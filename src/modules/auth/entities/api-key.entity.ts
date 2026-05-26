@@ -37,11 +37,12 @@ export class ApiKey {
   @Column({ type: 'boolean', default: true })
   isActive: boolean;
 
-  // Use DB-specific column type: 'timestamp' for postgres, 'datetime' for sqlite
-  @Column({ type: process.env.DATABASE_TYPE === 'postgres' ? 'timestamp' : 'datetime', nullable: true })
+  // The "main" database connection is always SQLite (boot config),
+  // so we use 'datetime' regardless of the user's data DB choice.
+  @Column({ type: 'datetime', nullable: true })
   expiresAt: Date | null;
 
-  @Column({ type: process.env.DATABASE_TYPE === 'postgres' ? 'timestamp' : 'datetime', nullable: true })
+  @Column({ type: 'datetime', nullable: true })
   lastUsedAt: Date | null;
 
   @Column({ type: 'int', default: 0 })
