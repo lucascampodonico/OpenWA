@@ -43,6 +43,16 @@ export interface WhatsAppWebJsConfig {
     headless?: boolean;
     args?: string[];
   };
+  // Opciones de sincronización al conectar
+  sync?: {
+    limitPerChat?: number; // mensajes por chat a recuperar
+    concurrency?: number; // chats concurrentes
+    downloadMedia?: boolean; // descargar media en el sync
+    maxMediaSizeKB?: number; // tamaño máximo de media a descargar en KB
+    allowedMimePrefixes?: string[]; // ej: ['image/', 'video/']
+    downloadTimeoutMs?: number; // timeout por descarga de media
+    delayBetweenChatsMs?: number; // pausa entre chats en ms
+  };
   // Phase 3: Proxy per session
   proxy?: {
     url: string;
@@ -63,6 +73,10 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
   }
 
   private readonly logger = createLogger('WhatsAppWebJsAdapter');
+  // Cache for resolved participant ids: lid -> { id: '@c.us', name }
+  private participantResolutionCache: Map<string, { id: string; name?: string }> = new Map();
+  // Track unresolved lids we already warned about to avoid spamming logs
+  private unresolvedParticipantLogged: Set<string> = new Set();
 
   async initialize(callbacks: EngineEventCallbacks): Promise<void> {
     this.callbacks = callbacks;
@@ -154,6 +168,24 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
           fromMe: msg.fromMe,
           isGroup: msg.from.endsWith('@g.us'),
         };
+
+        // Normalize participant ids into @c.us when possible.
+        try {
+          const participantId = (msg as any).author || (msg as any).participant || undefined;
+          if (incomingMessage.isGroup && participantId) {
+            // For group messages prefer resolving the author/participant id
+            const resolved = await this.resolveParticipantId(participantId, incomingMessage.chatId);
+            incomingMessage.metadata = { ...(incomingMessage.metadata || {}), participantName: resolved.name, participantId: resolved.id || participantId };
+            if (resolved.id) incomingMessage.from = resolved.id;
+          } else if (!String(incomingMessage.from || '').endsWith('@c.us')) {
+            // For non-group or when no author, normalize any id that isn't already @c.us
+            const resolvedAny = await this.resolveParticipantId(incomingMessage.from, incomingMessage.chatId);
+            incomingMessage.metadata = { ...(incomingMessage.metadata || {}), participantName: resolvedAny.name, participantId: resolvedAny.id || incomingMessage.from };
+            if (resolvedAny.id) incomingMessage.from = resolvedAny.id;
+          }
+        } catch (err) {
+          this.logger.warn('Error resolving participant for incoming live message', String(err));
+        }
 
         // Handle media
         if (msg.hasMedia) {
@@ -770,6 +802,291 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
       this.logger.error(`Failed to get channel messages: ${String(error)}`);
       return [];
     }
+  }
+
+  // Synchroniza mensajes recientes por chat al conectar para simular
+  // parte del historial que Whatsapp Web puede ofrecer.
+  private async syncRecentMessages(options: {
+    limitPerChat?: number;
+    concurrency?: number;
+    downloadMedia?: boolean;
+    maxMediaSizeKB?: number;
+    allowedMimePrefixes?: string[];
+    downloadTimeoutMs?: number;
+    delayBetweenChatsMs?: number;
+  } = {}): Promise<void> {
+    if (!this.client) return;
+
+    const {
+      limitPerChat = 50,
+      concurrency = 5,
+      downloadMedia = true,
+      maxMediaSizeKB = 1024,
+      allowedMimePrefixes = ['image/', 'video/'],
+      downloadTimeoutMs = 30_000,
+      delayBetweenChatsMs = 100,
+    } = options;
+
+    try {
+      const allChats = await this.client.getChats();
+      
+      // =========================================================================
+      // MODO DEBUG: Limitar la sincronización para pruebas
+      // =========================================================================
+      // Opción A: Sincronizar únicamente el primer chat de la lista
+      const chats = allChats.slice(0, 2);
+
+      // Opción B: Sincronizar un chat específico por su número/ID (Descomenta para usar)
+      /*
+      const chats = allChats.filter(chat => {
+        const id = (chat.id && (chat.id as any)._serialized) || String(chat.id);
+        return id === "5491112345678@c.us"; // Pon aquí el número con @c.us o ID de grupo
+      });
+      */
+      // =========================================================================
+
+      const downloadWithTimeout = async (promiseFactory: () => Promise<any>, timeoutMs: number) => {
+        return await Promise.race([
+          promiseFactory(),
+          new Promise((_, reject) => setTimeout(() => reject(new Error('download timeout')), timeoutMs)),
+        ]);
+      };
+
+      for (let i = 0; i < chats.length; i += concurrency) {
+        const batch = chats.slice(i, i + concurrency);
+        await Promise.all(
+          batch.map(async chat => {
+            try {
+              const messages = await chat.fetchMessages({ limit: limitPerChat });
+              const chatIdStr = (chat.id && (chat.id as any)._serialized) || String(chat.id);
+              if (!messages || messages.length === 0) return;
+
+              const chatSyncedMessages: IncomingMessage[] = [];
+
+              for (const msg of messages.reverse()) {
+                try {
+                  const incomingMessage: IncomingMessage = {
+                    id: String(msg.id?._serialized || msg.id),
+                    from: msg.from, // may be replaced below for group messages (author)
+                    to: msg.to,
+                    chatId: msg.from,
+                    body: String(msg.body || ''),
+                    type: msg.type,
+                    timestamp: Number(msg.timestamp || Date.now()),
+                    fromMe: Boolean(msg.fromMe),
+                    isGroup: String(msg.from || '').endsWith('@g.us'),
+                  };
+                  // Try to resolve group participant ids (@lid) into contact ids (@c.us).
+                  try {
+                    const participantId = (msg as any).author || (msg as any).participant || undefined;
+                    if (incomingMessage.isGroup && participantId) {
+                      const resolved = await this.resolveParticipantId(participantId, incomingMessage.chatId);
+                      incomingMessage.metadata = { ...(incomingMessage.metadata || {}), participantName: resolved.name, participantId: resolved.id || participantId };
+                      if (resolved.id) incomingMessage.from = resolved.id;
+                    } else if (!String(incomingMessage.from || '').endsWith('@c.us')) {
+                      // Normalize any non-@c.us 'from' to attempt to map to a contact by phone
+                      const resolvedAny = await this.resolveParticipantId(incomingMessage.from, incomingMessage.chatId);
+                      incomingMessage.metadata = { ...(incomingMessage.metadata || {}), participantName: resolvedAny.name, participantId: resolvedAny.id || incomingMessage.from };
+                      if (resolvedAny.id) incomingMessage.from = resolvedAny.id;
+                    }
+                  } catch (err) {
+                    this.logger.warn('Error resolving participant for group message', String(err));
+                  }
+
+                  // incomingMessage.metadata = { ...(incomingMessage.metadata || {}), participantName: resolvedName, participantId: resolvedId || participantId };
+                  // if (resolvedId) {
+                  //   incomingMessage.from = resolvedId;
+                  // }
+
+                  this.logger.debug(`syncRecentMessages: chat with resolved id ${incomingMessage.from || chatIdStr} fetched ${messages?.length || 0} messages`);
+
+                  if (msg.hasMedia) {
+                    const mimetype = (msg as any).mimetype || undefined;
+
+                    // Si se definieron prefijos permitidos, filtrar antes de descargar
+                    if (
+                      downloadMedia &&
+                      (!allowedMimePrefixes ||
+                        allowedMimePrefixes.length === 0 ||
+                        !mimetype ||
+                        allowedMimePrefixes.some(p => mimetype.startsWith(p)))
+                    ) {
+                      try {
+                        const media = await downloadWithTimeout(() => (msg as any).downloadMedia(), downloadTimeoutMs);
+                        if (media && media.data) {
+                          // Estimar tamaño desde base64
+                          const b64 = String(media.data || '');
+                          const approxBytes = Math.ceil((b64.length * 3) / 4);
+                          const approxKB = Math.ceil(approxBytes / 1024);
+                          if (approxKB <= maxMediaSizeKB) {
+                            incomingMessage.media = {
+                              mimetype: media.mimetype || mimetype,
+                              filename: media.filename || undefined,
+                              data: media.data || undefined,
+                            } as any;
+                          } else {
+                            this.logger.log(`Skipping media download: size ${approxKB}KB exceeds max ${maxMediaSizeKB}KB`);
+                            incomingMessage.media = {
+                              mimetype: media.mimetype || mimetype,
+                              filename: media.filename || undefined,
+                              data: undefined,
+                            } as any;
+                          }
+                        }
+                      } catch (err) {
+                        this.logger.warn('Failed to download media for synced message:', String(err));
+                        incomingMessage.media = {
+                          mimetype: mimetype || undefined,
+                          filename: undefined,
+                          data: undefined,
+                        } as any;
+                      }
+                    } else {
+                      incomingMessage.media = {
+                        mimetype: mimetype || undefined,
+                        filename: undefined,
+                        data: undefined,
+                      } as any;
+                    }
+                  }
+
+                  // Mark message as originating from sync so webhooks/consumers can treat it differently
+                  incomingMessage.metadata = { ...(incomingMessage.metadata || {}), synced: true, syncOrigin: 'history' };
+
+                  if (this.callbacks.onMessagesSynced) {
+                    chatSyncedMessages.push(incomingMessage);
+                  } else {
+                    this.callbacks.onMessage?.(incomingMessage);
+                  }
+                } catch (err) {
+                  this.logger.warn('Error processing synced message', String(err));
+                }
+              }
+
+              if (this.callbacks.onMessagesSynced && chatSyncedMessages.length > 0) {
+                this.callbacks.onMessagesSynced(chatIdStr, chatSyncedMessages);
+              }
+            } catch (err) {
+              const chatIdStr = (chat.id && (chat.id as any)._serialized) || String(chat.id);
+              this.logger.warn(`Failed to fetch messages for chat ${chatIdStr}: ${String(err)}`);
+            }
+
+            await new Promise(r => setTimeout(r, delayBetweenChatsMs));
+          }),
+        );
+      }
+      this.logger.log('syncRecentMessages: completed');
+    } catch (error) {
+      this.logger.warn('syncRecentMessages top-level error:', String(error));
+    }
+  }
+
+  // Public wrapper to allow manual triggering of sync from other modules
+  async syncMessages(options?: {
+    limitPerChat?: number;
+    concurrency?: number;
+    downloadMedia?: boolean;
+    maxMediaSizeKB?: number;
+    allowedMimePrefixes?: string[];
+    downloadTimeoutMs?: number;
+    delayBetweenChatsMs?: number;
+  }): Promise<void> {
+    await this.syncRecentMessages(options);
+  }
+
+  /**
+   * Resolve a participant id (possibly @lid) to a contact id (@c.us) when possible.
+   * Uses cache, contact lookup, contact list search and group participants as fallbacks.
+   */
+  private async resolveParticipantId(participantId: string, chatId?: string): Promise<{ id: string; name?: string }> {
+
+    if (!participantId) return { id: participantId };
+
+    // Cache hit
+    const cached = this.participantResolutionCache.get(participantId);
+    if (cached) return cached;
+
+    // 1) direct contact lookup (may accept @c.us or other serialized ids)
+    try {
+      const contact = await this.client!.getContactById(participantId);
+      if (contact && contact.id) {
+        const id = String((contact.id as any)._serialized || contact.id);
+        const name = contact.pushname || (contact as any).name || (contact as any).shortName;
+        const result = { id, name };
+        this.participantResolutionCache.set(participantId, result);
+        return result;
+      }
+    } catch (err) {
+      // ignore
+    }
+
+    // 2) try extracting digits and lookup as digits@c.us
+    const m = String(participantId).match(/(\d{6,})/);
+    const digits = m ? m[1] : undefined;
+    if (digits) {
+      const tryId = `${digits}@c.us`;
+      try {
+        const contact2 = await this.client!.getContactById(tryId);
+        if (contact2 && contact2.id) {
+          const id = String((contact2.id as any)._serialized || contact2.id);
+          const name = contact2.pushname || (contact2 as any).name;
+          const result = { id, name };
+          this.participantResolutionCache.set(participantId, result);
+          return result;
+        }
+      } catch (err) {
+        // ignore
+      }
+
+      // 3) search contacts list by number
+      try {
+        const contacts = await this.client!.getContacts();
+        const found = contacts.find((c: any) => {
+          const num = String(c.number || '');
+          return num === digits || num.endsWith(digits);
+        });
+        if (found) {
+          const id = String((found.id as any)._serialized || found.id);
+          const name = found.pushname || (found as any).name;
+          const result = { id, name };
+          this.participantResolutionCache.set(participantId, result);
+          return result;
+        }
+      } catch (err) {
+        // ignore
+      }
+    }
+
+    // 4) inspect group participants if chatId provided
+    if (chatId) {
+      try {
+        const groupChat = await this.client!.getChatById(chatId);
+        const parts = (groupChat as any).participants || [];
+        const found = parts.find((p: any) => {
+          const pid = p?.id?._serialized || p?.id;
+          return String(pid) === participantId || String(pid) === String(participantId);
+        });
+        if (found) {
+          const user = found?.id?.user;
+          const phoneId = user ? `${user}@c.us` : (found?.id?._serialized || participantId);
+          const name = found?.name || undefined;
+          const result = { id: phoneId, name };
+          this.participantResolutionCache.set(participantId, result);
+          return result;
+        }
+      } catch (err) {
+        // ignore
+      }
+    }
+
+    // Not resolved — warn once and return original
+    if (!this.unresolvedParticipantLogged.has(participantId)) {
+      this.unresolvedParticipantLogged.add(participantId);
+      this.logger.warn(`Could not resolve participantId ${participantId} for chat ${chatId || 'unknown'}`);
+    }
+    const fallback = { id: participantId };
+    this.participantResolutionCache.set(participantId, fallback);
+    return fallback;
   }
 
   // ========== Gap Quick Wins Implementation ==========

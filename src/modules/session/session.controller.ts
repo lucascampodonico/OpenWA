@@ -1,4 +1,5 @@
 import { Controller, Get, Post, Delete, Param, Body, HttpCode, HttpStatus } from '@nestjs/common';
+import { SyncSessionDto } from './dto/sync-session.dto';
 import { ApiTags, ApiOperation, ApiResponse, ApiParam } from '@nestjs/swagger';
 import { SessionService } from './session.service';
 import { CreateSessionDto, SessionResponseDto, QRCodeResponseDto } from './dto';
@@ -164,6 +165,37 @@ export class SessionController {
   @ApiResponse({ status: 404, description: 'Session not found' })
   async getGroups(@Param('id') id: string): Promise<{ id: string; name: string }[]> {
     return this.sessionService.getGroups(id);
+  }
+
+  @Post(':id/sync')
+  @RequireRole(ApiKeyRole.OPERATOR)
+  @ApiOperation({ summary: 'Trigger manual sync of recent messages for a session' })
+  @ApiParam({ name: 'id', description: 'Session ID' })
+  @ApiResponse({ status: 200, description: 'Sync started' })
+  @ApiResponse({ status: 404, description: 'Session not found' })
+  async syncSession(@Param('id') id: string, @Body() dto: SyncSessionDto): Promise<{ status: string }> {
+    const engine = this.sessionService.getEngine(id);
+    if (!engine) {
+      throw new Error('Session is not started');
+    }
+
+    // Call engine's syncMessages if available
+    if (typeof engine.syncMessages === 'function') {
+      // fire-and-forget but await to surface errors to API caller
+      await engine.syncMessages({
+        limitPerChat: dto.limitPerChat,
+        concurrency: dto.concurrency,
+        downloadMedia: dto.downloadMedia,
+        maxMediaSizeKB: dto.maxMediaSizeKB,
+        allowedMimePrefixes: dto.allowedMimePrefixes,
+        downloadTimeoutMs: dto.downloadTimeoutMs,
+        delayBetweenChatsMs: dto.delayBetweenChatsMs,
+      });
+      await this.auditService.logInfo(AuditAction.SESSION_SYNC, { sessionId: id });
+      return { status: 'sync_completed' };
+    }
+
+    throw new Error('Engine does not support manual sync');
   }
 
   @Get('stats/overview')

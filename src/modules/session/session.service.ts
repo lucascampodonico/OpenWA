@@ -312,6 +312,27 @@ export class SessionService implements OnModuleDestroy, OnModuleInit {
             this.eventsGateway.emitMessage(id, finalMessage as Record<string, unknown>);
           });
       },
+      onMessagesSynced: (chatId, messages): void => {
+        this.logger.debug(`Synced ${messages.length} messages for chat ${chatId}`, {
+          sessionId: id,
+          chatId,
+          action: 'messages_synced',
+        });
+
+        const messagesData = messages.map(m => ({ ...m }));
+
+        // Dispatch to webhooks with the batch of messages for this chat
+        void this.webhookService.dispatch(id, 'messages.synced', {
+          chatId,
+          messages: messagesData,
+        });
+
+        // Emit real-time event to WebSocket clients
+        this.eventsGateway.emitMessagesSynced(id, {
+          chatId,
+          messages: messagesData,
+        });
+      },
       onDisconnected: (reason: string): void => {
         this.logger.warn(`Session disconnected: ${reason}`, {
           sessionId: id,

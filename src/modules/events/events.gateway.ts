@@ -223,6 +223,13 @@ export class EventsGateway implements OnGatewayInit, OnGatewayConnection, OnGate
   }
 
   /**
+   * Emit batched synced messages
+   */
+  emitMessagesSynced(sessionId: string, data: { chatId: string; messages: unknown[] }) {
+    this.emitToRooms(sessionId, 'messages.synced', data);
+  }
+
+  /**
    * Emit message sent notification
    */
   emitMessageSent(sessionId: string, message: Record<string, unknown>) {

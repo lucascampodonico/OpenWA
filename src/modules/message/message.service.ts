@@ -2,6 +2,7 @@ import { Injectable, BadRequestException } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import { SessionService } from '../session/session.service';
+import { createLogger } from '../../common/services/logger.service';
 import { SendTextMessageDto, SendMediaMessageDto, MessageResponseDto } from './dto';
 import { MediaInput } from '../../engine/interfaces/whatsapp-engine.interface';
 import { Message, MessageDirection, MessageStatus } from './entities/message.entity';
@@ -15,6 +16,7 @@ export interface GetMessagesOptions {
 
 @Injectable()
 export class MessageService {
+  private readonly logger = createLogger('MessageService');
   constructor(
     @InjectRepository(Message, 'data')
     private readonly messageRepository: Repository<Message>,
@@ -405,12 +407,30 @@ export class MessageService {
    * Save incoming message (called from session webhook dispatch)
    */
   async saveIncomingMessage(sessionId: string, data: Partial<Message>): Promise<Message> {
+    this.logger.debug('saveIncomingMessage attempt', { sessionId, waMessageId: data.waMessageId, chatId: data.chatId, bodyLength: data.body ? String(data.body).length : 0 });
+    // Evitar duplicados: si ya existe un mensaje con el mismo waMessageId y sessionId, retornarlo
+    if (data.waMessageId) {
+      try {
+        const existing = await this.messageRepository.findOne({
+          where: { waMessageId: data.waMessageId, sessionId },
+        });
+        if (existing) {
+          this.logger.debug('saveIncomingMessage duplicate detected', { sessionId, waMessageId: data.waMessageId, existingId: existing.id });
+          return existing;
+        }
+      } catch (err) {
+        // ignore and continue to save
+      }
+    }
+
     const message = this.messageRepository.create({
       ...data,
       sessionId,
       direction: MessageDirection.INCOMING,
     });
-    return this.messageRepository.save(message);
+    const saved = await this.messageRepository.save(message);
+    this.logger.log('saveIncomingMessage saved', { sessionId, id: saved.id, waMessageId: saved.waMessageId, chatId: saved.chatId });
+    return saved;
   }
 
   /**

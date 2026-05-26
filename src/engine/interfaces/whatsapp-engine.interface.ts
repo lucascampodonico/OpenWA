@@ -41,6 +41,7 @@ export interface IncomingMessage {
     id: string;
     body: string;
   };
+  metadata?: Record<string, unknown>;
 }
 
 export interface Contact {
@@ -198,6 +199,7 @@ export interface EngineEventCallbacks {
   onQRCode?: (qr: string) => void;
   onReady?: (phone: string, pushName: string) => void;
   onMessage?: (message: IncomingMessage) => void;
+  onMessagesSynced?: (chatId: string, messages: IncomingMessage[]) => void;
   onMessageAck?: (messageId: string, ack: number) => void;
   onDisconnected?: (reason: string) => void;
   onStateChanged?: (state: EngineStatus) => void;
@@ -293,4 +295,15 @@ export interface IWhatsAppEngine {
   getProduct(productId: string): Promise<Product | null>;
   sendProduct(chatId: string, productId: string, body?: string): Promise<MessageResult>;
   sendCatalog(chatId: string, body?: string): Promise<MessageResult>;
+
+  // Synchronization: fetch recent messages from chats (manual trigger)
+  syncMessages?(options?: {
+    limitPerChat?: number;
+    concurrency?: number;
+    downloadMedia?: boolean;
+    maxMediaSizeKB?: number;
+    allowedMimePrefixes?: string[];
+    downloadTimeoutMs?: number;
+    delayBetweenChatsMs?: number;
+  }): Promise<void>;
 }
