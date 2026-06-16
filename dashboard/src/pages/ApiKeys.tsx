@@ -97,9 +97,33 @@ export function ApiKeys() {
   };
 
   const copyToClipboard = (text: string, id: string) => {
-    navigator.clipboard.writeText(text);
-    setCopied(id);
-    setTimeout(() => setCopied(null), 2000);
+    // The async Clipboard API is only available in a secure context (HTTPS / localhost). Over
+    // plain HTTP on a LAN IP `navigator.clipboard` is undefined, so fall back to a hidden
+    // textarea + execCommand('copy') instead of throwing.
+    const copied = (() => {
+      if (navigator.clipboard?.writeText) {
+        void navigator.clipboard.writeText(text);
+        return true;
+      }
+      try {
+        const ta = document.createElement('textarea');
+        ta.value = text;
+        ta.setAttribute('readonly', '');
+        ta.style.position = 'fixed';
+        ta.style.opacity = '0';
+        document.body.appendChild(ta);
+        ta.select();
+        const ok = document.execCommand('copy');
+        document.body.removeChild(ta);
+        return ok;
+      } catch {
+        return false;
+      }
+    })();
+    if (copied) {
+      setCopied(id);
+      setTimeout(() => setCopied(null), 2000);
+    }
   };
 
   const columns = useMemo(
@@ -151,13 +175,8 @@ export function ApiKeys() {
           const apiKey = info.row.original;
           return (
             <span className="actions-cell">
-              <button
-                className="icon-btn"
-                onClick={() => copyToClipboard(apiKey.keyPrefix, apiKey.id)}
-                title={t('apiKeys.actions.copy')}
-              >
-                {copied === apiKey.id ? <Check size={16} /> : <Copy size={16} />}
-              </button>
+              {/* No per-row copy: the full key only exists once (post-creation modal); the row
+                  only has the prefix, so a copy button here could only copy a useless fragment. */}
               {apiKey.isActive && (
                 <button
                   className="icon-btn"
@@ -179,7 +198,7 @@ export function ApiKeys() {
         },
       }),
     ],
-    [visibleKeys, copied, t],
+    [visibleKeys, t],
   );
 
   const table = useReactTable({

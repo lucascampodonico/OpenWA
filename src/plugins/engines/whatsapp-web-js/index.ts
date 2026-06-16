@@ -11,6 +11,7 @@ export interface WhatsAppWebJsConfig {
   sessionDataPath?: string;
   headless?: boolean;
   puppeteerArgs?: string[];
+  executablePath?: string;
 }
 
 export class WhatsAppWebJsPlugin implements IEnginePlugin {
@@ -35,12 +36,21 @@ export class WhatsAppWebJsPlugin implements IEnginePlugin {
 
   createEngine(config: Record<string, unknown>): IWhatsAppEngine {
     const sessionId = config.sessionId as string;
-    const sessionDataPath = (this.context?.config.sessionDataPath as string) ?? './data/sessions';
-    const headless = (this.context?.config.headless as boolean) ?? true;
-    const puppeteerArgs = (this.context?.config.puppeteerArgs as string[]) ?? [
-      '--no-sandbox',
-      '--disable-setuid-sandbox',
-    ];
+    // Prefer the per-call config resolved by EngineFactory (from ConfigService);
+    // fall back to any plugin-level context config, then to safe defaults. The
+    // built-in plugin registers with an empty context config, so without the
+    // per-call values sessionDataPath/headless/executablePath would silently
+    // fall back to relative-path defaults and ignore the environment.
+    const sessionDataPath =
+      (config.sessionDataPath as string | undefined) ??
+      (this.context?.config.sessionDataPath as string | undefined) ??
+      './data/sessions';
+    const headless =
+      (config.headless as boolean | undefined) ?? (this.context?.config.headless as boolean | undefined) ?? true;
+    const puppeteerArgs = (config.puppeteerArgs as string[] | undefined) ??
+      (this.context?.config.puppeteerArgs as string[] | undefined) ?? ['--no-sandbox', '--disable-setuid-sandbox'];
+    const executablePath =
+      (config.executablePath as string | undefined) ?? (this.context?.config.executablePath as string | undefined);
 
     const proxyUrl = config.proxyUrl as string | undefined;
     const proxyType = config.proxyType as 'http' | 'https' | 'socks4' | 'socks5' | undefined;
@@ -51,6 +61,7 @@ export class WhatsAppWebJsPlugin implements IEnginePlugin {
       puppeteer: {
         headless,
         args: puppeteerArgs,
+        executablePath,
       },
       proxy: proxyUrl
         ? {
@@ -79,6 +90,19 @@ export class WhatsAppWebJsPlugin implements IEnginePlugin {
       'status-updates',
       'catalog',
     ];
+  }
+
+  getEngineLibrary(): { name: string; version: string } {
+    // The actual whatsapp-web.js library version (e.g. 1.34.7), surfaced so operators can see which
+    // engine version is really running — distinct from this adapter plugin's manifest version (1.0.0).
+    let version = 'unknown';
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      version = (require('whatsapp-web.js/package.json') as { version: string }).version;
+    } catch {
+      // Keep 'unknown' if the package metadata can't be resolved at runtime.
+    }
+    return { name: 'whatsapp-web.js', version };
   }
 
   healthCheck(): Promise<{ healthy: boolean; message?: string }> {

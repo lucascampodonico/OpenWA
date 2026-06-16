@@ -32,6 +32,13 @@ export interface IncomingMessage {
   timestamp: number;
   fromMe: boolean;
   isGroup: boolean;
+  /** For group messages, the WID of the participant who actually sent it (`from` is the group JID there). */
+  author?: string;
+  /** Sender display info, best-effort from the WhatsApp Web contact cache. */
+  contact?: {
+    name?: string;
+    pushName?: string;
+  };
   media?: {
     mimetype: string;
     filename?: string;
@@ -40,6 +47,13 @@ export interface IncomingMessage {
   quotedMessage?: {
     id: string;
     body: string;
+  };
+  location?: {
+    latitude: number;
+    longitude: number;
+    description?: string;
+    address?: string;
+    url?: string;
   };
   metadata?: Record<string, unknown>;
 }
@@ -59,6 +73,8 @@ export interface Group {
   name: string;
   participantsCount?: number;
   isAdmin?: boolean;
+  /** JID of the parent community this group is linked to, or null if standalone. */
+  linkedParentJID?: string | null;
 }
 
 export interface GroupParticipant {
@@ -78,6 +94,8 @@ export interface GroupInfo {
   participants: GroupParticipant[];
   isReadOnly?: boolean;
   isAnnounce?: boolean;
+  /** JID of the parent community this group is linked to, or null if standalone. */
+  linkedParentJID?: string | null;
 }
 
 export interface ContactCard {
@@ -195,14 +213,71 @@ export interface PaginatedProducts {
   };
 }
 
+/**
+ * Lightweight summary of a chat, exposed to the dashboard's real-time chats view.
+ * Only library-agnostic primitives are leaked here; raw whatsapp-web.js objects are
+ * mapped to this shape inside the adapter.
+ */
+export interface ChatSummary {
+  id: string;
+  name: string;
+  isGroup: boolean;
+  unreadCount: number;
+  timestamp: number;
+  lastMessage?: string;
+}
+
+/**
+ * Engine-neutral chat presence state. `typing`/`recording` show the indicator to the chat;
+ * `paused` clears it. Best-effort: engines without a presence concept may no-op.
+ */
+export type ChatState = 'typing' | 'recording' | 'paused';
+
+/**
+ * Structured payload for a remotely-revoked ("deleted for everyone") message.
+ * The engine layer never emits a localized display string; `body` is intentionally
+ * empty and the dashboard renders the localized "message deleted" text.
+ */
+export interface RevokedMessage {
+  id: string;
+  chatId: string;
+  from: string;
+  to: string;
+  type: 'revoked';
+  body: '';
+  timestamp: number;
+}
+
+export interface ReactionEvent {
+  messageId: string;
+  chatId: string;
+  reaction: string;
+  senderId: string;
+}
+
 export interface EngineEventCallbacks {
   onQRCode?: (qr: string) => void;
   onReady?: (phone: string, pushName: string) => void;
   onMessage?: (message: IncomingMessage) => void;
+  /**
+   * Fired for messages the account itself created (outgoing) — including sends composed on a
+   * linked phone, which the `message`/`onMessage` event never delivers. Used to emit `message.sent`.
+   */
+  onMessageCreate?: (message: IncomingMessage) => void;
   onMessagesSynced?: (chatId: string, messages: IncomingMessage[]) => void;
   onMessageAck?: (messageId: string, ack: number) => void;
+  onMessageRevoked?: (message: RevokedMessage) => void;
+  onMessageReaction?: (event: ReactionEvent) => void;
   onDisconnected?: (reason: string) => void;
   onStateChanged?: (state: EngineStatus) => void;
+  /**
+   * Fired on a terminal initialization/authentication failure (e.g. Chromium
+   * could not launch, or WhatsApp rejected the stored credentials). The engine
+   * has already moved to FAILED; `reason` carries a human-readable cause that
+   * callers may surface to operators. Distinct from `onDisconnected`, which is
+   * recoverable and triggers reconnection.
+   */
+  onError?: (reason: string) => void;
 }
 
 export interface IWhatsAppEngine {
@@ -215,6 +290,8 @@ export interface IWhatsAppEngine {
   // Status
   getStatus(): EngineStatus;
   getQRCode(): string | null;
+  /** Request an 8-char pairing code to link via phone number instead of scanning the QR. */
+  requestPairingCode(phoneNumber: string): Promise<string>;
   getPhoneNumber(): string | null;
   getPushName(): string | null;
 
@@ -261,6 +338,7 @@ export interface IWhatsAppEngine {
 
   // Message Operations
   deleteMessage(chatId: string, messageId: string, forEveryone?: boolean): Promise<void>;
+  getChatHistory(chatId: string, limit?: number, includeMedia?: boolean): Promise<IncomingMessage[]>;
 
   // Contact Extended Operations
   getProfilePicture(contactId: string): Promise<string | null>;
@@ -306,4 +384,14 @@ export interface IWhatsAppEngine {
     downloadTimeoutMs?: number;
     delayBetweenChatsMs?: number;
   }): Promise<void>;
+
+  // Chats
+  getChats(): Promise<ChatSummary[]>;
+  sendSeen(chatId: string): Promise<boolean>;
+  deleteChat(chatId: string): Promise<boolean>;
+  /**
+   * Send a typing/recording presence indicator to a chat, or clear it (`paused`).
+   * Engine-agnostic and best-effort: engines without a presence concept should no-op.
+   */
+  sendChatState(chatId: string, state: ChatState): Promise<void>;
 }
