@@ -36,8 +36,8 @@ services:
     networks:
       - openwa-network
     ports:
-      - '${BIND_HOST:-127.0.0.1}:${DASHBOARD_PORT:-2886}:80'
-      - '${BIND_HOST:-127.0.0.1}:8080:8080' # Traefik dashboard
+      - '${DASHBOARD_PORT:-2886}:80'
+      - '8080:8080' # Traefik dashboard
     volumes:
       - ./traefik/traefik.yml:/etc/traefik/traefik.yml:ro
       - ./traefik/dynamic.yml:/etc/traefik/dynamic.yml:ro
@@ -81,7 +81,7 @@ services:
     pids_limit: 512
     mem_limit: ${OPENWA_MEM_LIMIT:-2g} # tune up for many concurrent sessions
     ports:
-      - '${BIND_HOST:-127.0.0.1}:${API_PORT:-2785}:2785'
+      - '${API_PORT:-2785}:2785'
     expose:
       - '2785'
     environment:
@@ -252,8 +252,8 @@ services:
     volumes:
       - minio-data:/data
     ports:
-      - '${BIND_HOST:-127.0.0.1}:9000:9000'
-      - '${BIND_HOST:-127.0.0.1}:9001:9001'
+      - '9000:9000'
+      - '9001:9001'
     healthcheck:
       test: ['CMD', 'curl', '-f', 'http://localhost:9000/minio/health/live']
       interval: 10s
