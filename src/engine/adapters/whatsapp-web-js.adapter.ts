@@ -43,7 +43,7 @@ import {
   WwjsChannelData,
   GroupCreateResult,
 } from '../types/whatsapp-web-js.types';
-import { buildIncomingMessageBase } from './message-mapper';
+import { buildIncomingMessageBase, mapWwebjsMessageType } from './message-mapper';
 
 /** Default cap on a server-side media download: 50 MiB (overridable via MEDIA_DOWNLOAD_MAX_BYTES). */
 const DEFAULT_MEDIA_MAX_BYTES = 50 * 1024 * 1024;
@@ -1093,7 +1093,7 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
                     to: msg.to,
                     chatId: msg.from,
                     body: String(msg.body || ''),
-                    type: msg.type,
+                    type: mapWwebjsMessageType(msg.type),
                     timestamp: Number(msg.timestamp || Date.now()),
                     fromMe: Boolean(msg.fromMe),
                     isGroup: String(msg.from || '').endsWith('@g.us'),
