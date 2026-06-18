@@ -7,11 +7,25 @@ import {
   createColumnHelper,
   type VisibilityState,
 } from '@tanstack/react-table';
-import { Plus, Copy, RefreshCw, Trash2, Eye, EyeOff, Loader2, X, Check, KeyRound, AlertTriangle } from 'lucide-react';
+import {
+  Plus,
+  Copy,
+  RefreshCw,
+  Trash2,
+  Eye,
+  EyeOff,
+  Loader2,
+  X,
+  Check,
+  KeyRound,
+  AlertTriangle,
+  AlertCircle,
+} from 'lucide-react';
 import type { ApiKey } from '../services/api';
 import { useDocumentTitle } from '../hooks/useDocumentTitle';
 import { useApiKeysQuery, useCreateApiKeyMutation, useDeleteApiKeyMutation, useRevokeApiKeyMutation } from '../hooks/queries';
 import { PageHeader } from '../components/PageHeader';
+import { copyToClipboard } from '../utils/clipboard';
 import './ApiKeys.css';
 
 const roleNames = ['admin', 'operator', 'viewer'] as const;
@@ -31,7 +45,7 @@ const columnHelper = createColumnHelper<ApiKey>();
 export function ApiKeys() {
   const { t } = useTranslation();
   useDocumentTitle(t('apiKeys.title'));
-  const { data: apiKeys = [], isLoading: loading } = useApiKeysQuery();
+  const { data: apiKeys = [], isLoading: loading, isError: apiKeysError } = useApiKeysQuery();
   const createMutation = useCreateApiKeyMutation();
   const deleteMutation = useDeleteApiKeyMutation();
   const revokeMutation = useRevokeApiKeyMutation();
@@ -96,31 +110,8 @@ export function ApiKeys() {
     });
   };
 
-  const copyToClipboard = (text: string, id: string) => {
-    // The async Clipboard API is only available in a secure context (HTTPS / localhost). Over
-    // plain HTTP on a LAN IP `navigator.clipboard` is undefined, so fall back to a hidden
-    // textarea + execCommand('copy') instead of throwing.
-    const copied = (() => {
-      if (navigator.clipboard?.writeText) {
-        void navigator.clipboard.writeText(text);
-        return true;
-      }
-      try {
-        const ta = document.createElement('textarea');
-        ta.value = text;
-        ta.setAttribute('readonly', '');
-        ta.style.position = 'fixed';
-        ta.style.opacity = '0';
-        document.body.appendChild(ta);
-        ta.select();
-        const ok = document.execCommand('copy');
-        document.body.removeChild(ta);
-        return ok;
-      } catch {
-        return false;
-      }
-    })();
-    if (copied) {
+  const handleCopy = async (text: string, id: string) => {
+    if (await copyToClipboard(text)) {
       setCopied(id);
       setTimeout(() => setCopied(null), 2000);
     }
@@ -140,7 +131,11 @@ export function ApiKeys() {
           return (
             <span className="key-cell">
               <code>{visibleKeys.has(apiKey.id) ? apiKey.keyPrefix + '...' : apiKey.keyPrefix + '****'}</code>
-              <button className="icon-btn-sm" onClick={() => toggleKeyVisibility(apiKey.id)}>
+              <button
+                className="icon-btn-sm"
+                onClick={() => toggleKeyVisibility(apiKey.id)}
+                aria-label={visibleKeys.has(apiKey.id) ? t('common.hideApiKey') : t('common.showApiKey')}
+              >
                 {visibleKeys.has(apiKey.id) ? <EyeOff size={14} /> : <Eye size={14} />}
               </button>
             </span>
@@ -233,6 +228,13 @@ export function ApiKeys() {
         }
       />
 
+      {apiKeysError && (
+        <div className="error-banner" role="alert">
+          <AlertCircle size={20} />
+          <span className="error-banner-text">{t('dashboard.loadError')}</span>
+        </div>
+      )}
+
       {showModal && (
         <div
           className="modal-overlay"
@@ -270,7 +272,7 @@ export function ApiKeys() {
                     >
                       {createdKey}
                     </code>
-                    <button className="btn-primary" onClick={() => copyToClipboard(createdKey, 'modal')}>
+                    <button className="btn-primary" onClick={() => void handleCopy(createdKey, 'modal')}>
                       {copied === 'modal' ? <Check size={16} /> : <Copy size={16} />}
                     </button>
                   </div>

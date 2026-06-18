@@ -1,6 +1,8 @@
 import { Controller, Get, Post, Delete, Param, HttpCode, HttpStatus } from '@nestjs/common';
 import { ApiTags, ApiOperation, ApiResponse, ApiParam } from '@nestjs/swagger';
 import { ContactService } from './contact.service';
+import { RequireRole } from '../auth/decorators/auth.decorators';
+import { ApiKeyRole } from '../auth/entities/api-key.entity';
 
 @ApiTags('contacts')
 @Controller('sessions/:sessionId/contacts')
@@ -42,11 +44,13 @@ export class ContactController {
     description: 'Number existence check result',
   })
   async checkNumber(@Param('sessionId') sessionId: string, @Param('number') number: string) {
-    const exists = await this.contactService.checkNumberExists(sessionId, number);
+    // The engine returns the canonical chat id in its native format; we don't build the JID here
+    // (decoupled from the whatsapp-web.js `@c.us` scheme).
+    const whatsappId = await this.contactService.getNumberId(sessionId, number);
     return {
       number,
-      exists,
-      whatsappId: exists ? `${number}@c.us` : null,
+      exists: whatsappId !== null,
+      whatsappId,
     };
   }
 
@@ -65,7 +69,21 @@ export class ContactController {
     return { url };
   }
 
+  @Get(':contactId/phone')
+  @ApiOperation({ summary: 'Resolve a contact id (e.g. an @lid) to a phone number — best-effort' })
+  @ApiParam({ name: 'sessionId', description: 'Session ID' })
+  @ApiParam({ name: 'contactId', description: 'Contact ID / JID to resolve (e.g., an @lid)' })
+  @ApiResponse({
+    status: 200,
+    description: 'Resolved phone number (MSISDN digits), or null when the engine cannot map it',
+  })
+  async resolvePhone(@Param('sessionId') sessionId: string, @Param('contactId') contactId: string) {
+    const phone = await this.contactService.resolveContactPhone(sessionId, contactId);
+    return { contactId, phone };
+  }
+
   @Post(':contactId/block')
+  @RequireRole(ApiKeyRole.OPERATOR)
   @HttpCode(HttpStatus.OK)
   @ApiOperation({ summary: 'Block a contact' })
   @ApiParam({ name: 'sessionId', description: 'Session ID' })
@@ -80,6 +98,7 @@ export class ContactController {
   }
 
   @Delete(':contactId/block')
+  @RequireRole(ApiKeyRole.OPERATOR)
   @ApiOperation({ summary: 'Unblock a contact' })
   @ApiParam({ name: 'sessionId', description: 'Session ID' })
   @ApiParam({ name: 'contactId', description: 'Contact ID (e.g., 628xxx@c.us)' })

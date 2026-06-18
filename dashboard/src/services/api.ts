@@ -49,6 +49,24 @@ export interface Webhook {
   updatedAt: string;
 }
 
+export interface MessageTemplate {
+  id: string;
+  sessionId: string;
+  name: string;
+  body: string;
+  header?: string | null;
+  footer?: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface TemplatePayload {
+  name: string;
+  body: string;
+  header?: string | null;
+  footer?: string | null;
+}
+
 export interface ApiKey {
   id: string;
   name: string;
@@ -95,6 +113,29 @@ export interface Chat {
   lastMessage?: string;
 }
 
+// Engine-neutral message types (mirrors the backend's IWhatsAppEngine MessageType). The backend
+// normalizes raw engine tokens at the adapter boundary (#265/#270), so persisted rows, the
+// message.received/sent payloads, and the websocket all use these values.
+export const MESSAGE_TYPES = [
+  'text',
+  'image',
+  'video',
+  'audio',
+  'voice',
+  'document',
+  'sticker',
+  'location',
+  'contact',
+  'revoked',
+  'unknown',
+] as const;
+export type MessageType = (typeof MESSAGE_TYPES)[number];
+
+/** Coerce an arbitrary string (e.g. a raw websocket payload field) to a known MessageType. */
+export function asMessageType(value: string | undefined): MessageType {
+  return (MESSAGE_TYPES as readonly string[]).includes(value ?? '') ? (value as MessageType) : 'unknown';
+}
+
 export interface ChatMessage {
   id: string;
   waMessageId?: string;
@@ -102,7 +143,7 @@ export interface ChatMessage {
   from: string;
   to: string;
   body: string;
-  type: string;
+  type: MessageType;
   direction: 'incoming' | 'outgoing';
   status: 'pending' | 'sent' | 'delivered' | 'read' | 'failed';
   timestamp?: number;
@@ -319,6 +360,43 @@ export const webhookApi = {
 };
 
 // =============================================================================
+// Template API
+// =============================================================================
+
+export const templateApi = {
+  list: (sessionId: string) => request<MessageTemplate[]>(`/sessions/${sessionId}/templates`),
+  get: (sessionId: string, id: string) => request<MessageTemplate>(`/sessions/${sessionId}/templates/${id}`),
+  create: (sessionId: string, data: TemplatePayload) =>
+    request<MessageTemplate>(`/sessions/${sessionId}/templates`, {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
+  update: (sessionId: string, id: string, data: Partial<TemplatePayload>) =>
+    request<MessageTemplate>(`/sessions/${sessionId}/templates/${id}`, {
+      method: 'PUT',
+      body: JSON.stringify(data),
+    }),
+  delete: (sessionId: string, id: string) =>
+    request<void>(`/sessions/${sessionId}/templates/${id}`, { method: 'DELETE' }),
+};
+
+// =============================================================================
+// Contact API
+// =============================================================================
+
+export interface CheckNumberResponse {
+  number: string;
+  exists: boolean;
+  /** Engine-canonical WhatsApp id for the number (e.g. `…@c.us` or `…@lid`), or null if unregistered. */
+  whatsappId: string | null;
+}
+
+export const contactApi = {
+  checkNumber: (sessionId: string, number: string) =>
+    request<CheckNumberResponse>(`/sessions/${sessionId}/contacts/check/${encodeURIComponent(number)}`),
+};
+
+// =============================================================================
 // API Key API
 // =============================================================================
 
@@ -408,6 +486,14 @@ export const messageApi = {
     }),
   react: (sessionId: string, data: { chatId: string; messageId: string; emoji: string }) =>
     request<void>(`/sessions/${sessionId}/messages/react`, {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
+  sendTemplate: (
+    sessionId: string,
+    data: { chatId: string; templateId?: string; templateName?: string; variables?: Record<string, string> },
+  ) =>
+    request<MessageResponse>(`/sessions/${sessionId}/messages/send-template`, {
       method: 'POST',
       body: JSON.stringify(data),
     }),

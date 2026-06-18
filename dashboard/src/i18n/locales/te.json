@@ -9,6 +9,8 @@
     "edit": "ఎడిట్ చేయి",
     "create": "సృష్టించు",
     "close": "మూసివేయి",
+    "showApiKey": "API కీని చూపు",
+    "hideApiKey": "API కీని దాచు",
     "submit": "సమర్పించు",
     "confirm": "ధృవీకరించు",
     "search": "వెతుకు",
@@ -58,6 +60,7 @@
     "sessions": "సెషన్స్",
     "chats": "చాట్‌లు",
     "webhooks": "వెబ్‌హుక్స్",
+    "templates": "Templates",
     "apiKeys": "API కీలు",
     "messageTester": "మెసేజ్ టెస్టర్",
     "infrastructure": "ఇన్‌ఫ్రాస్ట్రక్చర్",
@@ -289,6 +292,51 @@
       "all": "అన్ని ఈవెంట్స్"
     }
   },
+  "templates": {
+    "title": "Templates",
+    "subtitle": "Create reusable message templates for each WhatsApp session",
+    "createTitle": "Create Template",
+    "editTitle": "Edit Template",
+    "newTemplate": "New Template",
+    "createTemplate": "Create Template",
+    "saveChanges": "Save Changes",
+    "viewOnly": "View Only",
+    "noSessions": "No sessions",
+    "sessionHint": "Saved under {{name}}",
+    "namePlaceholder": "e.g., order-confirmation",
+    "header": "Header",
+    "headerPlaceholder": "Optional intro line",
+    "body": "Body",
+    "bodyPlaceholder": "Hi {{customer}}, your order {{orderId}} is ready.",
+    "footer": "Footer",
+    "footerPlaceholder": "Optional closing line",
+    "previewTitle": "Preview",
+    "previewValuePlaceholder": "Sample value",
+    "previewEmpty": "Start writing a template to preview it here.",
+    "noPlaceholders": "Use {{name}} placeholders to test substitutions.",
+    "savedTitle": "Saved Templates",
+    "count": "{{count}} total",
+    "deleteTitle": "Delete Template",
+    "deleteConfirm": "Delete template \"{{name}}\"? This action cannot be undone.",
+    "actions": {
+      "copyName": "Copy template name"
+    },
+    "empty": {
+      "title": "No templates saved",
+      "description": "Create a reusable template to speed up common replies and notifications.",
+      "noSessionsTitle": "No sessions available",
+      "noSessionsDesc": "Create a WhatsApp session before adding templates."
+    },
+    "toasts": {
+      "created": "Template created successfully",
+      "createFailed": "Failed to create template: {{message}}",
+      "updated": "Template updated successfully",
+      "updateFailed": "Failed to update template: {{message}}",
+      "deleted": "Template deleted successfully",
+      "deleteFailed": "Failed to delete template: {{message}}",
+      "copied": "Template name copied"
+    }
+  },
   "apiKeys": {
     "title": "API కీలు",
     "subtitle": "అథెంటికేషన్ మరియు యాక్సెస్ కంట్రోల్ కోసం API కీలను నిర్వహించండి",
@@ -405,7 +453,8 @@
       "messageId": "సందేశం ID",
       "error": "లోపం"
     },
-    "sendFailed": "సందేశాన్ని పంపడం విఫలమైంది"
+    "sendFailed": "సందేశాన్ని పంపడం విఫలమైంది",
+    "notOnWhatsApp": "ఈ నంబర్ WhatsAppలో నమోదు కాలేదు"
   },
   "infrastructure": {
     "title": "ఇన్‌ఫ్రాస్ట్రక్చర్",

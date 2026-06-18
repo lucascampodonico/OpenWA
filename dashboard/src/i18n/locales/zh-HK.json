@@ -9,6 +9,8 @@
     "edit": "編輯",
     "create": "建立",
     "close": "關閉",
+    "showApiKey": "顯示 API 金鑰",
+    "hideApiKey": "隱藏 API 金鑰",
     "submit": "提交",
     "confirm": "確認",
     "search": "搜尋",
@@ -58,6 +60,7 @@
     "sessions": "工作階段",
     "chats": "聊天",
     "webhooks": "Webhooks",
+    "templates": "Templates",
     "apiKeys": "API 金鑰",
     "messageTester": "訊息測試器",
     "infrastructure": "基礎架構",
@@ -289,6 +292,51 @@
       "all": "所有事件"
     }
   },
+  "templates": {
+    "title": "Templates",
+    "subtitle": "Create reusable message templates for each WhatsApp session",
+    "createTitle": "Create Template",
+    "editTitle": "Edit Template",
+    "newTemplate": "New Template",
+    "createTemplate": "Create Template",
+    "saveChanges": "Save Changes",
+    "viewOnly": "View Only",
+    "noSessions": "No sessions",
+    "sessionHint": "Saved under {{name}}",
+    "namePlaceholder": "e.g., order-confirmation",
+    "header": "Header",
+    "headerPlaceholder": "Optional intro line",
+    "body": "Body",
+    "bodyPlaceholder": "Hi {{customer}}, your order {{orderId}} is ready.",
+    "footer": "Footer",
+    "footerPlaceholder": "Optional closing line",
+    "previewTitle": "Preview",
+    "previewValuePlaceholder": "Sample value",
+    "previewEmpty": "Start writing a template to preview it here.",
+    "noPlaceholders": "Use {{name}} placeholders to test substitutions.",
+    "savedTitle": "Saved Templates",
+    "count": "{{count}} total",
+    "deleteTitle": "Delete Template",
+    "deleteConfirm": "Delete template \"{{name}}\"? This action cannot be undone.",
+    "actions": {
+      "copyName": "Copy template name"
+    },
+    "empty": {
+      "title": "No templates saved",
+      "description": "Create a reusable template to speed up common replies and notifications.",
+      "noSessionsTitle": "No sessions available",
+      "noSessionsDesc": "Create a WhatsApp session before adding templates."
+    },
+    "toasts": {
+      "created": "Template created successfully",
+      "createFailed": "Failed to create template: {{message}}",
+      "updated": "Template updated successfully",
+      "updateFailed": "Failed to update template: {{message}}",
+      "deleted": "Template deleted successfully",
+      "deleteFailed": "Failed to delete template: {{message}}",
+      "copied": "Template name copied"
+    }
+  },
   "apiKeys": {
     "title": "API 金鑰",
     "subtitle": "管理用於認證及存取控制的 API 金鑰",
@@ -405,7 +453,8 @@
       "messageId": "訊息 ID",
       "error": "錯誤"
     },
-    "sendFailed": "傳送訊息失敗"
+    "sendFailed": "傳送訊息失敗",
+    "notOnWhatsApp": "此號碼未在 WhatsApp 註冊"
   },
   "infrastructure": {
     "title": "基礎架構",
