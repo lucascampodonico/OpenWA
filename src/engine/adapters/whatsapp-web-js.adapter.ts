@@ -595,6 +595,7 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
       // (whatsapp-web.js #3857/#3969). `pn` is the phone JID (`<digits>@c.us`) when the account knows
       // the mapping; best-effort, so a missing mapping or any failure resolves to null.
       const [result] = await this.client!.getContactLidAndPhone([contactId]);
+      this.logger.debug(`getContactLidAndPhone result for ${contactId}: ${JSON.stringify(result)}`);
       const pn = result?.pn;
       return pn ? pn.replace(/@c\.us$/i, '').replace(/\D/g, '') || null : null;
     } catch (error) {
@@ -1051,7 +1052,7 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
 
     try {
       const allChats = await this.client.getChats();
-      
+
       // =========================================================================
       // MODO DEBUG: Limitar la sincronización para pruebas
       // =========================================================================

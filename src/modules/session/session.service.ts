@@ -423,7 +423,11 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
             // attaches senderPhone (digits or null) before persist/dispatch so webhook/ws consumers
             // get it in a single pass. Only for privacy-id senders, so no lookup for normal numbers.
             if (process.env.RESOLVE_LID_TO_PHONE === 'true' && incoming.isLidSender && !incoming.fromMe) {
+              this.logger.debug(`Resolviendo LID para sender: ${incoming.author ?? incoming.from}`);
+
               incoming.senderPhone = await this.resolveSenderPhone(id, incoming.author ?? incoming.from);
+
+              this.logger.debug(`Resultado de resolución LID: ${incoming.senderPhone}`);
             }
 
             const metadata: Record<string, unknown> = {};
