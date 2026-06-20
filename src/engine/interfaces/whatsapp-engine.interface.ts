@@ -311,7 +311,7 @@ export interface EngineEventCallbacks {
    * delivery signal to the neutral `DeliveryStatus`, so consumers never see engine-specific codes.
    */
   onMessageAck?: (messageId: string, status: DeliveryStatus) => void;
-  onMessagesSynced?: (chatId: string, messages: IncomingMessage[]) => void;
+  onMessagesSynced?: (chatId: string, messages: IncomingMessage[], chatName?: string) => void;
   onMessageRevoked?: (message: RevokedMessage) => void;
   onMessageReaction?: (event: ReactionEvent) => void;
   onDisconnected?: (reason: string) => void;

@@ -1187,7 +1187,7 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
               }
 
               if (this.callbacks.onMessagesSynced && chatSyncedMessages.length > 0) {
-                this.callbacks.onMessagesSynced(chatIdStr, chatSyncedMessages);
+                this.callbacks.onMessagesSynced(chatIdStr, chatSyncedMessages, chat.name);
               }
             } catch (err) {
               const chatIdStr = (chat.id && (chat.id as any)._serialized) || String(chat.id);

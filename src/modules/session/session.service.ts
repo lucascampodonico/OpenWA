@@ -618,8 +618,8 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
             this.logger.error(`Failed to update message reaction: ${event.messageId}`, String(err));
           });
       },
-      onMessagesSynced: (chatId, messages): void => {
-        this.logger.debug(`Synced ${messages.length} messages for chat ${chatId}`, {
+      onMessagesSynced: (chatId, messages, chatName): void => {
+        this.logger.debug(`Synced ${messages.length} messages for chat ${chatId} (${chatName || ''})`, {
           sessionId: id,
           chatId,
           action: 'messages_synced',
@@ -630,12 +630,14 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
         // Dispatch to webhooks with the batch of messages for this chat
         void this.webhookService.dispatch(id, 'messages.synced', {
           chatId,
+          chatName: chatName || undefined,
           messages: messagesData,
         });
 
         // Emit real-time event to WebSocket clients
         this.eventsGateway.emitMessagesSynced(id, {
           chatId,
+          chatName: chatName || undefined,
           messages: messagesData,
         });
       },
