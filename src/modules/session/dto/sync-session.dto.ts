@@ -28,4 +28,12 @@ export class SyncSessionDto {
   @IsOptional()
   @IsNumber()
   delayBetweenChatsMs?: number;
+
+  @IsOptional()
+  @IsNumber()
+  chatLimit?: number;
+
+  @IsOptional()
+  @IsNumber()
+  chatOffset?: number;
 }

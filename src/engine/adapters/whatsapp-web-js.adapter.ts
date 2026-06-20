@@ -1037,6 +1037,8 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
     allowedMimePrefixes?: string[];
     downloadTimeoutMs?: number;
     delayBetweenChatsMs?: number;
+    chatLimit?: number;
+    chatOffset?: number;
   } = {}): Promise<void> {
     if (!this.client) return;
 
@@ -1056,16 +1058,15 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
       // =========================================================================
       // MODO DEBUG: Limitar la sincronización para pruebas
       // =========================================================================
-      // Opción A: Sincronizar únicamente el primer chat de la lista
-      const chats = allChats.slice(0, 2);
+      let chats = allChats;
+      const offset = options.chatOffset !== undefined ? options.chatOffset : 0;
+      const limit = options.chatLimit !== undefined ? options.chatLimit : undefined;
 
-      // Opción B: Sincronizar un chat específico por su número/ID (Descomenta para usar)
-      /*
-      const chats = allChats.filter(chat => {
-        const id = (chat.id && (chat.id as any)._serialized) || String(chat.id);
-        return id === "5491112345678@c.us"; // Pon aquí el número con @c.us o ID de grupo
-      });
-      */
+      if (limit !== undefined) {
+        chats = allChats.slice(offset, offset + limit);
+      } else if (offset > 0) {
+        chats = allChats.slice(offset);
+      }
       // =========================================================================
 
       const downloadWithTimeout = async (promiseFactory: () => Promise<any>, timeoutMs: number) => {
@@ -1213,6 +1214,8 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
     allowedMimePrefixes?: string[];
     downloadTimeoutMs?: number;
     delayBetweenChatsMs?: number;
+    chatLimit?: number;
+    chatOffset?: number;
   }): Promise<void> {
     await this.syncRecentMessages(options);
   }

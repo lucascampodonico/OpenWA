@@ -440,6 +440,8 @@ export interface IWhatsAppEngine {
     allowedMimePrefixes?: string[];
     downloadTimeoutMs?: number;
     delayBetweenChatsMs?: number;
+    chatLimit?: number;
+    chatOffset?: number;
   }): Promise<void>;
 
   // Chats
