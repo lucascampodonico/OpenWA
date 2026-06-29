@@ -300,16 +300,39 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
           if (incomingMessage.isGroup && participantId) {
             // For group messages prefer resolving the author/participant id
             const resolved = await this.resolveParticipantId(participantId, incomingMessage.chatId);
-            incomingMessage.metadata = { ...(incomingMessage.metadata || {}), participantName: resolved.name, participantId: resolved.id || participantId };
+            incomingMessage.metadata = {
+              ...(incomingMessage.metadata || {}),
+              participantName: resolved.name,
+              participantId: resolved.id || participantId,
+            };
             if (resolved.id) incomingMessage.from = resolved.id;
           } else if (!String(incomingMessage.from || '').endsWith('@c.us')) {
             // For non-group or when no author, normalize any id that isn't already @c.us
             const resolvedAny = await this.resolveParticipantId(incomingMessage.from, incomingMessage.chatId);
-            incomingMessage.metadata = { ...(incomingMessage.metadata || {}), participantName: resolvedAny.name, participantId: resolvedAny.id || incomingMessage.from };
+            incomingMessage.metadata = {
+              ...(incomingMessage.metadata || {}),
+              participantName: resolvedAny.name,
+              participantId: resolvedAny.id || incomingMessage.from,
+            };
             if (resolvedAny.id) incomingMessage.from = resolvedAny.id;
           }
         } catch (err) {
           this.logger.warn('Error resolving participant for incoming live message', String(err));
+        }
+
+        // Handle group name
+        if (incomingMessage.isGroup) {
+          try {
+            const chat = await msg.getChat();
+            if (chat && chat.name) {
+              incomingMessage.metadata = {
+                ...(incomingMessage.metadata || {}),
+                groupName: chat.name,
+              };
+            }
+          } catch (error) {
+            this.logger.error('Error getting group chat name', String(error));
+          }
         }
 
         // Handle media
@@ -347,7 +370,8 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
       }
     });
 
-    this.client.on('message_create', msg => {
+    // eslint-disable-next-line @typescript-eslint/no-misused-promises
+    this.client.on('message_create', async msg => {
       // `message_create` fires for every message the account creates — including ones composed on a
       // linked phone, which the `message` event above never delivers. Incoming messages are already
       // handled there, so forward only the account's own outgoing (`fromMe`) messages; this is the
@@ -357,7 +381,24 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
       }
 
       try {
-        this.callbacks.onMessageCreate?.(buildIncomingMessageBase(msg));
+        const incomingMessage = buildIncomingMessageBase(msg);
+
+        // Handle group name
+        if (incomingMessage.isGroup) {
+          try {
+            const chat = await msg.getChat();
+            if (chat && chat.name) {
+              incomingMessage.metadata = {
+                ...(incomingMessage.metadata || {}),
+                groupName: chat.name,
+              };
+            }
+          } catch (error) {
+            this.logger.error('Error getting group chat name for outgoing message', String(error));
+          }
+        }
+
+        this.callbacks.onMessageCreate?.(incomingMessage);
       } catch (error) {
         this.logger.error('Error processing outgoing message', String(error));
       }
@@ -1029,17 +1070,19 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
 
   // Synchroniza mensajes recientes por chat al conectar para simular
   // parte del historial que Whatsapp Web puede ofrecer.
-  private async syncRecentMessages(options: {
-    limitPerChat?: number;
-    concurrency?: number;
-    downloadMedia?: boolean;
-    maxMediaSizeKB?: number;
-    allowedMimePrefixes?: string[];
-    downloadTimeoutMs?: number;
-    delayBetweenChatsMs?: number;
-    chatLimit?: number;
-    chatOffset?: number;
-  } = {}): Promise<void> {
+  private async syncRecentMessages(
+    options: {
+      limitPerChat?: number;
+      concurrency?: number;
+      downloadMedia?: boolean;
+      maxMediaSizeKB?: number;
+      allowedMimePrefixes?: string[];
+      downloadTimeoutMs?: number;
+      delayBetweenChatsMs?: number;
+      chatLimit?: number;
+      chatOffset?: number;
+    } = {},
+  ): Promise<void> {
     if (!this.client) return;
 
     const {
@@ -1105,12 +1148,20 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
                     const participantId = (msg as any).author || (msg as any).participant || undefined;
                     if (incomingMessage.isGroup && participantId) {
                       const resolved = await this.resolveParticipantId(participantId, incomingMessage.chatId);
-                      incomingMessage.metadata = { ...(incomingMessage.metadata || {}), participantName: resolved.name, participantId: resolved.id || participantId };
+                      incomingMessage.metadata = {
+                        ...(incomingMessage.metadata || {}),
+                        participantName: resolved.name,
+                        participantId: resolved.id || participantId,
+                      };
                       if (resolved.id) incomingMessage.from = resolved.id;
                     } else if (!String(incomingMessage.from || '').endsWith('@c.us')) {
                       // Normalize any non-@c.us 'from' to attempt to map to a contact by phone
                       const resolvedAny = await this.resolveParticipantId(incomingMessage.from, incomingMessage.chatId);
-                      incomingMessage.metadata = { ...(incomingMessage.metadata || {}), participantName: resolvedAny.name, participantId: resolvedAny.id || incomingMessage.from };
+                      incomingMessage.metadata = {
+                        ...(incomingMessage.metadata || {}),
+                        participantName: resolvedAny.name,
+                        participantId: resolvedAny.id || incomingMessage.from,
+                      };
                       if (resolvedAny.id) incomingMessage.from = resolvedAny.id;
                     }
                   } catch (err) {
@@ -1122,7 +1173,9 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
                   //   incomingMessage.from = resolvedId;
                   // }
 
-                  this.logger.debug(`syncRecentMessages: chat with resolved id ${incomingMessage.from || chatIdStr} fetched ${messages?.length || 0} messages`);
+                  this.logger.debug(
+                    `syncRecentMessages: chat with resolved id ${incomingMessage.from || chatIdStr} fetched ${messages?.length || 0} messages`,
+                  );
 
                   if (msg.hasMedia) {
                     const mimetype = (msg as any).mimetype || undefined;
@@ -1147,14 +1200,16 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
                               mimetype: media.mimetype || mimetype,
                               filename: media.filename || undefined,
                               data: media.data || undefined,
-                            } as any;
+                            };
                           } else {
-                            this.logger.log(`Skipping media download: size ${approxKB}KB exceeds max ${maxMediaSizeKB}KB`);
+                            this.logger.log(
+                              `Skipping media download: size ${approxKB}KB exceeds max ${maxMediaSizeKB}KB`,
+                            );
                             incomingMessage.media = {
                               mimetype: media.mimetype || mimetype,
                               filename: media.filename || undefined,
                               data: undefined,
-                            } as any;
+                            };
                           }
                         }
                       } catch (err) {
@@ -1163,19 +1218,24 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
                           mimetype: mimetype || undefined,
                           filename: undefined,
                           data: undefined,
-                        } as any;
+                        };
                       }
                     } else {
                       incomingMessage.media = {
                         mimetype: mimetype || undefined,
                         filename: undefined,
                         data: undefined,
-                      } as any;
+                      };
                     }
                   }
 
                   // Mark message as originating from sync so webhooks/consumers can treat it differently
-                  incomingMessage.metadata = { ...(incomingMessage.metadata || {}), synced: true, syncOrigin: 'history' };
+                  incomingMessage.metadata = {
+                    ...(incomingMessage.metadata || {}),
+                    synced: true,
+                    syncOrigin: 'history',
+                    ...(incomingMessage.isGroup && chat.name ? { groupName: chat.name } : {}),
+                  };
 
                   if (this.callbacks.onMessagesSynced) {
                     chatSyncedMessages.push(incomingMessage);
@@ -1225,7 +1285,6 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
    * Uses cache, contact lookup, contact list search and group participants as fallbacks.
    */
   private async resolveParticipantId(participantId: string, chatId?: string): Promise<{ id: string; name?: string }> {
-
     if (!participantId) return { id: participantId };
 
     // Cache hit
@@ -1294,7 +1353,7 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
         });
         if (found) {
           const user = found?.id?.user;
-          const phoneId = user ? `${user}@c.us` : (found?.id?._serialized || participantId);
+          const phoneId = user ? `${user}@c.us` : found?.id?._serialized || participantId;
           const name = found?.name || undefined;
           const result = { id: phoneId, name };
           this.participantResolutionCache.set(participantId, result);

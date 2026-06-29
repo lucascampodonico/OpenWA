@@ -470,7 +470,12 @@ export class MessageService {
    * Save incoming message (called from session webhook dispatch)
    */
   async saveIncomingMessage(sessionId: string, data: Partial<Message>): Promise<Message> {
-    this.logger.debug('saveIncomingMessage attempt', { sessionId, waMessageId: data.waMessageId, chatId: data.chatId, bodyLength: data.body ? String(data.body).length : 0 });
+    this.logger.debug('saveIncomingMessage attempt', {
+      sessionId,
+      waMessageId: data.waMessageId,
+      chatId: data.chatId,
+      bodyLength: data.body ? String(data.body).length : 0,
+    });
     // Evitar duplicados: si ya existe un mensaje con el mismo waMessageId y sessionId, retornarlo
     if (data.waMessageId) {
       try {
@@ -478,7 +483,11 @@ export class MessageService {
           where: { waMessageId: data.waMessageId, sessionId },
         });
         if (existing) {
-          this.logger.debug('saveIncomingMessage duplicate detected', { sessionId, waMessageId: data.waMessageId, existingId: existing.id });
+          this.logger.debug('saveIncomingMessage duplicate detected', {
+            sessionId,
+            waMessageId: data.waMessageId,
+            existingId: existing.id,
+          });
           return existing;
         }
       } catch (err) {
@@ -492,7 +501,12 @@ export class MessageService {
       direction: MessageDirection.INCOMING,
     });
     const saved = await this.messageRepository.save(message);
-    this.logger.log('saveIncomingMessage saved', { sessionId, id: saved.id, waMessageId: saved.waMessageId, chatId: saved.chatId });
+    this.logger.log('saveIncomingMessage saved', {
+      sessionId,
+      id: saved.id,
+      waMessageId: saved.waMessageId,
+      chatId: saved.chatId,
+    });
     return saved;
   }
 
