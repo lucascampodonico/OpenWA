@@ -30,15 +30,19 @@ timeline
                  : Webhook delivery-state & templates
                  : Security & container hardening
 
-    section v0.3.0 - SDK & Observability
-        Q3 2026 : JavaScript/Node.js & Python SDK
-                : Docs Site
-                : Prometheus Metrics
-                : Grafana Dashboard
+    section v0.3.0 - Engine Pluggability & Plugins (Released)
+        Jun 2026 : Baileys engine (browser-free)
+                 : Pluggable ENGINE_TYPE env var
+                 : Plugin capability layer
+
+    section v0.4.0 - Single-Port Deployment (Released)
+        Jun 2026 : Dashboard served from API port
+                 : Bundled Traefik removed
+                 : Bring-your-own reverse proxy
 
     section v1.0.0 - Enterprise
-        Q4 2026 : Baileys Engine
-                : Kubernetes Operator
+        2027 : Kubernetes Operator
+             : Multi-tenant
 ```
 
 ### Release Summary
@@ -61,8 +65,12 @@ timeline
 | v0.2.8  | Engine decoupling (ack/type/JID), templates, @lid→phone    | ✅ Released |
 | v0.2.9  | Reliability/security/a11y hardening (RBAC, deps, shutdown, retention) | ✅ Released |
 | v0.2.10 | Dashboard/CI follow-ups (MessageTester JID, neutral MessageType, qemu v4) | ✅ Released |
-| v0.3.0  | Deployment simplification (single-port UI, no Traefik) — next breaking release | 📋 Planned  |
-| v1.0.0  | Enterprise Ready (Baileys engine, K8s)                     | 📋 Planned  |
+| v0.3.0  | Engine pluggability (Baileys engine, plugin layer)                              | ✅ Released |
+| v0.4.0  | Single-port deployment (dashboard on API port, Traefik removed)                 | ✅ Released |
+| v0.5.x  | Plugin/dashboard hardening and SDK/docs increments                              | ✅ Released |
+| v0.6.x  | Operational hardening, API surface refinements, dashboard follow-ups            | ✅ Released |
+| v0.7.x  | Dashboard chat UX, infra backup/restore, media-download toggle, infra follow-ups | ✅ Released |
+| v1.0.0  | Enterprise Ready (K8s Operator, multi-tenant)                                   | 📋 Planned  |
 
 > SDK / docs-site / observability features (Node & Python SDK, Postman collection, Grafana, OpenTelemetry)
 > are delivered **incrementally** in `0.2.x`/`0.3.x` as they're additive — they no longer gate a single
@@ -82,7 +90,7 @@ Each phase includes a 2–3 week buffer for:
 | Requirement        | Details                                                   |
 | ------------------ | --------------------------------------------------------- |
 | **Development**    | 1-2 full-time developers (or equivalent part-time)        |
-| **Environment**    | Node.js 20 LTS, Docker, Git                               |
+| **Environment**    | Node.js 22 LTS, Docker, Git                               |
 | **Testing**        | WhatsApp test accounts (2-3 numbers)                      |
 | **Infrastructure** | VPS for staging (2GB RAM minimum)                         |
 | **Accounts**       | GitHub organization, npm registry access, Docker Hub/GHCR |
@@ -308,7 +316,7 @@ gantt
     Message queue               :p2-18, after p2-17, 2d
 
     section Dashboard (Week 8-10)
-    React + shadcn/ui setup     :p2-19, after p2-18, 3d
+    React + bespoke-CSS setup   :p2-19, after p2-18, 3d
     Authentication UI           :p2-20, after p2-19, 3d
     Session management          :p2-21, after p2-20, 4d
     QR code display             :p2-22, after p2-21, 2d
@@ -454,8 +462,8 @@ gantt
 
 | Feature            | Priority | Status |
 | ------------------ | -------- | ------ |
-| Horizontal scaling | P2       | ✅     |
-| Session affinity   | P2       | ✅     |
+| Horizontal scaling | P2       | 📄 Design reference only; single active owner per session remains required |
+| Session affinity   | P2       | 📄 Documented for future topology, not implemented as multi-replica runtime |
 | Security audit     | P0       | ✅     |
 
 #### Community & Tooling
@@ -486,7 +494,7 @@ v0.1.0 Release Package:
 ## 15.6 Future Roadmap (v0.3.0+)
 
 > **Note:** Version 0.1.0 is the initial stable release including all features from Phases 1-3.
-> Versions 0.1.7, 0.1.8, 0.2.0, and 0.2.1 have since shipped (see the CHANGELOG); v0.3.0
+> Versions 0.1.7 through 0.7.8 have since shipped (see the CHANGELOG); v1.0.0
 > onward is forward-looking.
 
 ```mermaid
@@ -504,13 +512,13 @@ flowchart LR
         V020[v0.2.0 - i18n, Real-time Chats,<br/>Webhook Delivery-state & Hardening]
     end
 
-    subgraph v0.x["v0.x Series - Enhancements"]
-        V030[v0.3.0 - SDK, Developer Tools & Observability]
+    subgraph v0.x["✅ Released (v0.3–v0.4)"]
+        V030[v0.3.0 - Engine Pluggability<br/>Baileys engine + plugin layer]
+        V040[v0.4.0 - Single-Port Deployment<br/>Dashboard on API port, no bundled Traefik]
     end
 
     subgraph v1.x["v1.x Series - Enterprise"]
         V10[v1.0.0 - Enterprise Ready]
-        V11[v1.1.0 - Multi-engine Support]
     end
 
     Phase1 --> Phase2 --> Stable --> v0.x --> v1.x
@@ -527,42 +535,76 @@ flowchart LR
 | Security & API surface hardening | P0       | ✅     |
 | Container / Podman hardening     | P1       | ✅     |
 
-### v0.3.0 — Deployment simplification (next breaking release)
+### v0.3.0 — Engine pluggability & plugin layer (Released)
 
-`0.3.0` is the next **breaking** release (per §15.2). Its headline is the deployment simplification:
-serve the dashboard from the API on a single port (`@nestjs/serve-static`) and drop the bundled Traefik
-service (#275, #276), plus moving Puppeteer/browser config out of the neutral engine contract (#265).
-Ships with a migration guide. The remaining engine-pluggability items (#265) and other non-breaking work
-land across `0.2.x`.
+`0.3.0` shipped as a **breaking** release (per §15.2). It introduced a pluggable engine layer
+(`ENGINE_TYPE` env var: `whatsapp-web.js` default or `baileys` for a browser-free alternative loaded
+lazily), moved Puppeteer/browser config out of the neutral engine contract (#265), and added a Tier-2
+plugin capability layer (`ctx.messages` / `ctx.engine`; `PluginContext.getService` removed).
+Ships with a migration guide.
+
+### v0.4.0 — Single-port deployment (Released)
+
+`0.4.0` shipped as a **breaking** release. The dashboard SPA is now served directly from the API on its
+own port (default `:2785`) via `@nestjs/serve-static`; the bundled Traefik service is removed (#275,
+#276). Use your own reverse proxy (nginx, Caddy, a cloud load balancer) for TLS/public exposure.
+`SERVE_DASHBOARD=false` opts out. The `DASHBOARD_PORT`, `PROXY_ENABLED`, and `DASHBOARD_ENABLED` env
+vars are removed. Ships with a migration guide.
 
 #### Incremental themes — SDK, Developer Tools & Observability
 
-Delivered additively whenever ready (so they land in `0.2.x`/`0.3.x` per SemVer, not gated to one version):
+Delivered additively whenever ready, per SemVer (not gated to one version). The client SDKs and Prometheus metrics have **shipped** (v0.7.x); the rest remain open.
 
-| Feature                | Priority | Description                     |
-| ---------------------- | -------- | ------------------------------- |
-| JavaScript/Node.js SDK | P1       | Official client library         |
-| Python SDK             | P2       | Python client library           |
-| Docs Site              | P1       | Documentation website           |
-| Postman Collection     | P1       | Ready-to-use API collection     |
-| Video Tutorials        | P2       | Getting started video series    |
-| Example Projects       | P1       | Real-world integration examples |
+| Feature                | Priority | Status | Description                     |
+| ---------------------- | -------- | ------ | ------------------------------- |
+| JavaScript/Node.js SDK | P1       | ✅ Shipped (`@rmyndharis/openwa`) | Official client library |
+| Python SDK             | P2       | ✅ Shipped (`rmyndharis-openwa`) | Python client library |
+| PHP SDK                | P2       | ✅ Shipped (`rmyndharis/openwa`) | PHP client library |
+| Postman Collection     | P1       | ◐ cURL collection (doc 07); Postman export TBD | Ready-to-use API collection |
+| Docs Site              | P1       | ☐ Open | Documentation website |
+| Video Tutorials        | P2       | ☐ Open | Getting started video series    |
+| Example Projects       | P1       | ◐ A few under `docs/examples/` | Real-world integration examples |
 
 **Performance & Observability**
 
-| Feature                | Priority | Description                      |
-| ---------------------- | -------- | -------------------------------- |
-| Prometheus Metrics     | P1       | /metrics endpoint for monitoring |
-| Grafana Dashboard      | P2       | Pre-built monitoring dashboard   |
-| OpenTelemetry Tracing  | P2       | Distributed tracing support      |
-| Performance Benchmarks | P1       | Documented performance metrics   |
-| Memory Optimization    | P1       | Reduced memory per session       |
+| Feature                | Priority | Status | Description                      |
+| ---------------------- | -------- | ------ | -------------------------------- |
+| Prometheus Metrics     | P1       | ✅ Shipped (`GET /api/metrics`, `openwa_*`) | /metrics endpoint for monitoring |
+| Grafana Dashboard      | P2       | ☐ Open | Pre-built monitoring dashboard   |
+| OpenTelemetry Tracing  | P2       | ☐ Open | Distributed tracing support      |
+| Performance Benchmarks | P1       | ☐ Open | Documented performance metrics   |
+| Memory Optimization    | P1       | ☐ Open | Reduced memory per session       |
+
+### Integration Fabric — inbound integrations for plugins (in progress)
+
+A core substrate that lets sandboxed marketplace plugins implement bidirectional external integrations
+(helpdesk agent inboxes, chatbot flow builders, CRMs) **without running their own server**. Until now a
+plugin could only make outbound calls; the Integration Fabric adds a governed **inbound** path — the core
+receives a signature-verified webhook, dedups and queues it, and hands it to the plugin, which replies to
+the WhatsApp chat through a normalized capability. The core owns ingress, verification, ordering,
+delivery, and the dead-letter queue; the plugin owns only provider-specific logic. Plugins consume it
+through a stable, versioned **Integration SDK (v1)**. Motivated by #553.
+
+Delivered in phases (additive; see [25 - Integration Fabric](./25-integration-fabric.md) for the
+architecture and design rationale):
+
+| Phase | Scope                                                                                                                                                                          | Status                         |
+| ----- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------ |
+| P0    | Core substrate: inbound webhook RPC, `@Public` ingress endpoint with HMAC-over-raw-body verification, plugin-instance primitive, normalized send capability, identity/dedup/DLQ tables, ingress queue. SDK v1 frozen. | ✅ Merged (internal substrate) |
+| P1    | Scale-correctness: per-conversation FIFO ordering, per-instance fairness, DLQ redrive, bot/human handover.                                                                    | ✅ Merged (internal substrate) |
+| P2    | Operator provisioning (mint plugin instances and secrets, dashboard) + the first adapter (helpdesk inbox) shipped as a marketplace plugin — closes #553 end-to-end.           | 📋 Planned                     |
+| P3    | Second adapter (chatbot flow builder) — validates the substrate generalizes.                                                                                                 | 📋 Planned                     |
+| P4    | Developer experience: SDK reference docs, compatibility test suite, secret rotation, multi-node routing.                                                                      | 📋 Planned                     |
+
+> **P0 and P1 are an internal foundation, not a user-facing feature yet.** The ingress flow requires an
+> operator provisioning step (minting a plugin instance and its secret) that lands in P2; until then it is
+> reachable only by direct configuration. The public SDK reference and the first ready-to-use adapter
+> arrive in P2–P4.
 
 ### v1.0.0 - Enterprise Ready
 
 | Feature             | Priority | Description                    |
 | ------------------- | -------- | ------------------------------ |
-| Baileys Engine      | P2       | Alternative lightweight engine |
 | Kubernetes Operator | P3       | Native K8s deployment          |
 | Multi-tenant        | P3       | Enterprise SaaS features       |
 | Encryption at rest  | P2       | Full data encryption           |
@@ -646,7 +688,7 @@ flowchart TB
 | Dashboard functional  | All features | ✅ Achieved       | Internal |
 | PostgreSQL stable     | ✅           | ✅ Achieved       | Internal |
 | Webhook delivery rate | > 99%        | ✅ Achieved       | Internal |
-| Test coverage         | > 70%        | ⚠️ ~5% (deferred) | Internal |
+| Test coverage         | > 70%        | ⚠️ 66.87% line coverage; 80% improvement plan active | Internal |
 | GitHub stars          | 100+         | 📋 Pending        | External |
 
 ### Phase 3 Success Criteria
@@ -655,7 +697,7 @@ flowchart TB
 | ----------------------------- | ------- | ----------------- | -------- |
 | Feature parity with WAHA Plus | 90%+    | ✅ Achieved       | Internal |
 | API response time (p95)       | < 200ms | ✅ Achieved       | Internal |
-| Test coverage                 | > 80%   | ⚠️ ~5% (deferred) | Internal |
+| Test coverage                 | > 80%   | ⚠️ 66.87% line coverage; in progress | Internal |
 | Documentation coverage        | 100%    | ✅ 95%+           | Internal |
 | Production users              | 50+     | 📋 Pending        | External |
 | GitHub stars                  | 500+    | 📋 Pending        | External |

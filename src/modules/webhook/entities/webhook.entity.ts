@@ -10,13 +10,16 @@ import {
 import { Session } from '../../session/entities/session.entity';
 import { DateTransformer } from '../../../common/transformers/date.transformer';
 import { jsonColumnType, dateColumnType } from '../../../common/utils/column-types';
+import { WebhookFilters } from '../filters/filter-types';
 
 @Entity('webhooks')
 export class Webhook {
   @PrimaryGeneratedColumn('uuid')
   id: string;
 
-  @Column({ type: 'uuid' })
+  // varchar (not uuid) to match the authoritative migration DDL and sessions.id; the data connection
+  // runs synchronize:false, so a 'uuid' decorator here would only mislead schema diffs / a stray sync.
+  @Column({ type: 'varchar' })
   sessionId: string;
 
   @ManyToOne(() => Session, { onDelete: 'CASCADE' })
@@ -34,6 +37,10 @@ export class Webhook {
 
   @Column({ type: jsonColumnType(), default: '{}' })
   headers: Record<string, string>;
+
+  // Optional smart pre-filter. Null/absent means "no filtering" (fire on every subscribed event).
+  @Column({ type: jsonColumnType(), nullable: true })
+  filters: WebhookFilters | null;
 
   @Column({ type: 'boolean', default: true })
   active: boolean;

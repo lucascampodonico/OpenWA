@@ -4,7 +4,10 @@ import { IWhatsAppEngine } from './interfaces/whatsapp-engine.interface';
 import { WhatsAppWebJsAdapter } from './adapters/whatsapp-web-js.adapter';
 import { PluginLoaderService, PluginType, IEnginePlugin, PluginManifest } from '../core/plugins';
 import { WhatsAppWebJsPlugin } from '../plugins/engines/whatsapp-web-js';
+import { BaileysPlugin } from '../plugins/engines/baileys';
 import { createLogger } from '../common/services/logger.service';
+import { BaileysMessageStoreService } from './adapters/baileys-message-store.service';
+import { LidMappingStoreService } from './identity/lid-mapping-store.service';
 
 export interface EngineCreateOptions {
   sessionId: string;
@@ -20,6 +23,8 @@ export class EngineFactory implements OnModuleInit {
   constructor(
     private readonly configService: ConfigService,
     private readonly pluginLoader: PluginLoaderService,
+    private readonly baileysMessageStore: BaileysMessageStoreService,
+    private readonly lidMappingStore: LidMappingStoreService,
   ) {
     this.engineType = this.configService.get<string>('engine.type') ?? 'whatsapp-web.js';
   }
@@ -30,6 +35,12 @@ export class EngineFactory implements OnModuleInit {
   }
 
   private async registerBuiltInEngines(): Promise<void> {
+    // The engine config sub-tree (engine.* from configuration.ts) as an opaque blob. Supplied BOTH
+    // to registerBuiltInPlugin (becomes context.config when onLoad runs) AND to each plugin's
+    // constructor (A fallback so createEngine still has operator config if enablePlugin fails
+    // before onLoad — otherwise sessionDataPath/executablePath/authDir would silently drop to defaults).
+    const engineConfig = this.configService.get<Record<string, unknown>>('engine') ?? {};
+
     // Register WhatsApp-web.js as built-in plugin
     const wwjsManifest: PluginManifest = {
       id: 'whatsapp-web.js',
@@ -41,10 +52,25 @@ export class EngineFactory implements OnModuleInit {
       provides: ['whatsapp-engine'],
     };
 
-    const wwjsPlugin = new WhatsAppWebJsPlugin();
-    // Supply the engine config sub-tree (engine.* from configuration.ts) as an opaque blob;
-    // the plugin reads its own namespace (puppeteer.*, sessionDataPath) from context.config.
-    this.pluginLoader.registerBuiltInPlugin(wwjsManifest, wwjsPlugin, this.configService.get('engine') ?? {});
+    const wwjsPlugin = new WhatsAppWebJsPlugin(engineConfig, this.lidMappingStore);
+    this.pluginLoader.registerBuiltInPlugin(wwjsManifest, wwjsPlugin, engineConfig);
+
+    // Register Baileys as a second built-in engine plugin. Same opaque engine blob; the plugin
+    // reads only its own namespace (baileys.authDir) from context.config.
+    const baileysManifest: PluginManifest = {
+      id: 'baileys',
+      name: 'Baileys Engine',
+      version: '1.0.0',
+      type: PluginType.ENGINE,
+      description: 'Baileys (WebSocket, no-browser) engine adapter',
+      main: 'index.ts',
+      provides: ['whatsapp-engine'],
+    };
+    this.pluginLoader.registerBuiltInPlugin(
+      baileysManifest,
+      new BaileysPlugin(this.baileysMessageStore, engineConfig, this.lidMappingStore),
+      engineConfig,
+    );
 
     // Auto-enable the configured engine
     try {
@@ -97,6 +123,15 @@ export class EngineFactory implements OnModuleInit {
   }
 
   private createFallbackEngine(options: EngineCreateOptions): IWhatsAppEngine {
+    // This legacy fallback can only construct the whatsapp-web.js adapter. If a different engine was
+    // requested (e.g. ENGINE_TYPE=baileys) and its plugin wasn't available, building wwebjs here would
+    // silently run the WRONG engine — fail loudly so the misconfiguration is visible instead.
+    if (this.engineType !== 'whatsapp-web.js') {
+      throw new Error(
+        `Engine '${this.engineType}' is unavailable and has no direct fallback; cannot start the session.`,
+      );
+    }
+
     // Legacy direct creation (fallback)
     return new WhatsAppWebJsAdapter({
       sessionId: options.sessionId,
@@ -112,6 +147,7 @@ export class EngineFactory implements OnModuleInit {
             type: options.proxyType ?? 'http',
           }
         : undefined,
+      lidMappingStore: this.lidMappingStore,
     });
   }
 

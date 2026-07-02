@@ -5,7 +5,7 @@
 > **OpenWA is currently a single-process, single-instance application.** Live WhatsApp
 > engine state (browser + WebSocket + reconnect/error state) lives in an in-memory `Map`
 > in `SessionService`; there is **no** DB-backed session registry, **no** node-claim/lease,
-> and **no** Socket.IO Redis adapter (findings H1/H11).
+> and **no** Socket.IO Redis adapter.
 >
 > **Supported topology:** exactly **one** API instance per session-data volume. Running
 > multiple replicas against a shared session volume — as the multi-node examples below
@@ -66,7 +66,7 @@ flowchart TB
 
 ## 13.2 Session Affinity Strategy
 
-Since WhatsApp sessions maintain WebSocket connections and browser instances, they cannot be freely moved between nodes.
+Since WhatsApp sessions maintain active connections (a browser instance for `whatsapp-web.js`, or a WebSocket for `baileys` — set via `ENGINE_TYPE`), they cannot be freely moved between nodes.
 
 ### Strategy 1: Session-to-Node Mapping (Recommended)
 
@@ -105,9 +105,9 @@ version: '3.8'
 
 services:
   openwa:
-    image: ghcr.io/rmyndharis/openwa:0.2.0
+    image: ghcr.io/rmyndharis/openwa:0.4.6
     deploy:
-      replicas: 1 # MUST stay 1 until session-claim is implemented — multiple replicas on one session volume corrupt WhatsApp auth (H1/H11)
+      replicas: 1 # MUST stay 1 until session-claim is implemented — multiple replicas on one session volume corrupt WhatsApp auth
       update_config:
         parallelism: 1
         delay: 30s
@@ -163,24 +163,10 @@ services:
     networks:
       - openwa-net
 
-  traefik:
-    image: traefik:v3.0
-    deploy:
-      replicas: 1
-      placement:
-        constraints:
-          - node.role == manager
-    ports:
-      - '80:80'
-      - '443:443'
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock:ro
-    command:
-      - '--providers.swarm=true'
-      - '--entrypoints.web.address=:80'
-      - '--entrypoints.websecure.address=:443'
-    networks:
-      - openwa-net
+  # NOTE (v0.4.0): OpenWA no longer ships a bundled Traefik container.
+  # For TLS / public exposure, bring your own reverse proxy (Traefik, nginx,
+  # Caddy, a cloud load balancer, etc.) and point it at openwa:2785.
+  # See section 13.5 for Traefik / nginx config examples.
 
 volumes:
   postgres-data:
@@ -237,7 +223,7 @@ data:
   REDIS_HOST: 'redis-service'
   REDIS_PORT: '6379'
   ENABLE_QUEUE: 'true'
-  API_PORT: '3000'
+  PORT: '2785'
 ```
 
 ### k8s/secret.yaml
@@ -266,7 +252,7 @@ metadata:
   namespace: openwa
 spec:
   serviceName: openwa
-  replicas: 1 # MUST stay 1 until session-claim is implemented (H1/H11) — see the warning at the top of this guide
+  replicas: 1 # MUST stay 1 until session-claim is implemented — see the warning at the top of this guide
   selector:
     matchLabels:
       app: openwa
@@ -277,9 +263,9 @@ spec:
     spec:
       containers:
         - name: openwa
-          image: ghcr.io/rmyndharis/openwa:0.2.0
+          image: ghcr.io/rmyndharis/openwa:0.4.6
           ports:
-            - containerPort: 3000
+            - containerPort: 2785
               name: http
           envFrom:
             - configMapRef:
@@ -304,13 +290,13 @@ spec:
           livenessProbe:
             httpGet:
               path: /api/health
-              port: 3000
+              port: 2785
             initialDelaySeconds: 30
             periodSeconds: 10
           readinessProbe:
             httpGet:
               path: /api/health/ready
-              port: 3000
+              port: 2785
             initialDelaySeconds: 10
             periodSeconds: 5
   volumeClaimTemplates:
@@ -337,7 +323,7 @@ spec:
     app: openwa
   ports:
     - port: 80
-      targetPort: 3000
+      targetPort: 2785
       name: http
 ---
 apiVersion: v1
@@ -350,7 +336,7 @@ spec:
   selector:
     app: openwa
   ports:
-    - port: 3000
+    - port: 2785
       name: http
 ```
 
@@ -533,11 +519,11 @@ groups:
 
 ### Health Check Endpoints
 
-| Endpoint               | Purpose                         |
-| ---------------------- | ------------------------------- |
-| `/api/health`          | Liveness probe                  |
-| `/api/health/ready`    | Readiness probe                 |
-| `/api/health/detailed` | Full status with DB/Redis check |
+| Endpoint            | Purpose                                                          |
+| ------------------- | ---------------------------------------------------------------- |
+| `/api/health`       | Basic health check — returns `status`, `timestamp`, `version`    |
+| `/api/health/live`  | Liveness probe (static `ok`; reflects process liveness only)     |
+| `/api/health/ready` | Readiness probe — verifies the main + data databases respond (returns 503 while draining or if a DB is down) |
 ---
 
 <div align="center">

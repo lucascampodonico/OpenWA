@@ -6,6 +6,7 @@ export default () => ({
     host: process.env.REDIS_HOST || 'localhost',
     port: parseInt(process.env.REDIS_PORT || '6379', 10),
     password: process.env.REDIS_PASSWORD,
+    connectTimeoutMs: parseInt(process.env.REDIS_CONNECT_TIMEOUT_MS || '5000', 10),
   },
 
   // Queue configuration
@@ -21,10 +22,15 @@ export default () => ({
   // Main Database configuration (always SQLite for boot config)
   database: {
     type: 'sqlite' as const,
-    database: './data/main.sqlite',
+    // SQLite file for the auth/audit DB. Overridable (e.g. e2e points it at a temp file) so tests
+    // never write api keys into the developer's ./data/main.sqlite.
+    database: process.env.MAIN_DATABASE_NAME || './data/main.sqlite',
     // Schema management for the auth/audit DB. Default ON (zero-config first boot).
     // Set MAIN_DATABASE_SYNCHRONIZE=false to manage schema via the main-owned migrations
-    // instead (migrationsRun then creates api_keys/audit_logs).
+    // instead (migrationsRun then creates api_keys/audit_logs). When disabled, run the
+    // main-connection migrations explicitly with `npm run migration:run:main` (or
+    // `migration:run:main:prod` for the compiled image) — the plain `migration:run` only
+    // manages the data connection.
     synchronize: process.env.MAIN_DATABASE_SYNCHRONIZE !== 'false',
     logging: process.env.DATABASE_LOGGING === 'true',
   },
@@ -47,6 +53,11 @@ export default () => ({
     logging: process.env.DATABASE_LOGGING === 'true',
     // Connection pooling (PostgreSQL)
     poolSize: parseInt(process.env.DATABASE_POOL_SIZE || '10', 10),
+    // Pool/query timeouts (PostgreSQL). statement_timeout is server-side per query; idle/connection
+    // are pool-side. Set any to 0 to disable. Applied to the runtime connection only (see app.module).
+    statementTimeoutMs: parseInt(process.env.DATABASE_STATEMENT_TIMEOUT_MS || '30000', 10),
+    idleTimeoutMs: parseInt(process.env.DATABASE_IDLE_TIMEOUT_MS || '30000', 10),
+    connectionTimeoutMs: parseInt(process.env.DATABASE_CONNECTION_TIMEOUT_MS || '10000', 10),
     // SSL configuration
     ssl: process.env.DATABASE_SSL === 'true',
     sslRejectUnauthorized: process.env.DATABASE_SSL_REJECT_UNAUTHORIZED !== 'false',
@@ -57,13 +68,27 @@ export default () => ({
     type: process.env.ENGINE_TYPE || 'whatsapp-web.js',
     puppeteer: {
       headless: process.env.PUPPETEER_HEADLESS !== 'false',
-      args: (process.env.PUPPETEER_ARGS || '--no-sandbox,--disable-setuid-sandbox').split(','),
+      // Accept either delimiter: .env/compose use commas, the dashboard Infrastructure form
+      // persists space-separated. Splitting on both keeps each flag a discrete argv token —
+      // a single glued token like "--no-sandbox --disable-gpu" silently neuters --no-sandbox.
+      args: (process.env.PUPPETEER_ARGS || '--no-sandbox,--disable-setuid-sandbox').split(/[\s,]+/).filter(Boolean),
       // Optional path to a system Chromium/Chrome binary. When unset, whatsapp-web.js
       // uses Puppeteer's bundled Chromium. Required on hosts where the bundled binary
       // is missing or incompatible (Alpine, ARM, custom base images).
       executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
     },
     sessionDataPath: process.env.SESSION_DATA_PATH || './data/sessions',
+    // Baileys engine (used when ENGINE_TYPE=baileys). Multi-file auth state base dir; each session
+    // gets its own subdirectory. Read by the Baileys plugin from the opaque engine config blob.
+    baileys: {
+      authDir: process.env.BAILEYS_AUTH_DIR || './data/baileys',
+    },
+  },
+
+  sessions: {
+    // 0 = unlimited/backwards-compatible. Set to a positive integer to cap concurrently running or
+    // initializing WhatsApp engines, which protects memory/Chromium-constrained deployments.
+    maxConcurrent: parseInt(process.env.MAX_CONCURRENT_SESSIONS || '0', 10),
   },
 
   // Webhook configuration
@@ -98,6 +123,23 @@ export default () => ({
       .split(',')
       .map(proxy => proxy.trim())
       .filter(Boolean),
+  },
+
+  // Plugin platform configuration
+  plugins: {
+    // Where installed plugins live on disk (matches the plugin loader's default).
+    dir: process.env.PLUGINS_DIR || './plugins',
+    // Remote catalog of installable plugins (JSON array; the OpenWA-plugins repo's plugins.json).
+    // Fetched through the SSRF guard — add its host to SSRF_ALLOWED_HOSTS if it is not publicly resolvable.
+    catalogUrl:
+      process.env.PLUGIN_CATALOG_URL || 'https://raw.githubusercontent.com/rmyndharis/OpenWA-plugins/main/plugins.json',
+    // Cap on a plugin .zip downloaded by install-from-URL (matches the 5 MB upload limit). Fail-safe:
+    // a non-numeric or non-positive value (parseInt → NaN/0/-n) falls back to the default rather than
+    // silently disabling the cap (a downstream `??` would not catch NaN).
+    downloadMaxBytes: (() => {
+      const n = parseInt(process.env.PLUGIN_DOWNLOAD_MAX_BYTES ?? '', 10);
+      return Number.isFinite(n) && n > 0 ? n : 5 * 1024 * 1024;
+    })(),
   },
 
   // Storage configuration

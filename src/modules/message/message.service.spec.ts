@@ -1,7 +1,7 @@
 import { Test, TestingModule } from '@nestjs/testing';
 import { getRepositoryToken } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
-import { BadRequestException, NotFoundException } from '@nestjs/common';
+import { BadRequestException, NotFoundException, PayloadTooLargeException } from '@nestjs/common';
 import { MessageService } from './message.service';
 import { Message, MessageDirection, MessageStatus } from './entities/message.entity';
 import { SessionService } from '../session/session.service';
@@ -9,6 +9,7 @@ import { HookManager } from '../../core/hooks';
 import { TemplateService } from '../template/template.service';
 import { Template } from '../template/entities/template.entity';
 import { SsrfBlockedError } from '../../common/security/ssrf-guard';
+import { LidMappingStoreService } from '../../engine/identity/lid-mapping-store.service';
 
 const mockEngineResult = { id: 'wa-msg-1', timestamp: 1706868000 };
 
@@ -38,6 +39,7 @@ describe('MessageService', () => {
   let sessionService: jest.Mocked<Partial<SessionService>>;
   let hookManager: jest.Mocked<Partial<HookManager>>;
   let templateService: jest.Mocked<Partial<TemplateService>>;
+  let lidMappingStore: { lidsForPhone: jest.Mock };
   let mockEngine: ReturnType<typeof createMockEngine>;
 
   // Auto-typing is on by default; disable it for the unrelated send tests so they don't incur the
@@ -77,6 +79,8 @@ describe('MessageService', () => {
       resolve: jest.fn(),
     };
 
+    lidMappingStore = { lidsForPhone: jest.fn().mockReturnValue([]) };
+
     const module: TestingModule = await Test.createTestingModule({
       providers: [
         MessageService,
@@ -84,6 +88,7 @@ describe('MessageService', () => {
         { provide: SessionService, useValue: sessionService },
         { provide: HookManager, useValue: hookManager },
         { provide: TemplateService, useValue: templateService },
+        { provide: LidMappingStoreService, useValue: lidMappingStore },
       ],
     }).compile();
 
@@ -122,6 +127,16 @@ describe('MessageService', () => {
       expect(mockEngine.sendTextMessage).toHaveBeenCalledWith('628123456789@c.us', 'Hello');
     });
 
+    it('threads mentions through to the engine (#530)', async () => {
+      const input = { chatId: '120@g.us', text: 'hi @62811', mentions: ['62811@c.us'] };
+      (hookManager.execute as jest.Mock).mockResolvedValueOnce({
+        continue: true,
+        data: { sessionId: 'sess-1', input, type: 'text' },
+      });
+      await service.sendText('sess-1', input);
+      expect(mockEngine.sendTextMessage).toHaveBeenCalledWith('120@g.us', 'hi @62811', ['62811@c.us']);
+    });
+
     it('should save outgoing message as pending before sending, then update to sent', async () => {
       await service.sendText('sess-1', {
         chatId: '628123456789@c.us',
@@ -140,6 +155,20 @@ describe('MessageService', () => {
       );
       // save called twice: once for initial pending, once for status update to sent
       expect(repository.save).toHaveBeenCalledTimes(2);
+    });
+
+    it('returns success (not FAILED) when persisting the SENT state fails after a successful send', async () => {
+      // 1st save (PENDING) ok; 2nd save (SENT-state, after WhatsApp already accepted the message) throws.
+      (repository.save as jest.Mock)
+        .mockImplementationOnce((msg: unknown) => Promise.resolve(msg))
+        .mockRejectedValueOnce(new Error('transient db fault'));
+
+      const result = await service.sendText('sess-1', { chatId: '628123456789@c.us', text: 'Hello' });
+
+      // The send succeeded, so it is reported as success — not rethrown, not marked FAILED.
+      expect(result.messageId).toBe('wa-msg-1');
+      expect(result.timestamp).toBe(1706868000);
+      expect(hookManager.execute).not.toHaveBeenCalledWith('message:failed', expect.anything(), expect.anything());
     });
 
     it('executes the message:sending hook (message:sent now fires once from the engine message_create path)', async () => {
@@ -290,12 +319,65 @@ describe('MessageService', () => {
       );
     });
 
+    it('threads media mentions into the MediaInput (#530)', async () => {
+      await service.sendImage('sess-1', {
+        chatId: '120@g.us',
+        base64: 'AAAA',
+        mimetype: 'image/png',
+        caption: 'look @62811',
+        mentions: ['62811@c.us'],
+      });
+      expect(mockEngine.sendImageMessage).toHaveBeenCalledWith(
+        '120@g.us',
+        expect.objectContaining({ mentions: ['62811@c.us'] }),
+      );
+    });
+
     it('maps a blocked-media-URL SSRF error to HTTP 400', async () => {
       mockEngine.sendImageMessage.mockRejectedValueOnce(new SsrfBlockedError('Blocked internal address: 127.0.0.1'));
 
       await expect(
         service.sendImage('sess-1', { chatId: '628123456789@c.us', url: 'http://127.0.0.1/x.png' }),
       ).rejects.toBeInstanceOf(BadRequestException);
+    });
+
+    it('rejects a base64 image over the media cap before sending or persisting', async () => {
+      process.env.MEDIA_DOWNLOAD_MAX_BYTES = '1024';
+      try {
+        await expect(
+          service.sendImage('sess-1', {
+            chatId: '628123456789@c.us',
+            base64: Buffer.alloc(1025).toString('base64'),
+            mimetype: 'image/png',
+          }),
+        ).rejects.toBeInstanceOf(PayloadTooLargeException);
+        expect(mockEngine.sendImageMessage).not.toHaveBeenCalled();
+      } finally {
+        delete process.env.MEDIA_DOWNLOAD_MAX_BYTES;
+      }
+    });
+
+    it('strips the base64 payload from a FAILED media row but keeps mimetype/filename', async () => {
+      mockEngine.sendImageMessage.mockRejectedValueOnce(new Error('engine down'));
+
+      await expect(
+        service.sendImage('sess-1', {
+          chatId: '628123456789@c.us',
+          base64: 'QUJDREVGISBhIGJpZyBwYXlsb2Fk',
+          mimetype: 'image/png',
+          filename: 'pic.png',
+        }),
+      ).rejects.toThrow();
+
+      // The persisted FAILED row must not retain the (often multi-MB) base64 — it's never displayed
+      // or retried — but should keep the descriptive mimetype/filename.
+      const calls = (repository.save as jest.Mock).mock.calls as [Message][];
+      const saved = calls.at(-1)![0];
+      expect(saved.status).toBe(MessageStatus.FAILED);
+      const media = (saved.metadata as { media?: { data?: unknown; mimetype?: string; filename?: string } }).media;
+      expect(media?.data).toBeUndefined();
+      expect(media?.mimetype).toBe('image/png');
+      expect(media?.filename).toBe('pic.png');
     });
   });
 
@@ -344,6 +426,91 @@ describe('MessageService', () => {
     });
   });
 
+  // ── getMessages from-filter (lid resolution becomes a hit) ─────────
+  describe('getMessages from-filter resolves a lid to a phone', () => {
+    // A group message whose stored author is an unresolved lid, plus a plain DM from the same person.
+    const lidRow = { id: 'm-lid', from: '111@lid', chatId: 'grp@g.us' } as Message;
+    const dmRow = { id: 'm-dm', from: '628999@c.us', chatId: '628999@c.us' } as Message;
+    const rows = [lidRow, dmRow];
+
+    // A query-builder fake that actually filters by the `from IN (:...froms)` clause it receives, so the
+    // test exercises the resolution-driven expansion end to end (filter -> rows returned).
+    const makeFilteringQb = () => {
+      let froms: string[] | null = null;
+      const qb = {
+        where: jest.fn().mockReturnThis(),
+        orderBy: jest.fn().mockReturnThis(),
+        skip: jest.fn().mockReturnThis(),
+        take: jest.fn().mockReturnThis(),
+        andWhere: jest.fn().mockImplementation((_clause: string, params?: { froms?: string[] }) => {
+          if (params?.froms) froms = params.froms;
+          return qb;
+        }),
+        getManyAndCount: jest.fn().mockImplementation(() => {
+          const matched = froms ? rows.filter(r => froms!.includes(r.from)) : rows;
+          return Promise.resolve([matched, matched.length]);
+        }),
+      };
+      return qb;
+    };
+
+    it('returns the lid-authored message once the table maps the lid to that phone (the hit)', async () => {
+      lidMappingStore.lidsForPhone.mockReturnValue(['111']); // table: lid 111 -> phone 628999
+      const qb = makeFilteringQb();
+      (repository.createQueryBuilder as jest.Mock).mockReturnValue(qb);
+
+      const { messages } = await service.getMessages('sess-1', { from: '628999' });
+
+      expect(lidMappingStore.lidsForPhone).toHaveBeenCalledWith('628999');
+      expect(messages.map(m => m.id).sort()).toEqual(['m-dm', 'm-lid']);
+    });
+
+    it('misses the lid-authored message when the table has no mapping (the prior silent miss)', async () => {
+      lidMappingStore.lidsForPhone.mockReturnValue([]); // unresolved: no lid -> phone row yet
+      const qb = makeFilteringQb();
+      (repository.createQueryBuilder as jest.Mock).mockReturnValue(qb);
+
+      const { messages } = await service.getMessages('sess-1', { from: '628999' });
+
+      expect(messages.map(m => m.id)).toEqual(['m-dm']); // only the @c.us DM matches
+    });
+  });
+
+  // ── getMessages chatId filter is dialect-agnostic ─────────────────
+  describe('getMessages chatId filter matches across dialects', () => {
+    // A message stored with the raw @s.whatsapp.net chatId (e.g. an outbound send addressed by a raw id).
+    const stored = { id: 'm1', from: '628113@c.us', chatId: '6281316434311@s.whatsapp.net' } as Message;
+
+    const makeChatQb = () => {
+      let chatIds: string[] | null = null;
+      const qb = {
+        where: jest.fn().mockReturnThis(),
+        orderBy: jest.fn().mockReturnThis(),
+        skip: jest.fn().mockReturnThis(),
+        take: jest.fn().mockReturnThis(),
+        andWhere: jest.fn().mockImplementation((_clause: string, params?: { chatIds?: string[] }) => {
+          if (params?.chatIds) chatIds = params.chatIds;
+          return qb;
+        }),
+        getManyAndCount: jest.fn().mockImplementation(() => {
+          const matched = chatIds && chatIds.includes(stored.chatId) ? [stored] : [];
+          return Promise.resolve([matched, matched.length]);
+        }),
+      };
+      return qb;
+    };
+
+    it('returns a @s.whatsapp.net-stored message when filtering by the neutral @c.us chat id', async () => {
+      lidMappingStore.lidsForPhone.mockReturnValue([]);
+      const qb = makeChatQb();
+      (repository.createQueryBuilder as jest.Mock).mockReturnValue(qb);
+
+      const { messages } = await service.getMessages('sess-1', { chatId: '6281316434311@c.us' });
+
+      expect(messages.map(m => m.id)).toEqual(['m1']);
+    });
+  });
+
   // ── sendVideo / sendAudio / sendDocument / sendSticker ────────────
 
   describe('sendVideo', () => {
@@ -363,6 +530,41 @@ describe('MessageService', () => {
         url: 'https://example.com/audio.ogg',
       });
       expect(mockEngine.sendAudioMessage).toHaveBeenCalled();
+    });
+
+    it('sends a voice note (ptt) and defaults the mimetype to ogg/opus when omitted', async () => {
+      await service.sendAudio('sess-1', {
+        chatId: 'test@c.us',
+        url: 'https://example.com/voice',
+        ptt: true,
+      });
+      expect(mockEngine.sendAudioMessage).toHaveBeenCalledWith(
+        'test@c.us',
+        expect.objectContaining({ ptt: true, mimetype: 'audio/ogg; codecs=opus' }),
+      );
+    });
+
+    it('respects a caller-supplied mimetype for a voice note', async () => {
+      await service.sendAudio('sess-1', {
+        chatId: 'test@c.us',
+        url: 'https://example.com/voice.ogg',
+        mimetype: 'audio/ogg',
+        ptt: true,
+      });
+      expect(mockEngine.sendAudioMessage).toHaveBeenCalledWith(
+        'test@c.us',
+        expect.objectContaining({ ptt: true, mimetype: 'audio/ogg' }),
+      );
+    });
+
+    it('persists a voice note as type "voice"', async () => {
+      await service.sendAudio('sess-1', { chatId: 'test@c.us', url: 'https://example.com/voice', ptt: true });
+      expect(repository.create).toHaveBeenCalledWith(expect.objectContaining({ type: 'voice' }));
+    });
+
+    it('persists a plain audio send (no ptt) as type "audio"', async () => {
+      await service.sendAudio('sess-1', { chatId: 'test@c.us', url: 'https://example.com/audio.ogg' });
+      expect(repository.create).toHaveBeenCalledWith(expect.objectContaining({ type: 'audio' }));
     });
   });
 
@@ -554,6 +756,28 @@ describe('MessageService', () => {
       mockEngine.getChatHistory.mockResolvedValueOnce(fake);
       const result = await service.getChatHistory('sess-1', 'test@c.us');
       expect(result).toBe(fake);
+    });
+
+    describe('deep mode (#347)', () => {
+      it('allows a limit above the standard 100 cap when deep=true', async () => {
+        await service.getChatHistory('sess-1', 'test@c.us', 500, false, true);
+        expect(mockEngine.getChatHistory).toHaveBeenLastCalledWith('test@c.us', 500, false);
+      });
+
+      it('clamps a deep limit to the 2000 ceiling', async () => {
+        await service.getChatHistory('sess-1', 'test@c.us', 5000, false, true);
+        expect(mockEngine.getChatHistory).toHaveBeenLastCalledWith('test@c.us', 2000, false);
+      });
+
+      it('forces includeMedia off in deep mode (metadata-only)', async () => {
+        await service.getChatHistory('sess-1', 'test@c.us', 300, true, true);
+        expect(mockEngine.getChatHistory).toHaveBeenLastCalledWith('test@c.us', 300, false);
+      });
+
+      it('still clamps to 100 when deep is not set (regression guard)', async () => {
+        await service.getChatHistory('sess-1', 'test@c.us', 500, false, false);
+        expect(mockEngine.getChatHistory).toHaveBeenLastCalledWith('test@c.us', 100, false);
+      });
     });
   });
 

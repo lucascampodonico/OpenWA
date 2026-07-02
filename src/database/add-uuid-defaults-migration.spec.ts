@@ -4,7 +4,7 @@
 import { QueryRunner } from 'typeorm';
 import { AddUuidDefaultsForPostgres1779235200000 } from './migrations/1779235200000-AddUuidDefaultsForPostgres';
 
-const ALL_TABLES = ['sessions', 'webhooks', 'messages', 'api_keys', 'audit_logs', 'message_batches'];
+const ALL_TABLES = ['sessions', 'webhooks', 'messages', 'message_batches'];
 
 function makeQueryRunner(type: string, existingTables: Set<string>) {
   return {
@@ -25,20 +25,28 @@ describe('AddUuidDefaultsForPostgres migration', () => {
     expect(qr.hasTable).not.toHaveBeenCalled();
   });
 
-  it('on Postgres up() sets a uuid DEFAULT on every existing table', async () => {
+  it('on Postgres up() creates pgcrypto, then sets a uuid DEFAULT on every existing table', async () => {
     const qr = makeQueryRunner('postgres', new Set(ALL_TABLES));
     await migration.up(qr as unknown as QueryRunner);
 
-    expect(qr.query).toHaveBeenCalledTimes(ALL_TABLES.length);
+    // 1 CREATE EXTENSION + one ALTER per table.
+    expect(qr.query).toHaveBeenCalledTimes(ALL_TABLES.length + 1);
+    const calls = qr.query.mock.calls.map(call => String((call as unknown[])[0]));
+    // pgcrypto must be ensured before any gen_random_uuid() default that depends on it (PG <= 12).
+    const extIdx = calls.findIndex(q => /CREATE EXTENSION IF NOT EXISTS pgcrypto/i.test(q));
+    const firstAlterIdx = calls.findIndex(q => /gen_random_uuid\(\)/i.test(q));
+    expect(extIdx).toBe(0);
+    expect(extIdx).toBeLessThan(firstAlterIdx);
     expect(qr.query).toHaveBeenCalledWith(
       'ALTER TABLE "sessions" ALTER COLUMN "id" SET DEFAULT gen_random_uuid()::varchar',
     );
   });
 
-  it('skips tables that do not exist', async () => {
+  it('skips tables that do not exist (still creates pgcrypto)', async () => {
     const qr = makeQueryRunner('postgres', new Set(['sessions', 'messages']));
     await migration.up(qr as unknown as QueryRunner);
-    expect(qr.query).toHaveBeenCalledTimes(2);
+    // 1 CREATE EXTENSION + 2 ALTERs (only the two existing tables).
+    expect(qr.query).toHaveBeenCalledTimes(3);
   });
 
   it('on Postgres down() drops the DEFAULT on every existing table', async () => {
@@ -46,6 +54,6 @@ describe('AddUuidDefaultsForPostgres migration', () => {
     await migration.down(qr as unknown as QueryRunner);
 
     expect(qr.query).toHaveBeenCalledTimes(ALL_TABLES.length);
-    expect(qr.query).toHaveBeenCalledWith('ALTER TABLE "api_keys" ALTER COLUMN "id" DROP DEFAULT');
+    expect(qr.query).toHaveBeenCalledWith('ALTER TABLE "message_batches" ALTER COLUMN "id" DROP DEFAULT');
   });
 });

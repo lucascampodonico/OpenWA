@@ -1,4 +1,4 @@
-import { Controller, Get, Put, Body } from '@nestjs/common';
+import { Controller, Get, Put, NotImplementedException } from '@nestjs/common';
 import { ApiTags, ApiOperation, ApiResponse } from '@nestjs/swagger';
 import { ConfigService } from '@nestjs/config';
 import { RequireRole } from '../auth/decorators/auth.decorators';
@@ -53,32 +53,32 @@ export class SettingsController {
   }
 
   @Get()
+  @RequireRole(ApiKeyRole.ADMIN)
   @ApiOperation({ summary: 'Get application settings' })
   @ApiResponse({ status: 200, description: 'Current settings' })
   get(): Settings {
+    // Settings expose environment-derived configuration (debug flag, reconnect policy, rate-limit
+    // thresholds, base URL). Gate the read at ADMIN, matching the PUT below and the rest of the
+    // admin-config surface — a VIEWER or session-scoped key has no business reading server config.
     return this.settings;
   }
 
   @Put()
   @RequireRole(ApiKeyRole.ADMIN)
-  @ApiOperation({ summary: 'Update application settings' })
-  @ApiResponse({ status: 200, description: 'Settings updated' })
-  update(@Body() newSettings: Partial<Settings>): Settings {
-    if (newSettings.general) {
-      this.settings.general = {
-        ...this.settings.general,
-        ...newSettings.general,
-      };
-    }
-    if (newSettings.api) {
-      this.settings.api = { ...this.settings.api, ...newSettings.api };
-    }
-    if (newSettings.notifications) {
-      this.settings.notifications = {
-        ...this.settings.notifications,
-        ...newSettings.notifications,
-      };
-    }
-    return this.settings;
+  @ApiOperation({ summary: 'Settings are read-only at runtime (environment-derived)' })
+  @ApiResponse({
+    status: 501,
+    description: 'Settings are derived from environment configuration and cannot be changed at runtime',
+  })
+  update(): never {
+    // Every Settings field is derived from environment variables and consumed at boot /
+    // decorator-evaluation time (ThrottlerModule.forRootAsync, port, webhook timeout, DB logging),
+    // and ConfigService is immutable at runtime — so a runtime write cannot actually take effect.
+    // The previous handler mutated an in-memory copy and returned 200 'updated' while persisting
+    // nothing and applying nothing: a false success. Be honest instead of pretending it worked.
+    throw new NotImplementedException(
+      'Settings are derived from environment configuration and are read-only at runtime. ' +
+        'Change the corresponding environment variable and restart the service.',
+    );
   }
 }
