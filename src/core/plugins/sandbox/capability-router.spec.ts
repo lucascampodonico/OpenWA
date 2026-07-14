@@ -12,6 +12,8 @@ function makeContext() {
       getContactById: jest.fn().mockResolvedValue(null),
       checkNumberExists: jest.fn().mockResolvedValue(true),
       getChats: jest.fn().mockResolvedValue([]),
+      getChatHistory: jest.fn().mockResolvedValue([]),
+      canonicalChatId: jest.fn().mockResolvedValue('628@c.us'),
     },
     storage: {
       get: jest.fn().mockResolvedValue('v'),
@@ -54,6 +56,19 @@ describe('dispatchCapabilityVerb', () => {
     const ctx = makeContext();
     await dispatchCapabilityVerb(ctx, 'engine.getGroupInfo', ['s', 'g']);
     expect(ctx.engine.getGroupInfo).toHaveBeenCalledWith('s', 'g');
+  });
+
+  it('routes engine.getChatHistory with chatId, limit and includeMedia', async () => {
+    const ctx = makeContext();
+    await dispatchCapabilityVerb(ctx, 'engine.getChatHistory', ['s', 'c@c.us', 20, true]);
+    expect(ctx.engine.getChatHistory).toHaveBeenCalledWith('s', 'c@c.us', 20, true);
+  });
+
+  it('routes engine.canonicalChatId and returns the resolved id', async () => {
+    const ctx = makeContext();
+    const out = await dispatchCapabilityVerb(ctx, 'engine.canonicalChatId', ['s', '111@lid']);
+    expect(ctx.engine.canonicalChatId).toHaveBeenCalledWith('s', '111@lid');
+    expect(out).toBe('628@c.us');
   });
 
   it('routes storage.get and returns its value', async () => {

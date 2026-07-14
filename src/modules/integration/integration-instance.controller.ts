@@ -17,13 +17,16 @@ import { AuditAction } from '../audit/entities/audit-log.entity';
 import { AuditService } from '../audit/audit.service';
 import { PluginLoaderService } from '../../core/plugins/plugin-loader.service';
 import { InstanceExistsError, PluginInstanceService } from './plugin-instance.service';
+import { ScopeBindingService } from './scope-binding.service';
 import { PluginInstance } from './entities/plugin-instance.entity';
 import { buildIngressUrls } from './ingress-url';
 import { CreateInstanceDto, InstanceView, UpdateInstanceDto } from './dto/instance.dto';
+import { ApiTags, ApiResponse } from '@nestjs/swagger';
 
 // ADMIN-only provisioning surface for per-plugin instances (e.g. one Chatwoot account). Only plugins
 // that declare an ingress route AND the webhook:ingress permission can have instances; everything
 // else is rejected before touching persistence.
+@ApiTags('integration')
 @Controller('integration/plugins/:pluginId/instances')
 @RequireRole(ApiKeyRole.ADMIN)
 export class IntegrationInstanceController {
@@ -31,10 +34,17 @@ export class IntegrationInstanceController {
     private readonly instances: PluginInstanceService,
     private readonly loader: PluginLoaderService,
     private readonly audit: AuditService,
+    private readonly scopeBinding: ScopeBindingService,
   ) {}
 
   @Post()
   @HttpCode(201)
+  @ApiResponse({
+    status: 201,
+    description:
+      'Instance created. The plaintext ingress secret and verifyToken are revealed once in this response — store them immediately (both masked on every later read).',
+    type: InstanceView,
+  })
   async create(@Param('pluginId') pluginId: string, @Body() dto: CreateInstanceDto): Promise<InstanceView> {
     const routes = this.assertIngressCapable(pluginId);
     try {
@@ -47,7 +57,7 @@ export class IntegrationInstanceController {
       void this.audit.logInfo(AuditAction.INTEGRATION_INSTANCE_CREATED, {
         metadata: { pluginId, instanceId: dto.instanceId },
       });
-      this.applyScopeBinding(pluginId, inst.sessionScope, inst.config ?? {}, inst.enabled);
+      await this.scopeBinding.applyScopeBinding(pluginId, inst.sessionScope, inst.config ?? {}, inst.enabled);
       return this.view(inst, routes, /* reveal */ true);
     } catch (err) {
       if (err instanceof InstanceExistsError) throw new ConflictException(err.message);
@@ -56,6 +66,7 @@ export class IntegrationInstanceController {
   }
 
   @Get()
+  @ApiResponse({ status: 200, description: 'Instances for the plugin (secrets masked).', type: [InstanceView] })
   async list(@Param('pluginId') pluginId: string): Promise<InstanceView[]> {
     const routes = this.pluginRoutes(pluginId);
     const rows = await this.instances.list(pluginId);
@@ -63,6 +74,7 @@ export class IntegrationInstanceController {
   }
 
   @Get(':instanceId')
+  @ApiResponse({ status: 200, description: 'The instance (secret masked).', type: InstanceView })
   async getOne(@Param('pluginId') pluginId: string, @Param('instanceId') instanceId: string): Promise<InstanceView> {
     const inst = await this.instances.resolve(pluginId, instanceId);
     if (!inst) throw new NotFoundException('instance not found');
@@ -71,6 +83,12 @@ export class IntegrationInstanceController {
 
   @Post(':instanceId/regenerate-secret')
   @HttpCode(200)
+  @ApiResponse({
+    status: 200,
+    description:
+      'Secret regenerated. The new plaintext secret is revealed once in this response; the verifyToken is also shown (unchanged).',
+    type: InstanceView,
+  })
   async regenerate(
     @Param('pluginId') pluginId: string,
     @Param('instanceId') instanceId: string,
@@ -84,6 +102,7 @@ export class IntegrationInstanceController {
   }
 
   @Patch(':instanceId')
+  @ApiResponse({ status: 200, description: 'Instance updated (secret masked).', type: InstanceView })
   async patch(
     @Param('pluginId') pluginId: string,
     @Param('instanceId') instanceId: string,
@@ -94,25 +113,35 @@ export class IntegrationInstanceController {
     const previousScope = inst.sessionScope;
     if (dto.enabled !== undefined) inst = await this.instances.setEnabled(pluginId, instanceId, dto.enabled);
     if (dto.sessionScope !== undefined || dto.config !== undefined) {
-      inst = await this.instances.update(pluginId, instanceId, { sessionScope: dto.sessionScope, config: dto.config });
+      inst = await this.instances.update(
+        pluginId,
+        instanceId,
+        { sessionScope: dto.sessionScope, config: dto.config },
+        this.schemaFor(pluginId),
+      );
     }
     const updated = inst as PluginInstance;
-    // If the bound session changed, tear down the old scope so it stops firing with stale config.
-    if (previousScope && previousScope !== '*' && previousScope !== updated.sessionScope) {
-      this.applyScopeBinding(pluginId, previousScope, {}, false);
+    // If the bound session changed, tear down the OLD scope (incl. a wildcard/null scope) so it stops
+    // firing with stale config. The new scope is (re)bound right after; teardown runs first with the new
+    // scope already persisted, so the wildcard retirement check sees the current state correctly.
+    if (previousScope !== updated.sessionScope) {
+      await this.scopeBinding.applyScopeBinding(pluginId, previousScope, {}, false);
     }
-    this.applyScopeBinding(pluginId, updated.sessionScope, updated.config ?? {}, updated.enabled);
+    await this.scopeBinding.applyScopeBinding(pluginId, updated.sessionScope, updated.config ?? {}, updated.enabled);
     return this.view(updated, this.pluginRoutes(pluginId), false);
   }
 
   @Delete(':instanceId')
   @HttpCode(204)
+  @ApiResponse({ status: 204, description: 'Instance deleted and its session scope torn down.' })
   async remove(@Param('pluginId') pluginId: string, @Param('instanceId') instanceId: string): Promise<void> {
     const inst = await this.instances.resolve(pluginId, instanceId);
     if (!inst) throw new NotFoundException('instance not found');
-    // Deactivate + clear the session config BEFORE deletion (needs the instance's scope).
-    this.applyScopeBinding(pluginId, inst.sessionScope, {}, false);
+    const scope = inst.sessionScope;
+    // Delete the row FIRST, then tear down its scope: for a wildcard/null scope the teardown lists the
+    // remaining instances to decide whether to retire '*', and that check must not count this instance.
     await this.instances.remove(pluginId, instanceId);
+    await this.scopeBinding.applyScopeBinding(pluginId, scope, {}, false);
     void this.audit.logInfo(AuditAction.INTEGRATION_INSTANCE_DELETED, { metadata: { pluginId, instanceId } });
   }
 
@@ -133,6 +162,12 @@ export class IntegrationInstanceController {
     return this.loader.getPlugin(pluginId)?.manifest.ingress?.map(r => r.route) ?? [];
   }
 
+  // The plugin's declarative config schema, used to restore masked secrets on update (undefined when the
+  // plugin is unloaded — restoreSecretConfig then fails closed).
+  private schemaFor(pluginId: string) {
+    return this.loader.getPlugin(pluginId)?.manifest.configSchema;
+  }
+
   private view(inst: PluginInstance, routes: string[], reveal: boolean): InstanceView {
     const schema = this.loader.getPlugin(inst.pluginId)?.manifest.configSchema;
     const masked = reveal ? inst : this.instances.maskedView(inst, schema);
@@ -149,40 +184,5 @@ export class IntegrationInstanceController {
       updatedAt: masked.updatedAt,
       ingressUrls: buildIngressUrls(process.env.BASE_URL, inst.pluginId, inst.instanceId, routes),
     };
-  }
-
-  // Bind an instance's config to the plugin's runtime so an ingress handler resolves it as ctx.config
-  // (see PluginLoaderService.dispatchWebhookForInstance) and activate the session — iff `activate` (a
-  // disabled or removed instance must not keep firing). A concrete scope writes sessionConfig[scope] and
-  // toggles that session in activeSessions; a null/'*' scope binds the base config + all sessions ('*').
-  // Best-effort: provisioning must not fail because the plugin is momentarily unloaded.
-  private applyScopeBinding(
-    pluginId: string,
-    scope: string | null,
-    config: Record<string, unknown>,
-    activate: boolean,
-  ): void {
-    try {
-      if (!scope || scope === '*') {
-        // 'all sessions' → base config + activate ['*']. A base binding cannot be cleanly torn down
-        // (updatePluginConfig merges, so one instance's keys aren't separable) — deactivation is a no-op.
-        if (activate) {
-          this.loader.updatePluginConfig(pluginId, config);
-          this.loader.setPluginSessions(pluginId, ['*']);
-        }
-        return;
-      }
-      this.loader.setPluginSessionConfig(pluginId, scope, activate ? config : {});
-      const current = this.loader.getPlugin(pluginId)?.activeSessions ?? [];
-      const set = new Set(current.filter(s => s !== '*'));
-      if (activate) set.add(scope);
-      else set.delete(scope);
-      this.loader.setPluginSessions(pluginId, [...set]);
-    } catch (err) {
-      // Best-effort: don't fail provisioning if the plugin is momentarily unloaded.
-      void this.audit.logInfo(AuditAction.INTEGRATION_INSTANCE_UPDATED, {
-        metadata: { pluginId, scope, bridgeError: String(err) },
-      });
-    }
   }
 }

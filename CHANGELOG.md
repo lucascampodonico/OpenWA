@@ -7,6 +7,401 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+
+## [0.8.17] - 2026-07-13
+
+### Added
+
+- **`AuditAction` emit-coverage gate.** A structural test now fails the build when an `AuditAction`
+  enum value is neither emitted at a real call site nor registered (with a reason) in a new
+  intentionally-unemitted registry. A declared audit event can no longer silently exist with no
+  emission site, and a new action cannot land without either wiring it or documenting why it is held
+  back. The registry is also checked for stale entries (an action that is in fact emitted) and empty
+  reasons, so it cannot decay into a dumping ground.
+
+- **Operator-tunable HTTP server timeouts.** The gateway now pins `requestTimeout`,
+  `headersTimeout`, and `keepAliveTimeout` on its HTTP server explicitly (previously Node's
+  implicit defaults), exposed via `REQUEST_TIMEOUT_MS` / `HEADERS_TIMEOUT_MS` /
+  `KEEPALIVE_TIMEOUT_MS` and logged at boot. Defaults match Node 22 (300s / 65s / 5s);
+  `headersTimeout` is normalized to stay above `keepAliveTimeout` (Node requires it), and the three
+  are validated as positive integers at boot.
+
+- **Committed OpenAPI snapshot + CI sync gate.** The gateway's OpenAPI document is now committed as
+  `openapi.json` (generated from the NestJS Swagger decorators via `npm run openapi:export`) and a CI
+  check (`npm run openapi:check`) fails when a controller/DTO change lands without regenerating it, so
+  the machine-readable contract can never silently drift from the code. SDK/API consumers now have a
+  versioned artifact at the repo root.
+
+- **Pre-release boot smoke on amd64 + arm64.** Cutting a release tag now runs the just-published
+  image on both `linux/amd64` and `linux/arm64` (via QEMU) and polls the dependency-free
+  `/api/health/live` endpoint before the GitHub Release is created — so a runtime-only boot regression
+  on one architecture (a clean build can still produce a native-dep/Chromium SIGTRAP on arm64) cannot
+  ship under a release. The Release job waits on the new boot-smoke job.
+
+- **SBOM attestation on published images.** Each image built by CI and on release now carries an
+  in-toto SBOM attestation alongside the SLSA provenance that `docker/build-push-action` already
+  generates by default. Both are verifiable with
+  `docker buildx imagetools inspect ghcr.io/rmyndharis/openwa:<tag>`. Provenance is now also pinned
+  explicitly (`provenance: true`) so the attestation pair is self-documenting rather than reliant on
+  the action default.
+
+- **HTTP RED metrics.** The `/api/metrics` endpoint now exposes
+  `http_requests_total{method,route,status}` and an `http_request_duration_seconds` histogram (per
+  route), recorded by a global interceptor. Route labels use the Express route pattern (bounded —
+  `/api/sessions/:id`, not the raw URL) with a `Controller#handler` fallback, and `/api/health` +
+  `/api/metrics` are not counted. Conventional unprefixed names so a generic RED dashboard or a 5xx
+  error-rate alert matches them directly.
+
+- **Request correlation ids (`X-Request-ID`).** Every inbound request now carries an id that
+  propagates through the whole request via AsyncLocalStorage, so each JSON log line and each
+  audit-log metadata blob stamps it — a request can be traced end-to-end. A valid client-supplied
+  `X-Request-ID` (alphanumeric + dash, ≤128 chars) is echoed; anything else (including a CRLF
+  header-injection attempt) is replaced with a generated UUID. The id is also set on the response.
+
+- **Engine capability matrix + drift gate.** A committed, source-verified matrix
+  (`src/engine/engine-capability-matrix.ts`) records, for every `IWhatsAppEngine` method on each
+  engine (whatsapp-web.js default, Baileys), whether it is `supported` or `not-available` — and for
+  the not-available ones, the root cause: `adapter-gap` (the underlying library supports it, OpenWA
+  just hasn't wired it — fixable) vs `library-limitation` (no first-class library API), with the
+  cited library symbol as evidence. A drift gate fails when a method's throw-availability changes.
+  `docs/engine-capability-matrix.md` inventories the unwired adapter-gaps as a prioritized capability
+  backlog.
+
+- **Delete-for-me on the Baileys engine.** `deleteMessage(…, forEveryone=false)` now performs a
+  delete-for-me via Baileys' `chatModify({ deleteForMe })` instead of returning 501. Revoke-for-
+  everyone (`forEveryone=true`) was already wired; this completes `deleteMessage` on the Baileys
+  engine for the most common delete mode.
+
+- **Status posts on the whatsapp-web.js engine.** `postTextStatus`, `postImageStatus`, and
+  `postVideoStatus` now work on whatsapp-web.js (the default engine) — they route through
+  `sendMessage('status@broadcast', …)` (text styling via `extra: { backgroundColor, fontStyle }`;
+  media via `MessageMedia` + `caption`). Previously these returned 501 on the default engine despite
+  the library supporting them; the stale "blocked upstream, #455" guard is removed (#455 is a closed
+  feature request, and whatsapp-web.js 1.34.7 ships a real status-send path). Caveat: the library has
+  no status-recipient arg, so `StatusPostOptions.recipients` is not honored on this engine (it
+  broadcasts to the account's status-privacy audience; a one-time warning is logged). The Baileys
+  engine continues to honor `recipients`.
+
+- **Chat labels on the Baileys engine.** `addLabelToChat` and `removeLabelFromChat` now work on
+  the Baileys engine — 1:1 to `sock.addChatLabel(chatId, labelId)` / `sock.removeChatLabel(chatId,
+  labelId)` instead of returning 501. WhatsApp-Business-only (rejects on personal accounts). Label
+  *listing* (`getLabels` / `getLabelById` / `getChatLabels`) remains unavailable on Baileys (no
+  first-class library API — see `docs/engine-capability-matrix.md`).
+
+- **Status delete on the whatsapp-web.js engine.** `deleteStatus(statusId)` now works on
+  whatsapp-web.js via `client.revokeStatusMessage(statusId)` instead of returning 501 — completing
+  the status lifecycle (post + delete) on the default engine. Own-status only (the library revokes
+  the caller's own status posts).
+
+- **Read contact stories on the whatsapp-web.js engine.** `getContactStatuses()` and
+  `getContactStatus(contactId)` now return contact "stories" (24h status posts) via
+  whatsapp-web.js `getBroadcasts()` / `getBroadcastById()` flattened to `Status[]` (contact via
+  `broadcast.getContact()`, type from `MessageTypes`, 24h TTL) instead of stubbing to `[]`. The
+  Baileys engine still cannot read stories — `fetchStatus` returns the *about* text, not stories
+  (documented as a library limitation).
+
+- **Channel lookup / subscribe / unsubscribe on the Baileys engine.** `getChannelById(id)`,
+  `subscribeToChannel(inviteCode)`, and `unsubscribeFromChannel(id)` now work via Baileys
+  `newsletterMetadata` (mapped to `Channel` with optional fields), `newsletterFollow` (subscribe,
+  resolving invite→jid first), and `newsletterUnfollow` (unsubscribe, 1:1). `getChannelById` on
+  Baileys resolves ANY channel by jid (richer than the whatsapp-web.js subscribed-list lookup).
+  `getChannelMessages` remains unsupported — `newsletterFetchMessages` returns a raw BinaryNode with
+  no library parser, so it stays a documented gap rather than an unverified walk.
+
+- **Bounded webhook fan-out.** An event matching N webhooks now delivers at most
+  `WEBHOOK_DISPATCH_CONCURRENCY` (default 16) concurrently instead of opening N outbound sockets at
+  once; the rest queue and run as slots free. Per-webhook isolation (`Promise.allSettled`) is
+  unchanged. The shared `ConcurrencyLimiter` was also promoted from `engine/adapters` to
+  `common/utils` (it has no engine-specific logic), so the webhook module no longer imports across the
+  engine boundary.
+
+- **Optional Redis-backed rate-limit storage.** When `REDIS_ENABLED=true`, API rate-limit counters
+  now persist to Redis (a new `RedisThrottlerStorage` implementing @nestjs/throttler v6's
+  `ThrottlerStorage`), so limits aggregate across replicas behind a load balancer instead of being
+  per-process. Default off (single-node deployments gain nothing and it adds a connection dependency).
+  Fail-OPEN on Redis error — rate limiting is a secondary control, and fail-closed would self-DoS the
+  API.
+
+### Fixed
+
+- **Silent delivery failure for 1:1 Baileys sends to LID-migrated contacts (ack 463).** On the
+  Baileys engine, a 1:1 send addressed by phone (`<phone>@c.us` / `<phone>@s.whatsapp.net`) to a
+  contact WhatsApp has migrated to LID addressing was rejected server-side with ack error 463
+  (`NackCallerReachoutTimelocked` / "missing tctoken" — the privacy token is stored and honored
+  under the LID), while the same send addressed to the contact's `<lid>@lid` delivered. Because
+  Baileys generates the message id locally, the API still returned a `messageId`, so the
+  non-delivery was silent to the caller. The adapter now resolves phone-dialect 1:1 chat ids to
+  the contact's LID at the send boundary via `sock.signalRepository.lidMapping.getLIDForPN` (the
+  same mapping the Baileys send path consults), applied in `sendTextMessage`, `sendContent` (all
+  media/location/contact/poll sends), and `sendChatState`. Groups, broadcast, already-`@lid`, and
+  unmapped ids pass through unchanged (non-migrated contacts behave identically), and resolution
+  is best-effort: any lookup error falls back to the phone jid. The disappearing-timer lookup
+  still resolves under the LID, since `getEphemeralExpiration` already keys on the raw, engine,
+  and neutral forms of the jid. Thanks @isaacmendes. [#717]
+
+- **Diagnosable failure for a stale browser profile after a binary-changing upgrade.** Upgrading
+  across the v0.8.12 amd64 browser-binary switch (Debian Chromium → Chrome for Testing, #663) — or any
+  later change to the Chromium/Chrome binary — can leave an already-authenticated `whatsapp-web.js`
+  session's persistent browser profile incompatible with the new binary: on the next start the page
+  context is destroyed during injection and the engine fails with Puppeteer's opaque
+  `Execution context was destroyed`, which reads like a Puppeteer bug and gave no hint that the stale
+  profile was the cause. The `whatsapp-web.js` adapter now detects that error in its `initialize()`
+  catch and logs an advisory pointing the operator at the remedy (delete the session profile dir and
+  re-scan); the error still propagates unchanged, so existing failure handling is unaffected. The
+  profile is not auto-recovered — a tainted profile is not safely portable across Chromium major
+  versions (clearing only the cache subdirs is insufficient), so a one-time re-authentication is
+  required. [#708]
+
+- **OpenAPI export script under current env validation.** `scripts/export-openapi.ts` had been broken
+  since the SQLite `DATABASE_NAME` file-path validation tightened (it pinned an in-memory data DB,
+  which that rule rejects). The data connection now uses a temp-dir SQLite file that is removed on
+  exit, so the snapshot generator runs hermetically again.
+
+
+## [0.8.16] - 2026-07-12
+
+### Added
+
+- **Integration SDK v1 `response` contract for inbound routes.** A route may now declare a host-side
+  `preflight` (today: `session-alive`, returning 503 for a definitively-dead WhatsApp session) and a
+  declarative `ack` (status/body/headers) returned synchronously to the provider. The plugin ALWAYS runs
+  async (enqueued, full DLQ/retry); for routes declaring `response`, the ack is returned without awaiting
+  enqueue so a queue-disabled deployment cannot block the provider's deadline. A dead session (no live
+  engine or `FAILED`) on a concrete-scoped route now fails fast with 503 instead of being swallowed into
+  202; recoverable statuses still 202+enqueue and let the worker fail fast. The inert `mode: 'sync-reply'`
+  value is deprecated in favor of `response` (kept for SDK v1 additive-only compatibility). Routes with no
+  `response` are byte-identical to today's default fast-ack.
+
+- **`standard-webhooks` ingress signature scheme.** A route may now declare
+  `signature.scheme: "standard-webhooks"` to verify [Standard Webhooks](https://github.com/standard-webhooks/standard-webhooks)
+  payloads host-side (Supabase Auth's Send SMS hook, and any Svix-routed provider). The wire format is
+  fixed by the spec, so only `toleranceSec` (default 300s) and `dedupHeader` apply. The operator pastes
+  the provider's Svix secret (`v1,whsec_<base64>`) as the instance secret. This surfaces a bad signature
+  as a synchronous 401 and — because the `session-alive` preflight runs after verify — makes that preflight
+  safe to use (an unauthenticated caller can no longer probe liveness). Additive; existing
+  `hmac-sha256`/`shared-secret`/`none` behavior is unchanged.
+
+## [0.8.15] - 2026-07-11
+
+- **WhatsApp Web sessions no longer wedge silently in `INITIALIZING` forever.** `engine.initialize()` was awaited with no timeout, and neither whatsapp-web.js nor Puppeteer bounds the initial browser launch/navigation (`page.goto` is called with `timeout: 0` and the web-version-cache fetch carries no timeout). If Chromium stalled under container memory pressure — realistic at the documented 2 GB Standard profile — the await never resolved or rejected: the session sat in `INITIALIZING` indefinitely, `GET /sessions/:id/qr` 400'd forever, and nothing was logged. The #635 abandoned-engine reaper is reactive (terminal `onError` / rejected re-init only), so nothing recovered it. `initializeEngine()` now races `engine.initialize()` against a deadline derived from the configured auth wait (floor 60 s, or `WWEBJS_AUTH_TIMEOUT_MS` + 30 s when an operator has raised that for slow first boots) so a legitimate slow init is never cut short; on timeout it force-kills the wedged browser, marks the session `DISCONNECTED` (retryable, so the existing reconnect backoff picks it up), and rethrows — surfacing the failure to a manual `POST /start` caller instead of hanging. The race's catch is scoped to the timeout only (`EngineInitTimeoutError`): a real init rejection (e.g. Chromium can't launch) propagates untouched so `start()`'s existing `FAILED`+reason diagnostics are preserved — handling both in one catch would downgrade real failures to `DISCONNECTED` and hide their reason. Thanks @INAPA-desarrolloTIC. [#667]
+
+- **Dashboard primary buttons were invisible until hover in light mode.** A leftover Vite template rule — `:root:not([data-theme='dark']) button { background-color:#f9f9f9 }` inside `@media (prefers-color-scheme: light)` — carried specificity `(0,2,1)` (`:root` + the `:not([data-theme])` argument + `button`), higher than every page-scoped `.X-page .btn-primary` rule `(0,2,0)`. In light mode (the default) it overrode the green design-system background with a near-white `#f9f9f9`, leaving the buttons' white text invisible until the leftover Vite `button:hover { border-color:#646cff }` ring revealed them on hover; the same `(0,2,1)` rule also pushed `.btn-secondary` and `.btn-icon` off their intended backgrounds. Removed that rule (Create-session and other primary buttons are green again), and cleared the remaining Vite scaffolding brand-colors from `index.css` (`a { color:#646cff }`, the purple `a:hover`, `button { background-color:#1a1a1a }`, `button:hover { border-color:#646cff }`) that competed with the App.css design system on import-order tiebreaks; the structural button CSS (border-radius, padding, font, cursor) is retained. Plain `<button>` elements now render with the browser default instead of the dark `#1a1a1a`. The defect was invisible to anyone developing the dashboard in dark mode. Refs #684 (addresses the dashboard-button part; the QR-with-whatsapp-web.js report in the same issue is separate and still under investigation).
+
+- **PostgreSQL upgrade crash-loop for deployments formerly run with `DATABASE_SYNCHRONIZE=true`.** On the PostgreSQL data connection, migrations always run at boot (`migrationsRun: true`), so a schema previously bootstrapped with `DATABASE_SYNCHRONIZE=true` — whose `@PrimaryGeneratedColumn('uuid')` columns TypeORM created as native `uuid` — collides with a migration chain that assumes `varchar` ids and crash-loops the container on boot. A new guard migration (`NormalizeSynchronizeUuidColumns`), ordered before the first colliding migration, now converts those `uuid` id and foreign-key columns to `varchar` (dropping and recreating the dependent cascade foreign keys, and re-applying the `gen_random_uuid()::varchar` defaults), so affected deployments self-heal on the next restart. It is a single-probe no-op on SQLite and on already-`varchar` (healthy) PostgreSQL. For very large `messages` tables the conversion holds an exclusive lock, so run `npm run migration:run` against the stopped app during a maintenance window if needed; `DATABASE_SYNCHRONIZE=true` on PostgreSQL remains unsupported for production. Fixes #690.
+
+- **WhatsApp Web auto-version resolver now prefers a settled build.** The whatsapp-web.js engine auto-pins its WhatsApp Web build from the wppconnect wa-version registry; the resolver previously took the registry's `currentVersion` verbatim — the absolute latest build, which can be minutes old and unvalidated and, on some setups, never reaches QR readiness (the #684 whatsapp-web.js "stuck at Starting, no QR" report class). It now picks the newest non-beta, unexpired build published at least 12 hours ago, falling back to `currentVersion` only when no build qualifies, so auto-pinning no longer latches onto a brand-new build. Operators who set `WWEBJS_WEB_VERSION` explicitly are unaffected. Fixes the whatsapp-web.js "stuck at Starting, no QR" report from #684 (Bug 2); #692 fixes the dashboard-button part (Bug 1) of the same issue.
+
+- **Baileys engine: messages no longer get stuck on "Waiting for this message. This may take a while." on iOS recipients.** Reported specifically on iOS WhatsApp: the recipient's chat shows the message as permanently pending, with no error and a stable connection. The Baileys `makeWASocket` config had no `getMessage` implementation, so WhatsApp's own retry-on-decrypt-failure protocol had nothing to resend, leaving the recipient stuck instead of recovering within seconds; it's now backed by the message store.
+
+- **Baileys message-store lookups no longer fail their FK check.** The engine factory keyed `messageStore.put`/`getMessage`/`clearSession` by the session's on-disk auth-directory name, but `BaileysStoredMessage.sessionId` is a foreign key to `sessions.id` — every write violated the FK and was silently dropped by the orphan guard, leaving the store empty and defeating the `getMessage` fix above. The engine config now carries the auth-directory key (`sessionId`, the session name) and the DB-row key (`dbSessionId`, the session's UUID) as two separate fields, so the message store is keyed correctly without disturbing the existing on-disk auth-directory layout (and `purgeSessionData`, still keyed by name, keeps working on delete).
+
+- **Closed a write-then-immediate-read race in the Baileys signal key store.** The raw signal key store is now wrapped in Baileys' own `makeCacheableSignalKeyStore`, which could previously make a freshly-established session appear "missing" and force an unnecessary fresh PreKey handshake.
+
+- **Upgraded `@whiskeysockets/baileys` `6.7.23` → `7.0.0-rc13`.** Picks up an upstream concurrency rewrite (WhiskeySockets/Baileys#2571, #2587) that closes a "dual uncoordinated prekey queues" race in the same session-establishment path; no `6.x` release (up to `6.17.16`) carries this fix.
+
+- **Fixed a first-message-after-reconnect drop on the Baileys engine.** `handleMessagesUpsert` no longer treats every `type: 'append'` upsert as history sync — Baileys can tag a genuinely new customer message `'append'` when it arrives in the same window as a reconnect's state-sync handshake, silently dropping it; it's now gated on the message's own timestamp against the connection's open time instead (with the account's own sent-message echoes still excluded, to avoid double-firing the existing `emitOwnSendEcho` webhook).
+
+- **Dashboard Korean (ko) locale polish.** Refined several ko strings for consistency, fluency, and accuracy (follow-up to #679): "Create New Session" → `새 세션 생성` (aligns with `생성` used elsewhere in the create flow); the plugin "Configuration" tab → `설정` (matches the rest of the config UI); "Start messaging" → `대화 시작하기` (idiomatic — in Korean one starts a conversation, not a "message"); the WhatsApp Web build "current known-good" now reads `현재` instead of `최신` (latest), which had inverted the version-pinning intent; the "New" session status → `신규` (the conventional Korean status label); and the template placeholder example re-phrases the `{{orderId}}` clause so the interpolation reads naturally.
+
+- **Reliability and correctness hardening batch.** A set of fixes across the engine, session, auth, infra, dashboard, and SDK layers:
+  - The inbound media concurrency limiter now bounds its waiter queue and rejects when full; both engines route a rejected download to their existing emit-without-media path, so a burst of inbound media can no longer grow heap without bound.
+  - `start()` now cancels any pending reconnect timer before recreating the engine, so a stale timer left by a failed reconnect can no longer destroy the engine or orphan the Chromium process.
+  - The dashboard chat thread now refetches after a WebSocket reconnect, so messages that arrived during a transient gap (and ack/reaction/revoke updates) are no longer silently missing until the chat is reopened.
+  - Updating an API key's role, allowed sessions, allowed IPs, or expiry now disconnects the key's already-connected WebSocket sockets, so a narrowed key stops streaming realtime events for sessions/IPs it just lost. A benign rename leaves connected sockets alone.
+  - The SQLite→PostgreSQL export/import path now covers every data-owned table (plugin instances + ingress HMAC secrets, conversation mappings, ingress events, both dead-letter queues) instead of only seven, so a migration no longer silently drops the Integration Fabric and the DLQs. The main connection (API keys, audit logs) stays excluded; existing seven-table exports still import unchanged.
+  - The bundled `docker-compose.yml` no longer shadows dashboard-saved Puppeteer headless / session-data-path / browser-args with pinned container defaults — those are blank-forwarded so a dashboard (or `data/.env.generated`) selection applies, with the sane container defaults supplied by the application config layer (headless, `./data/sessions`, the full `--no-sandbox --disable-setuid-sandbox --disable-dev-shm-usage --disable-gpu` flag set). **Upgrade note:** if you previously saved engine config in the dashboard, re-save it (or set `PUPPETEER_ARGS`) so the full Docker sandbox flag set is retained.
+  - The PHP SDK `messages.list()` and `catalog.products()` docblocks now match the real `{messages, total}` / `{products, pagination}` envelopes the server returns (consistent with the JS/Python/Java SDKs), and the SDK CI path-filter now covers backend controllers and services so response-shape drift re-runs the SDK suites.
+
+## [0.8.14] - 2026-07-10
+
+### Added
+
+- **Plugin search providers (host→plugin search RPC).** A sandboxed plugin can now register as a `SearchProvider` by calling `ctx.registerSearchProvider(handler)` (e.g. `ctx.registerSearchProvider(async (query) => …)`) from its worker. The host routes `GET /api/search` queries to the plugin over a new correlated `search` / `search-result` wire protocol (mirroring the existing hook/webhook/health-check bridges), so a plugin owns all of its vendor-specific query logic (Meilisearch, Elasticsearch, Typesense, …) while the core stays backend-agnostic — adding a new backend is a plugin, with no core changes. When `SEARCH_PROVIDER=auto` (the default), an enabled plugin provider supersedes the built-in database full-text provider; `SEARCH_PROVIDER=builtin-fts` keeps the built-in active; `SEARCH_PROVIDER=none` disables search. Searches are bounded by a 10s timeout and fail fast rather than hanging, and a provider is dropped from the registry when its plugin is disabled. This is Part 1 of the plugin-search work (the query RPC + selection policy); the indexing side uses the existing `message:persisted` hook.
+
+- **Search queries are bounded host-side and plugin results are re-scoped.** `GET /api/search` now clamps `limit` (to `SEARCH_LIMIT_MAX`) and `offset` (to `SEARCH_OFFSET_MAX`) before dispatching to any provider, so a plugin backend can no longer be asked for an unbounded page; a plugin provider's returned hits are re-filtered host-side against the caller's session scope, mirroring the SQL-enforced built-in provider. The provider's `total` is preserved when no out-of-scope hit was stripped, so pagination is unaffected. [#680]
+- **Ingress events and delivery failures are now retained.** `ingress_events` and `integration_delivery_failures` are pruned past `INGRESS_RETENTION_DAYS` (default 90; `<=0` disables), matching the existing webhook/audit retention so the tables no longer grow without bound. [#680]
+- **MCP auth failures are audited and Bull Board login is throttled.** MCP authentication failures are now written to the audit log (parity with the REST `ApiKeyGuard`), and the Bull Board login endpoint is pre-auth IP-throttled (sharing MCP's `MCP_IP_RATE_LIMIT_*` settings) to bound credential-guessing floods. [#680]
+- **Ingress guardrails.** A startup warning now names any unauthenticated (`scheme:'none'`) ingress route a plugin declares; the documented `{id}` HMAC `contentTemplate` placeholder is now implemented (previously it silently 401'd deliveries that used it). [#680]
+- **CI now type-checks spec files, and the release gate matches CI.** A `tsc --noEmit -p tsconfig.json` step full-program type-checks test files (previously invisible to CI, since `tsconfig.build.json` excludes specs); the release workflow's test gate now runs the full CI suite (lint + typecheck + jest + e2e + postgres-migration + dashboard) gating both the image and the GitHub Release. [#680]
+- **Korean (한국어) dashboard locale.** The dashboard language picker now includes Korean alongside the existing locales. Thanks @moduvoice. [#679]
+
+### Fixed
+
+- **Sending media to a channel (`@newsletter`) on the whatsapp-web.js engine now fails fast with `501 Not Implemented` instead of a raw `500`.** whatsapp-web.js builds a channel media message and calls `msg.avParams()`, a WhatsApp-Web-page method removed in a recent WA Web build, so the send crashed with `TypeError: msg.avParams is not a function` (upstream wwebjs#201823, unresolved in the current 1.34.7 release). The engine adapter now guards all media sends — image/video/audio/document (which share one send path) **and sticker** (a separate path that funnels into the same crash for channels) — for a channel recipient and raises a typed `ChannelMediaNotSupportedError` (501) before reaching the broken upstream code. Text→channel still works; only media is affected. The Baileys engine is unaffected. Workaround for affected media-to-channel sends until the upstream is fixed: switch the session to the Baileys engine, or pin `WWEBJS_WEB_VERSION` to a cached WA Web build that predates the `avParams` removal. [#673]
+
+- **`base64` media now takes precedence over `url` when both are provided on a media send.** A `send-image`/`send-video`/etc. request carrying both fields previously sent the URL — and because `@ValidateIf` skipped `@IsUrl` validation on `url` whenever `base64` was present, a stale `url` (e.g. an example default left in the body, or a client such as the n8n community node that sends both) was fetched unvalidated and could 404, silently shadowing the supplied base64 image. `buildMediaInput` now prefers `base64`, aligning the send path with the already-base64-first persisted message metadata. Both engine adapters (whatsapp-web.js and Baileys) already guard the remote fetch behind an `isHttpUrl` check, so the change covers both. [#670]
+
+- **Fresh Docker Compose dev installs no longer boot-loop with `SQLITE_CANTOPEN`.** `.env.example` ships `DATABASE_NAME=openwa` (a PostgreSQL db-name) which, in the SQLite dev compose, became the SQLite **file path** — SQLite tried to open a bare file on the read-only container rootfs and retried 9× per boot. The dev compose now forwards a blank `DATABASE_NAME` default (matching production), `.env.example` documents it as PostgreSQL-only, and env-validation rejects a bare SQLite name with a clear boot error. [#677] [#680]
+- **`DATABASE_TYPE=postgres` combined with `DATABASE_SYNCHRONIZE=true` is now rejected at boot.** On PostgreSQL the data connection runs migrations every boot, so `synchronize` immediately dropped the search migration's generated `body_ts` column and broke `/search` (501) on every restart; the misconfigured combination now fails fast. [#680]
+- **Resolved internal IPs are no longer leaked in SSRF-block error messages.** The webhook test response, delivery-failure/DLQ `lastError`, `webhook:error` hook payloads, and plugin-download errors now show a generic message instead of the resolved internal address (which was a server-side-recon oracle). The full detail is still logged server-side. [#680]
+- **`STORE_EPHEMERAL_MESSAGES=false` is now honored on Baileys history backfill.** Previously only the live inbound path enforced the opt-out, so disappearing-message history was silently persisted + indexed on every connect/reconnect despite the operator's opt-out. [#680]
+- **Plugin archive extraction is bounded and fails clean.** Per-entry and aggregate actual extracted bytes are now capped (a lying `size=0` header can no longer inflate unboundedly), and a corrupt/oversized archive returns a 400 instead of an uncaught 500. [#680]
+- **WebSocket auth lifecycle.** IP-restricted API keys can now connect from an allowed IP (previously the gateway failed-closed and locked out every IP-restricted key), and a revoked/disabled key's active sockets are now evicted. [#680]
+- **Misc hardening.** The migration CLI honors `MAIN_DATABASE_NAME`; `secret-file` chmod failures are logged (a world-readable secret file no longer stays silent after a rewrite on a chmod-unsupported FS); the fully-expanded IPv4-mapped-loopback SSRF classifier gap is closed (latent, defense-in-depth); storage file-list/export traversal is now async + bounded (no longer blocks the event loop); the dashboard and all four SDKs warn on a non-localhost `http://` `baseUrl`. [#680]
+
+## [0.8.13] - 2026-07-09
+
+### Added
+
+- **Dashboard search panel.** The Chats page now has a global search bar in its header — type to search messages across all sessions, see results with highlighted snippets in a dropdown, and click a result to jump to that message in its chat (with cross-session navigation and best-effort message scrolling). Includes a scope toggle (all sessions / current session), load-more pagination, and graceful error states (incl. "search unavailable" when search is disabled). The snippet renderer is XSS-safe (escape-then-highlight, never `dangerouslySetInnerHTML`). Search UI strings are localized across all 10 supported locales.
+- **SDK search resources.** The JavaScript, Python, PHP, and Java SDKs now expose a `search` resource mirroring `GET /api/search` — `client.search.search({ q, sessionId?, chatId?, … })` → `SearchResults`. Typed params and results match the backend contract exactly.
+
+## [0.8.12] - 2026-07-08
+
+### Fixed
+
+- **Debian Chromium SIGTRAP crash in Kubernetes.** The `Dockerfile` previously installed the OS-level `chromium` package from Debian 12. When run as a non-root user in strict Docker/Kubernetes environments, this package consistently crashed at startup with `Code: null` and `Trace/breakpoint trap (core dumped)`. On amd64 the `Dockerfile` now downloads **Chrome for Testing** via Puppeteer during the build phase (avoiding the Debian package's SIGTRAP); arm64 keeps Debian's `chromium`, since Chrome for Testing publishes no linux-arm64 build. Both resolve to a single `PUPPETEER_EXECUTABLE_PATH` symlink. This resolves the persistent browser launch failures on restricted environments without requiring insecure workarounds like `--no-zygote` or disabling Seccomp/AppArmor. Thanks @muhfalihr.
+
+### Added
+
+- **Global message search across sessions.** `GET /api/search` finds messages across all sessions through an open `SearchProvider` contract, with a built-in database full-text provider (PostgreSQL `tsvector`/`GIN`, SQLite `FTS5`) as the zero-dependency default — no external service required. Search works out of the box on both SQLite and PostgreSQL and survives repeated dialect switching and export/import round-trips; a non-FTS5 SQLite build skips the index gracefully and the route returns `501` instead of crashing boot. Set `SEARCH_ENABLED=false` to disable the route and module entirely (the index is DB-maintained per-write regardless, at negligible in-process cost). Advanced backends (typo-tolerance, CJK word-segmentation, large-scale relevance) will be available as provider plugins.
+- **`message:persisted` plugin hook.** A new general extension point fired when a message is durably persisted — on outbound send (from `MessageService`) and on inbound receive (from `SessionService`, where both engine adapters converge on the single persist) — so plugins can react to persisted messages (e.g. an external search indexer) without coupling to the message/session services. The built-in FTS search provider is DB-synced and does not consume this hook; it exists for plugin providers and general use. Fire-and-forget: a handler error is swallowed and never breaks the send/receive path.
+- **Redis authentication via username.** Added support for `REDIS_USERNAME` to configure the Redis cache connection and BullMQ queue connections that require a username. Thanks @muhfalihr.
+- **OpenAPI/Swagger snapshot export + enriched, auth-accurate API docs.** The published spec (served at `/api/docs` and exportable via `scripts/export-openapi.ts`) now mirrors the runtime auth model: `@Public()` routes (`/api/health*`, `/api/infra/health`, and the integration ingress wildcard) are marked as not requiring an `X-API-Key`, matching what the `ApiKeyGuard` actually enforces. The `webhook` `events` enum now advertises the `*` subscribe-all wildcard the dispatch layer already honors, and request/response schemas are filled in across the catalog, status, stats, integration-instance, and auth endpoints — notably typing the integration `InstanceView` (and its `IngressUrl` entries) as real schemas so generated clients no longer receive opaque objects. The export script pins a hermetic environment (in-memory SQLite, queue/MCP off) so it is safe to run anywhere without touching a real database or opening a Redis connection.
+
+## [0.8.11] - 2026-07-08
+
+### Added
+
+- **Prometheus counter for terminally-failed webhook deliveries.** `/api/metrics` now exposes `openwa_webhook_delivery_failures_total`, incremented once per delivery that exhausts all its retries (mirroring the durable `webhook_delivery_failures` dead-letter record, on both the queued and the queue-disabled direct path). It is an in-process monotonic counter — cheap, real-time, and resetting only on restart, which Prometheus `rate()`/`increase()` treat as a normal counter reset — so a `COUNT(*)` over the retention-pruned failure table isn't queried per scrape. Operators can now alert on webhook failure rate from the scrape instead of tailing the structured log or querying the dead-letter endpoint.
+
+### Changed
+
+- **Runtime feature flags are centralized in the config layer.** `AUTO_START_SESSIONS`, `STORE_EPHEMERAL_MESSAGES`, `RESOLVE_LID_TO_PHONE`, `SIMULATE_TYPING`, and `SIMULATE_TYPING_MAX_MS` now resolve through a single discoverable `features.*` namespace on `ConfigService` (backed by one `computeFeatureFlags()` source of truth) instead of ad-hoc `process.env` reads scattered across the session and message services. Runtime behavior and defaults are unchanged. The four boolean flags are now validated at boot alongside the existing `QUEUE_ENABLED`/`MCP_ENABLED`/`SERVE_DASHBOARD` checks — ⚠️ **behavior change:** a deployment booting one of them with a non-canonical value (e.g. `SIMULATE_TYPING=1`, `AUTO_START_SESSIONS=yes`) will now fail fast naming the offending key until corrected to `true`/`false`/unset, instead of silently falling back to the default.
+- **Coverage floors added for the session, webhook, and hook-manager modules.** Per-directory Jest `coverageThreshold` entries now guard `src/modules/session`, `src/modules/webhook`, and `src/core/hooks` (set just below measured, matching the ratcheted floors already in place for the security, auth, engine-adapter, and integration modules), so a large deletion of these modules' tests fails CI instead of passing under the softer global gate.
+
+### Fixed
+
+- **Inbound integration (ingress) deliveries now retry with backoff instead of failing on the first error.** A queued ingress job was enqueued with no retry policy, so BullMQ ran a single attempt and a transient plugin-handler error (e.g. a 5xx from the sandbox) went straight to the dead-letter table — asymmetric with the webhook queue, which already retries. Ingress jobs now use bounded exponential-backoff retries (default 3 attempts, 5s base delay; configurable via `INGRESS_MAX_ATTEMPTS` and `INGRESS_RETRY_DELAY_MS`), and the dead-letter write still fires exactly once, only after the retries are exhausted. ⚠️ **Ordering caveat:** the per-conversation ordering lock guarantees no two same-conversation dispatches run concurrently, but a retried delivery re-enters the lock after its backoff and can therefore overtake a same-conversation successor that dispatched during the backoff window. Ingress order is best-effort regardless (the provider delivers over unordered HTTP); order-strict plugins must not assume a retried event still arrives in sequence. This trades strict order for throughput — BullMQ releases the worker slot during backoff, where retrying inside the lock would hold it.
+- **`/infra/status` now actively probes the databases (`SELECT 1`) instead of trusting `isInitialized`.** The Infrastructure panel's database tile read only `DataSource.isInitialized`, which stays `true` after a PostgreSQL backend dies (until an explicit `.destroy()`), so the tile showed the database healthy while it was actually down. The endpoint now runs a short, timeout-bounded `SELECT 1` on both connections — the same probe `/health/ready` uses — so a post-init outage is reflected. SQLite is effectively always up, so this only changes behavior for a genuinely-down external PostgreSQL.
+- **The settings panel reports the real docs and base-URL configuration.** `GET /settings` hardcoded `enableDocs: true` (ignoring `ENABLE_SWAGGER`, so it claimed the API docs were enabled in production where they are disabled by default) and an `http://localhost:<port>` `apiBaseUrl` (ignoring the operator's configured `BASE_URL`). Both now reflect the real values, and `autoReconnect` reports the engine's actual default (on) rather than a hardcoded `false` for a config key that never existed.
+- **A reaction no longer clobbers a message's delivery status.** `applyReaction` read the full message row, mutated its `reactions` metadata, then wrote the whole row back — so a delivery ack (`SENT`→`DELIVERED`/`READ`) that committed in the window between that read and write was overwritten with the stale status, permanently regressing the message's state until another ack happened to arrive. The reaction now writes only the `metadata` column via a scoped `UPDATE` keyed on `(sessionId, waMessageId)`, so it can never touch `status` (acks and reactions update disjoint columns). The existing per-message serialization for concurrent reactions is unchanged.
+- **`PUT /infra/config` returns the real HTTP status for a rejected configuration.** A validation failure (an unknown engine type, or a value carrying a newline that would inject an extra env var) was caught and returned as HTTP 200 with `{ saved: false }`, so a client branching on the status code alone treated a rejected save as success. Such validation errors now surface as their real 4xx (`BadRequestException`); a genuine persistence fault (e.g. a disk/permission error while writing the env file) still returns `{ saved: false }` with 200, preserving the dashboard's `body.saved` handling.
+- **Deleting a session no longer orphans its webhooks, templates, or stored Baileys messages on SQLite.** `webhooks`, `templates`, and `baileys_stored_messages` declare an `ON DELETE CASCADE` foreign key to `sessions`, but the default `data` engine (SQLite) runs with `foreign_keys` OFF, so that cascade never fired — a session delete removed only the session, `messages`, and `message_batches` rows and left the rest behind indefinitely (orphaned `webhooks` rows in particular retain their signing secret and any custom headers). `delete()` now removes all CASCADE-FK child rows explicitly inside the same transaction (children before the parent), which is engine-agnostic — redundant-but-harmless on PostgreSQL, where the real cascade already handles it — and mirrors the ordering the data-restore path already uses.
+- **The `message:sending` moderation gate and `message:failed` notification now cover every outbound path.** Both hooks were wired only into the text `sendText` method, so a plugin registered on `message:sending` (the canonical pre-send moderation/compliance gate) saw no image/video/audio/document/sticker/location/contact/poll/reply/forward send and no bulk send at all, and a `message:failed` plugin saw only text-send failures. Every single sender now passes through a shared pre-send gate (a plugin can block or rewrite the payload) and a shared failure emitter, and `BulkMessageService` runs the same per-message gate (a block fails just that message, honoring `stopOnError`) and emits `message:failed` on a failed batch item. ⚠️ **Behavior change:** a `message:sending` plugin now receives — and can block/modify — media, extended, and bulk sends it previously never saw; the hook payload carries a `type` discriminator (`image`/`video`/`poll`/`reply`/… ) so a handler can scope its logic per send type, and its `error` field is sanitized so an SSRF-blocked media fetch does not expose the resolved internal address to plugins. A moderation block on a bulk item fails just that item (honoring `stopOnError`) without emitting `message:failed`, matching single-send where a block is a client error, not a delivery failure. `message:sent` is unchanged (still emitted once from the engine `message_create` path).
+- **Sibling webhooks subscribed to the same event now get distinct idempotency keys.** The per-event idempotency key was derived only from the event and its payload, so two _different_ webhook endpoints registered for the same event on the same session received an identical `X-OpenWA-Idempotency-Key`. A receiver sitting behind both (or a shared dedup store) could drop the second endpoint's delivery as a replay of the first. The key is now salted with the destination webhook's id, so each endpoint is dedup'd independently while retries of the _same_ delivery (including the queue-add→direct fallback) keep their stable key.
+- **A session with auto-reconnect turned off no longer reports "reconnection failed after 0 attempts".** When a disconnect fired with the reconnect budget set to `0` (auto-reconnect disabled), the session was marked `FAILED` with the exhausted-retries message and a count of `0` — implying a retry loop had run and failed rather than a feature that is simply off. That case now records an explicit "Auto-reconnect is disabled" reason; the genuine exhausted-retries message (with its real attempt count) is unchanged.
+- **A failed inbound integration (ingress) delivery is no longer silently dropped on the inline path.** With the queue disabled (or Redis unreachable), an ingress delivery is dispatched inline; if the plugin handler threw, the error was swallowed and the event was stranded — the provider had already received its `202`, and the redrive tooling only scans the dead-letter table, which never got a row. The inline path now persists a dead-letter record (the same shape the queued path writes on its final failed attempt), so the event is redrivable. The write is best-effort: a failure to persist it is logged but never turns the `202` into a `5xx` (the delivery is already dedup-persisted, so the provider won't re-send).
+- **Plugin instance session bindings are re-derived on startup, so a binding lost while the plugin was momentarily unloaded self-heals.** Provisioning a plugin instance mirrors its config into the plugin runtime (per-session config + activation) so an ingress handler resolves the right `ctx.config`; if the plugin happened to be unloaded at that moment the bridge was skipped (only an INFO audit), leaving the instance marked enabled but resolving base config only — previously recoverable only by re-saving the instance. A boot-time reconciliation now re-applies every enabled instance's binding from the persisted `plugin_instances` rows (honoring each row's real `enabled` flag), so a restart restores it. The binding logic moved into a dedicated service shared by provisioning and the reconciler.
+- **Deleting a session now purges its on-disk engine auth directory.** `DELETE /sessions/:id` tore down the running engine and removed the database rows but left the engine's persistent auth store behind (`data/baileys/<name>` for the Baileys engine, `data/sessions/session-<name>` for whatsapp-web.js) — these are keyed by session **name** and live independently of any engine instance, so recreating a session under the same name reloaded stale credentials. The delete now removes that directory too (best-effort, keyed by name, guarded against path traversal, and correctly a no-op when the session was already stopped and had no live engine). Thanks @m7fz7.
+
+## [0.8.10] - 2026-07-07
+
+### Added
+
+- **PostgreSQL schema selection via `POSTGRES_SCHEMA`.** OpenWA's tables and the TypeORM migration ledger can now be placed in a dedicated Postgres schema (default `public` preserves historical behavior). Set `POSTGRES_SCHEMA` to isolate OpenWA from other apps sharing a database, or to use a managed-Postgres project schema. The schema must already exist (the built-in container creates it; for external Postgres run `CREATE SCHEMA <name>;` once). SQLite ignores this setting. The dashboard Infrastructure page exposes the field, and the environment variable is validated as a legal, non-reserved Postgres identifier at boot.
+
+### Changed
+
+- **OpenAPI/Swagger tag hygiene.** Every controller tag is now declared in the API document (ten were used but undeclared), the three Integration Fabric controllers gained `@ApiTags`, and the tag casing is uniform — so `/api/docs` groups every endpoint under a described tag instead of leaving some ungrouped.
+- **Graceful shutdown now drains on `SIGTERM`/`SIGINT`** (rolling deploys, `docker stop`, Ctrl+C), not just on the admin restart endpoint. On a termination signal the app flips readiness to `503` immediately so a load balancer/orchestrator stops routing, keeps serving in-flight requests for a bounded grace window, then tears down and exits deterministically. ⚠️ **Behavior change:** a `docker stop` / redeploy now takes up to the grace window (`SHUTDOWN_DELAY_MS`, default **3s** in production, **0** in dev) plus teardown instead of tearing down instantly, and the process now exits `0` on a clean signal. In Docker set `stop_grace_period` ≥ `SHUTDOWN_DELAY_MS` + your worst-case teardown (the bundled compose now sets `45s`); for Kubernetes set `terminationGracePeriodSeconds` accordingly. A second signal during the drain forces an immediate exit. The whatsapp-web.js engine no longer lets Puppeteer install its own signal handlers (which previously killed Chromium at signal time / `exit(130)` before the drain could run).
+- **The bundled Docker Compose stack pins its `docker-socket-proxy` and `minio` images to explicit tags** (they were on `:latest`) for reproducible, non-drifting deploys, and a Dependabot `docker` ecosystem was added so base and stack images keep receiving update PRs. A Node `>=22` `engines` floor + `.nvmrc` were declared, and the transitive install-time Scarf telemetry (via `swagger-ui-dist`) is disabled.
+
+### Fixed
+
+- **The Integration Fabric now works on PostgreSQL.** `conversation_mappings` and `integration_delivery_failures` declared `@PrimaryGeneratedColumn('uuid')` ids but their columns were created without a Postgres `DEFAULT gen_random_uuid()`, so on PostgreSQL every first insert failed with a `NOT NULL` violation on `id` — breaking the plugin conversation-mapping upsert (e.g. the Chatwoot handover) and the ingress dead-letter write. SQLite was unaffected because its driver mints the uuid client-side, which is why it went unnoticed. A forward-only migration adds the default (no-op on SQLite). A new CI job now applies the full migration chain against a real PostgreSQL and asserts every generated-uuid primary key has a database default, so this dialect gap can't recur.
+- **Indexed `webhooks.sessionId`.** The webhook dispatch path looks up a session's active webhooks by `sessionId` on every emitted event, so on a busy session this was a full table scan of the `webhooks` table per event (the foreign-key column carried no index). A cross-dialect index migration — plus the matching entity index — makes the lookup index-backed.
+- **Boot now rejects a non-canonical boolean feature flag instead of silently disabling the feature.** `QUEUE_ENABLED`, `MCP_ENABLED`, and `SERVE_DASHBOARD` are read with an exact `=== 'true'` / `!== 'false'` comparison, so a typo (`True`, `1`, `yes`) or a stray trailing space/CR (a Windows-edited env file forwarded verbatim by `docker run --env-file`) silently (dis)abled the feature with zero diagnostics. These are now validated at startup and boot fails fast naming the offending key. ⚠️ **Behavior change:** a deployment currently booting with such a value (e.g. `QUEUE_ENABLED=1`) will now refuse to start until corrected to `true`/`false`/unset — including `SERVE_DASHBOARD=0`/`no`, which was silently serving the dashboard and will now correctly disable it once set to `false`.
+- **A fatal uncaught exception is now written to the structured log** (with its stack and origin) before the process exits, instead of only a raw stack on stderr that the log pipeline missed. This is observe-only: the crash-and-restart posture is unchanged (the container restart policy still fires and the process never continues on corrupted post-exception state).
+- **`POST /infra/import-data` no longer swallows a genuine database error while clearing tables.** The table-clearing step tolerated only a genuinely-absent table but previously used a blanket catch, so an I/O/lock error (or an aborted transaction) could let a restore commit a _merged_ rather than _replaced_ dataset on SQLite. Such errors now surface and roll the whole import back (a real fault returns a `500` carrying the actual cause); the intended tolerance for a missing table is preserved.
+- **A session no longer schedules a reconnect while the process is shutting down** — a disconnect during the drain window would otherwise launch a fresh Chromium racing the shutdown teardown. The session is left `DISCONNECTED` (a later start / auto-restore re-initializes it cleanly).
+- **Documentation & config accuracy.** `.env.example` now documents `PORT` (the port the app binds to on bare metal) distinctly from the Compose-only host-published `API_PORT`, and adds the `QUEUE_ENABLED`/`CACHE_ENABLED` toggles. `SECURITY.md`'s supported-versions table and the Java SDK install snippets are refreshed to the current releases. The unused `uuid`/`@types/uuid` dependency was removed, and stale "not yet wired" comments on the plugin ingress-manifest validation (which the loader has called since it shipped) were corrected.
+- **The bundled Docker Compose stack no longer kills Chromium mid-spawn under multi-session `whatsapp-web.js` workloads (#636).** The per-container `pids_limit` shipped at `512` since the `#243` hardening pass — a fork-bomb guard chosen without accounting for Chromium's multi-process model. `whatsapp-web.js` runs a full Chromium instance per session (browser + renderer + GPU + zygote + utilities), and WhatsApp Web is itself process-heavy, so ~4 concurrent sessions already approached 512 and the next session's Chromium was killed mid-spawn when `fork()` returned `EAGAIN` — surfacing in the API as a `Failed to launch the browser process: Code: null` launch failure with no useful log (the dbus/crashpad noise in the log is non-fatal). The default is now `2048` (fits ~8–10 sessions with startup-spike headroom), exposed as `OPENWA_PIDS_LIMIT` for larger fleets. The limit is a cgroup `pids.max` ceiling, not an allocation — raising it is a no-op for light containers, so this is safe for the `baileys` engine (single-process, no Chromium, a handful of PIDs regardless). The fork-bomb guard stays finite (`-1`/unlimited is explicitly discouraged). A new troubleshooting entry distinguishes the three causes of `Code: null` (PID exhaustion vs OOM-kill vs the XDG/crashpad crash already fixed earlier), since the cause isn't visible in the log without `docker stats` / `dmesg`.
+
+## [0.8.9] - 2026-07-06
+
+### Changed
+
+- **Dashboard `<select>` elements replaced with a custom dropdown component.** The "All Status" filter (Sessions), "All Severities" filter (Logs), and language picker (Login) now use a reusable `CustomSelect` component that matches the dashboard design system with proper dark/light theming, keyboard navigation (arrows, Home/End, type-ahead, Escape), and responsive behavior. Focus returns to the trigger on close, matching native `<select>` semantics. Thanks @haseeblodhi1899.
+- The **"Install a plugin" modal is wider on desktop** (480px → 680px) to give the plugin catalog list more room, while still collapsing to a full-width bottom sheet on small screens.
+- **Webhook delivery-failure records are pruned on a retention window.** `webhook_delivery_failures` is an append-only log written on every terminally-failed delivery, so under a receiver outage it grew without bound. It is now pruned to `WEBHOOK_FAILURE_RETENTION_DAYS` (default 90; set `<= 0` to disable) once at startup and daily, mirroring the existing audit-log retention.
+
+### Fixed
+
+- **A malformed session id now returns `400` instead of a `500` on PostgreSQL.** The session routes validate the `:id` path param as a UUID at the boundary, so a non-UUID id (a typo or path fuzzing) is rejected with a clean `400` rather than reaching the `uuid` primary-key column and raising an uncaught cast error that surfaced as a generic `500` — a divergence that only appeared on PostgreSQL (SQLite treated the id as text and returned `404`).
+- **Baileys API sends now emit `message.sent`** (parity with the whatsapp-web.js engine). The wwjs engine fires this for the account's own sends; the Baileys engine's own socket-sends echo back only as a skipped history-sync upsert, so `message.sent` webhooks / WebSocket events / the `message:sent` hook never fired for Baileys API sends. They now fire for text and every media/location/contact/poll/reply/forward send (reactions and deletes excluded).
+- **Config & reliability hardening.** `DATABASE_STATEMENT_TIMEOUT_MS`, `DATABASE_IDLE_TIMEOUT_MS`, and `DATABASE_CONNECTION_TIMEOUT_MS` are validated at boot — a typo previously reached the config layer as `NaN` and broke the PostgreSQL pool. An unparseable `BODY_SIZE_LIMIT` no longer silently disables the request body-size cap (it falls back to the 25 MB default). The channel-messages endpoint no longer forwards `NaN` to the engine on a non-numeric `?limit`. The fire-and-forget session-row writes in the engine callbacks now handle a transient DB fault instead of surfacing an unhandled rejection, and a set of engine-adapter warning logs no longer mislabel their component name.
+- **A terminally-failed or un-reinitializable session no longer strands its browser process or wedges at "already started".** When an engine reports a terminal error, and when a reconnect attempt's re-initialization throws, the dead or half-built engine is now evicted from the session registry and its Chromium process is force-killed instead of being left in place — previously it kept holding a concurrency slot and caused a later start to be rejected as already running. Deleting a session likewise force-kills its browser (rather than a graceful close that could hang on a wedged Chromium and orphan the process).
+- **The dark theme now covers every dashboard surface.** A number of components used hardcoded colors instead of the theme's CSS variables, so several surfaces stayed light in dark mode — most visibly the Infrastructure "Database Migrations" card, plus status/severity badges, toasts, danger-hover states, and toggle tracks across most pages. They now use the theme tokens (and translucent semantic fills) so they follow the active theme in both light and dark. A new `--info` token themes the blue badges (permission, SQLite, info logs, qr-ready pill) that previously had no theme-aware color, and the root `<html>` background no longer stays white when the dark theme is selected on a light-OS device (visible on overscroll).
+
+## [0.8.8] - 2026-07-05
+
+### Added
+
+- **Native WhatsApp polls** via `POST /api/sessions/:sessionId/messages/send-poll`: question, 2–12 options and an optional `allowMultipleAnswers` flag (default single choice), implemented on both engines (whatsapp-web.js `Poll`, Baileys `poll` content with `selectableCount` 1/0). The message history stores the poll question as the body so the log stays readable. Polls are a first-class `poll` message type end to end — both engines map incoming poll messages to it, so the websocket/webhook events, persisted rows, and dashboard all report `poll` consistently. Thanks @alejo117.
+
+### Changed
+
+- Corrected the Italian login-footer wording. Thanks @albanobattistella.
+
+### Fixed
+
+- **`GET /api/sessions/:sessionId/channels/:channelId/messages` always returned an empty array** on the whatsapp-web.js engine (#625). The adapter called `client.getChannelById()`, which does not exist in whatsapp-web.js 1.34.x, so every call threw and the error was swallowed into `[]`. Channel messages are now read from the subscribed `Channel` instance (via `getChannels()`), and an unknown/unsubscribed channel returns a `404` (`ChannelNotFoundError`) instead of a silent empty `200` — matching `GET /channels/:channelId`. Thanks @Header9968.
+- **A session whose `engine.initialize()` fails no longer orphans its browser process.** The crash-recovery path in `SessionService.start()` was tearing down the half-built engine with a graceful `destroy()`, but a failed `initialize()` usually means the underlying browser/CDP connection is already broken (e.g. a `TargetCloseError: Target closed` mid-injection) — `destroy()` has nothing live to talk to, so it could only time out after 10s via `teardownEngineSafely`'s race, leaving the Chromium process alive and orphaned. Every such crash left one more orphaned process behind, eventually starving the host of memory. It now uses `forceDestroy()` (the same SIGKILL-the-process recovery `POST /:id/force-kill` uses), since a failed initialize is the same "possibly-unreachable engine" state that exists for.
+- **Authenticated HTTP/HTTPS proxies now work** on the whatsapp-web.js engine (#628). Credentials were passed inside `--proxy-server`, which Chromium ignores, so a proxy with a username/password never authenticated (only IP-authorized proxies worked). The username/password are now handed to whatsapp-web.js's `proxyAuthentication` (which drives Chromium's `page.authenticate`) while `--proxy-server` gets a credential-less URL. SOCKS proxies still cannot be authenticated — Chromium does not support SOCKS proxy authentication at all — so a SOCKS proxy carrying credentials now logs a clear warning instead of failing with an opaque navigation timeout. Thanks @gudge25.
+
+## [0.8.7] - 2026-07-03
+
+### Added
+
+- **Plugins can canonicalize a chat id** via a new `ctx.engine.canonicalChatId(sessionId, chatId)` capability, gated by the `engine:read` permission like the other engine reads. It resolves a `@lid` privacy id to its stable `<phone>@c.us` form when the mapping is known (best-effort; an unresolved id passes through), letting a plugin key a chat by one identity across WhatsApp's `@lid` migration. This is the host-side prerequisite for an adapter to keep a contact's conversation from splitting when they migrate to `@lid`. (#615)
+
+## [0.8.6] - 2026-07-03
+
+### Fixed
+
+- **The `engine.getChatHistory` plugin capability (added in 0.8.5) now reaches sandboxed plugins.** It was wired only into the host-side context, not the plugin-worker bridge, so a sandboxed plugin's `ctx.engine.getChatHistory` was `undefined` and the call failed silently. It is now bridged through the worker capability + router like the other engine reads. Historical messages from the whatsapp-web.js engine also carry location coordinates and quoted-message references now, matching the live message path (previously a backfilled location rendered empty and replies lost their thread link). (#609)
+
+## [0.8.5] - 2026-07-03
+
+### Added
+
+- **Plugins can read recent chat history** via a new `ctx.engine.getChatHistory(sessionId, chatId, limit?, includeMedia?)` capability, gated by the `engine:read` permission and the plugin's active-session scope like the other engine reads. The limit is clamped host-side (max 100), and both message directions are returned. This is the host-side prerequisite for an adapter to backfill prior conversation context. (#609)
+
+## [0.8.4] - 2026-07-03
+
+### Added
+
+- **`CSP_UPGRADE_INSECURE_REQUESTS` env var** to control the CSP `upgrade-insecure-requests` directive. It defaults to the existing behaviour (on in production, off elsewhere); set it to `false` for an HTTP-only deployment on a trusted private network, where the browser would otherwise upgrade the dashboard to `https` and make it unreachable. Set it to `true` to force it on. (#611)
+
+## [0.8.3] - 2026-07-03
+
+### Added
+
+- **Plugins can send WhatsApp voice notes through `ctx.conversations.send`.** A new `voice` envelope type sends the media at `mediaUrl` as a PTT voice note (audio bubble with waveform) rather than a plain audio file — the host maps it to an audio send with `ptt` set, which defaults the codec to `audio/ogg; codecs=opus` and classifies the message as `voice`, matching inbound classification. It rides the same `conversation:send` permission and activated-session scope as the other media types. (#607)
+
+## [0.8.2] - 2026-07-03
+
+### Added
+
+- **Plugins can send media through `ctx.conversations.send`.** The conversation-send capability now accepts `image`, `video`, `audio`, and `file` envelopes that carry a `mediaUrl`, sending them by URL through the same media pipeline as the REST media endpoints (the caption comes from `text`). It stays under the existing `conversation:send` permission and the plugin's activated-session scope — the text/reply behavior is unchanged. A `replyTo` on a media envelope is rejected, since the engine media path cannot quote a message.
+- **Official Java SDK (`com.rmyndharis:openwa`).** A hand-written, synchronous Java 17 client covering the full REST surface — all 12 resources (sessions, messages, contacts, groups, webhooks, chats, labels, channels, catalog, status, templates, health) plus API-key validation — with typed request builders, immutable response records, a typed error hierarchy, and an injectable HTTP transport for testing. One runtime dependency (Gson); published to Maven Central as `com.rmyndharis:openwa:0.1.1`. Lives in `sdk/java` and is drift-tested against the backend DTOs like the JavaScript, Python, and PHP SDKs. (#602)
+
+## [0.8.1] - 2026-07-02
+
+### Changed
+
+- ⚠️ **The WebSocket handshake no longer accepts the API key via the `?apiKey=` query string.** A key in the URL leaks into proxy and access logs. The handshake now accepts the key only via the Socket.IO `auth.apiKey` field (recommended) or the `X-API-Key` header. **Migration:** if a client connected with `io(url + '?apiKey=...')`, switch to `io(url, { auth: { apiKey } })` or send the `X-API-Key` header. (#601)
+- ⚠️ **The MCP server now defaults to read-only.** Write (state-changing) tools are exposed only when `MCP_READONLY=false` is set explicitly; previously an unset `MCP_READONLY` defaulted to read-write, so enabling `MCP_ENABLED` silently exposed message-send and group tools. **Migration:** set `MCP_READONLY=false` to keep write tools available to MCP callers. (#601)
+
+### Security
+
+- **SSRF rejection messages no longer disclose the resolved internal IP address.** A blocked outbound URL (media-by-URL send, webhook registration) returned the guard's raw message, which named the internal address it resolved to — a reconnaissance oracle. The client now receives a generic message and the detail is logged server-side only. (#595)
+- **Imported session names are validated against path traversal.** A session name becomes the engine's on-disk auth-directory key, and the data-import path bypassed the normal validation, so a crafted name could escape the intended directory. Session-name safety is now enforced at the engine sink for every code path, and the importer skips (with a warning) any unsafe name. Save-config and storage-export responses also return relative paths instead of absolute host paths. (#598)
+- **Plugin capability calls are confined to the sessions a plugin is activated for.** Capability calls (send, engine reads, conversation send, handover, mappings) were gated only by the plugin's static manifest scope, so a plugin activated for one session could act on another. They now also honor the operator-set per-session activation. Plugin `net.fetch` is additionally bounded by a global concurrency limit so many concurrent fetches can't exhaust host memory. (#594)
+- **Inbound-webhook signature verification and config-secret handling hardened.** The HMAC signed content is reconstructed without interpreting `$`-substitution sequences (a body containing one no longer fails verification), the challenge token is compared in constant time, plugin config-secret redaction fails closed when a schema is unavailable and masks nested secrets, and a masked secret round-tripped from the UI no longer overwrites the stored value. (#592, #593)
+- **Rejected WebSocket authentication attempts are now audited** with the same event the REST guard emits, so credential probing over the WebSocket surface leaves a forensic trail. (#601)
+
+### Fixed
+
+- **Inbound-webhook (Integration Fabric) idempotency and delivery durability.** The dedup key now includes the plugin id (two plugins sharing an instance id no longer drop each other's deliveries); a delivery with no dedup header derives a deterministic id instead of a random one (so a provider retry dedups rather than duplicating a WhatsApp send); a redrive keeps a DLQ row redrivable when an inline dispatch is swallowed rather than marking it handled; and the conversation-mapping upsert is race-safe. (#591)
+- **Disappearing-chat (ephemeral) inbound messages on the Baileys engine.** Location coordinates are no longer dropped for an ephemeral location message, and ephemeral/view-once-wrapped messages in a history sync now map to their real type and body instead of an empty "unknown". (#596)
+- **A failed engine start no longer wedges a session.** If engine initialization fails, the half-built engine is now torn down and evicted instead of being left behind holding a concurrency slot and blocking restarts. Creating a session whose name loses a race to an identical one returns 409 Conflict instead of a 500, and bulk send now caps the number of concurrently-processing batches held in memory (`BULK_MAX_CONCURRENT_BATCHES`). (#600)
+- **PostgreSQL boot on managed instances.** The UUID-defaults migration no longer runs `CREATE EXTENSION pgcrypto` unconditionally — it is a core built-in on PostgreSQL 13+, and requiring the extension crash-looped startup on managed databases where the role can't create it. The extension is now touched only on PostgreSQL ≤ 12, with a clear error if it's genuinely needed and unavailable. (#599)
+- **The migration CLI works again.** The data-source module exported two `DataSource` instances, which the TypeORM CLI rejects, breaking every `migration:*` command. (#590)
+
 ## [0.8.0] - 2026-07-02
 
 ### Added
@@ -362,7 +757,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - Sessions (Baileys): when a session is logged out — unlinked from the phone or via the API — the now-invalid on-disk auth state is cleared, so re-linking shows a fresh QR instead of getting stuck silently reloading the dead credentials. (#453 — thanks @ulises2k)
-- Webhooks: registering a webhook (`POST /sessions/:id/webhooks`) to a host whose DNS lookup *rejects* (NXDOMAIN, or a transient `EAI_AGAIN`/`ESERVFAIL` under resolver pressure) now returns `400 Could not resolve host: <host> (<code>)` instead of a generic `500 Internal server error`. The SSRF guard's DNS deadline already mapped resolution *timeouts* and empty results to a 4xx; a rejected lookup leaked the raw DNS error, which surfaced as an intermittent 500 during back-to-back session-create → webhook-register flows.
+- Webhooks: registering a webhook (`POST /sessions/:id/webhooks`) to a host whose DNS lookup _rejects_ (NXDOMAIN, or a transient `EAI_AGAIN`/`ESERVFAIL` under resolver pressure) now returns `400 Could not resolve host: <host> (<code>)` instead of a generic `500 Internal server error`. The SSRF guard's DNS deadline already mapped resolution _timeouts_ and empty results to a 4xx; a rejected lookup leaked the raw DNS error, which surfaced as an intermittent 500 during back-to-back session-create → webhook-register flows.
 - Infrastructure: the dashboard config form no longer shows Server, Webhook, and Rate-Limit sections that were never persisted — they returned a fake "saved" while silently discarding every value. The form now exposes only the settings it actually writes (Database, Redis/Queue, Storage, Engine); the removed settings remain configurable via environment variables.
 - Infrastructure: data export/import (the documented backup and SQLite↔PostgreSQL migration flow) is now complete. It previously exported and restored only sessions, webhooks, messages, and message batches — so a restore silently lost all message templates and stored Baileys messages (cascade-deleted with the old sessions and never re-imported) and dropped every webhook's filters, causing a filtered webhook to come back firing on all events. Templates, stored Baileys messages, and webhook filters now round-trip intact.
 - Engine selection: pinning the engine from the environment works again after the v0.7.1 compose change. The bundled compose files forward `ENGINE_TYPE` into the container again (`- ENGINE_TYPE=${ENGINE_TYPE:-}`) and the app treats a blank value as unset, so an `.env`/host `ENGINE_TYPE=baileys` is honoured while the dashboard's Infrastructure > Engine selection still wins when no engine is pinned. `.env.example` no longer ships `ENGINE_TYPE` pre-pinned. **Upgrade note:** if you relied on `ENGINE_TYPE=baileys` in your `.env`, confirm the active engine after upgrading. (#453 — thanks @ulises2k)
@@ -545,7 +940,7 @@ path (browser-flag parsing + `0600` secret file), and cleaner fresh-install sche
 
 - **The contact, group, and chat list endpoints are now paginated (default cap 1000).** ⚠️ Behavior
   change. `GET /sessions/:id/contacts`, `/groups`, and `/chats` previously serialized the operator's
-  *entire* address book / group / chat set into one response — a heap/GC hazard for very large
+  _entire_ address book / group / chat set into one response — a heap/GC hazard for very large
   accounts. They now accept optional `limit` (clamped `[1, 1000]`) and `offset` query params, and
   default to returning at most **1000** items when no `limit` is given. Accounts under 1000 items are
   unaffected; larger accounts page with `offset`. Chats are returned **most-recent first**, so a
@@ -720,7 +1115,7 @@ longer floods the screen with error toasts.
 
 A reliability, correctness, and dashboard release. **Identity & engine:** Baileys gains a persistent,
 cross-session `lid -> phone` table (shared resolution that survives restarts) plus a new `from` message
-filter, and its contact/chat *listing* ids are now engine-neutral (`@c.us`). **Webhooks:** message
+filter, and its contact/chat _listing_ ids are now engine-neutral (`@c.us`). **Webhooks:** message
 reactions now also fire as a `message.reaction` webhook (previously WebSocket-only). **Dashboard:**
 selectable appearance palettes with light/dark/system mode, and a redesigned Templates workspace.
 **Hardening:** the LibreTranslate client pins its outbound connection, and Baileys group-participant
@@ -773,7 +1168,7 @@ webhooks subscribed with `*` now also receive `message.reaction`.
   addressed by a raw engine id), so the conversation view is no longer empty when the stored and queried
   dialects differ - the same resolution the `from` filter uses. (#375)
 
-- **Baileys engine: contact and chat *listing* ids are now engine-neutral (`@c.us`).** `getContacts` /
+- **Baileys engine: contact and chat _listing_ ids are now engine-neutral (`@c.us`).** `getContacts` /
   `getChats` / `getContactById` previously returned the raw `<phone>@s.whatsapp.net` id (visible in the
   dashboard, and mismatched against the `@c.us` chatId stored on messages). They now emit the neutral
   `@c.us` dialect like the message payloads; the read-back paths (`sendSeen` / `deleteChat` / contact
@@ -933,8 +1328,8 @@ of silently falling back to the default.
   the queue dashboard (Bull Board) auth uses the same trusted-proxy IP model as the API; the production
   secret-guard inspects the canonical S3 variables. (#345)
 - **Storage import/key hardening.** A `tar.gz` import is bounded against decompression bombs (per-entry byte cap
-  + entry-count cap); storage-key containment is enforced at the backend-agnostic boundary so the S3 path
-  inherits it; a plugin's `ctx.storage` is sandbox-contained against `..` traversal. (#346)
+  - entry-count cap); storage-key containment is enforced at the backend-agnostic boundary so the S3 path
+    inherits it; a plugin's `ctx.storage` is sandbox-contained against `..` traversal. (#346)
 
 ### Fixed
 
@@ -1091,7 +1486,7 @@ application-code changes.
   monitoring, and any external reverse-proxy config accordingly. (#275)
 - The `with-dashboard` and `with-proxy` compose profiles are removed, and the `DASHBOARD_PORT`,
   `PROXY_ENABLED`, and `DASHBOARD_ENABLED` env vars are gone (silently ignored if still set). `--profile
-  full` now starts the optional datastores (postgres, redis, minio). If you relied on the bundled Traefik
+full` now starts the optional datastores (postgres, redis, minio). If you relied on the bundled Traefik
   for TLS, front the API with your own reverse proxy. (#275, #276)
 
 ## [0.3.0] - 2026-06-18
@@ -1351,7 +1746,7 @@ Login language selector legible in dark mode.
 ### Fixed
 
 - Chromium no longer hard-crashes at launch (`Trace/breakpoint trap` / `chrome_crashpad_handler:
-  --database is required`) on hardened `read_only` containers. Chromium resolves its home dir from the
+--database is required`) on hardened `read_only` containers. Chromium resolves its home dir from the
   passwd entry and ignores `$HOME`, so the home-less `openwa` user pointed it at a nonexistent
   `/home/openwa`. It is now given writable, pre-created `XDG_CONFIG_HOME`/`XDG_CACHE_HOME` dirs (created
   by the entrypoint, owned by `openwa`). This supersedes the ineffective `--crash-dumps-dir` approach

@@ -15,6 +15,7 @@ import {
   GroupInfo,
   GroupParticipant,
   LocationInput,
+  PollInput,
   ContactCard,
   MessageReaction,
   Label,
@@ -41,6 +42,8 @@ import { createLogger } from '../../common/services/logger.service';
 import { EngineNotReadyError } from '../../common/errors/engine-not-ready.error';
 import { EngineNotSupportedError } from '../../common/errors/engine-not-supported.error';
 import { MessageNotFoundError } from '../../common/errors/message-not-found.error';
+import { ChannelNotFoundError } from '../../common/errors/channel-not-found.error';
+import { ChannelMediaNotSupportedError } from '../../common/errors/channel-media-not-supported.error';
 import { loadRemoteMediaBuffer } from '../../common/media/load-remote-media';
 import {
   GroupChat,
@@ -61,7 +64,7 @@ import {
   isMediaDownloadEnabled,
   withInboundDownloadTimeout,
 } from './inbound-media-cap';
-import { ConcurrencyLimiter } from './concurrency-limiter';
+import { ConcurrencyLimiter } from '../../common/utils/concurrency-limiter';
 
 /**
  * Map a whatsapp-web.js MessageAck integer to the neutral DeliveryStatus.
@@ -101,6 +104,36 @@ export function isSupportedProxyUrl(url: string): boolean {
   }
 }
 
+export interface ProxyLaunchConfig {
+  /** Credential-less `--proxy-server` value — Chromium ignores credentials embedded in this flag. */
+  serverArg: string;
+  /** Username/password for whatsapp-web.js's `proxyAuthentication` (→ `page.authenticate`, HTTP/HTTPS only). */
+  proxyAuthentication?: { username: string; password: string };
+  /** The URL carries credentials for a SOCKS proxy, which Chromium cannot authenticate at all. */
+  socksAuthUnsupported: boolean;
+}
+
+/**
+ * Split a proxy URL into a credential-less `--proxy-server` value plus, for an HTTP/HTTPS proxy, the
+ * username/password to hand to whatsapp-web.js's `proxyAuthentication` (which calls `page.authenticate`
+ * — the only way Chromium authenticates a proxy). Credentials embedded in `--proxy-server` are ignored
+ * by Chromium, and SOCKS proxies cannot be authenticated at all, so SOCKS credentials are surfaced via
+ * `socksAuthUnsupported` for the caller to warn about instead of failing with an opaque nav timeout (#628).
+ * Call only with a URL that already passed {@link isSupportedProxyUrl}.
+ */
+export function buildProxyLaunchConfig(url: string): ProxyLaunchConfig {
+  const parsed = new URL(url);
+  const serverArg = `${parsed.protocol}//${parsed.host}`;
+  const username = decodeURIComponent(parsed.username);
+  const password = decodeURIComponent(parsed.password);
+  const hasCredentials = username !== '' || password !== '';
+  const isSocks = parsed.protocol === 'socks4:' || parsed.protocol === 'socks5:';
+  if (hasCredentials && !isSocks) {
+    return { serverArg, proxyAuthentication: { username, password }, socksAuthUnsupported: false };
+  }
+  return { serverArg, socksAuthUnsupported: hasCredentials && isSocks };
+}
+
 /**
  * Whether a MediaInput's string `data` is an http(s) URL (to be fetched through the SSRF-guarded
  * loadRemoteMedia) rather than base64. Case-insensitive, matching the Baileys adapter — a mixed-case
@@ -108,6 +141,18 @@ export function isSupportedProxyUrl(url: string): boolean {
  */
 export function isHttpUrl(value: string): boolean {
   return /^https?:\/\//i.test(value);
+}
+
+/**
+ * Detect Puppeteer's "Execution context was destroyed" error. During `Client.inject()` this is most
+ * often a persistent browser profile left stale by an OpenWA upgrade that changed the Chromium/Chrome
+ * binary (e.g. the v0.8.12 amd64 Debian Chromium → Chrome for Testing switch, #663 / #708) — but it is
+ * not exclusively that: Puppeteer also raises it on a page navigation or a renderer crash (see
+ * puppeteer-core `ExecutionContext` / `IsolatedWorld`), so the caller advises rather than asserts.
+ * Pure so the detection is unit-testable without mocking the whatsapp-web.js `Client`.
+ */
+export function isExecutionContextDestroyedError(reason: string): boolean {
+  return /execution context was destroyed/i.test(reason);
 }
 
 /**
@@ -237,7 +282,12 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
   private unresolvedParticipantLogged: Set<string> = new Set();
   // Bound concurrent inbound media downloads: downloadMedia() materialises the full base64 blob, so an
   // unbounded burst could stack many multi-MB allocations.
-  private readonly inboundLimiter = new ConcurrencyLimiter(inboundMediaConcurrency());
+  private readonly inboundLimiter = new ConcurrencyLimiter(
+    inboundMediaConcurrency(),
+    // Queue cap == active slots: beyond (active + queued) concurrent media messages, reject instead of
+    // parking, so a burst can't grow heap without bound (each parked closure holds the message).
+    inboundMediaConcurrency(),
+  );
 
   /**
    * Download inbound media safely. downloadMedia() can't be size-bounded at the source, so (1) pre-gate
@@ -298,8 +348,16 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
         () => undefined,
       );
     });
-    // The slot-holder runs in the background; never let it surface as an unhandled rejection.
-    void slotHeld.catch(() => undefined);
+    // The slot-holder runs in the background. It only rejects when the limiter's waiter queue is
+    // saturated (queue full) — in which case the download task never ran and boundedReady would hang.
+    // Resolve null so the caller unblocks and emits the message without media, matching the
+    // timeout/byte-cap no-media path. Never let it surface as an unhandled rejection either.
+    void slotHeld.catch(() => {
+      this.logger.warn('Inbound media limiter saturated; emitting message without media', {
+        msgId: msg.id._serialized,
+      });
+      resolveBounded(null);
+    });
     const media = await boundedReady;
     if (!media) return undefined;
     const capped = capInboundMedia({
@@ -335,12 +393,21 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
 
       // Add proxy configuration if provided — but only when the URL parses to a supported scheme, so
       // a malformed/stored proxy value can't break the Chromium launch or smuggle a non-proxy scheme.
+      let proxyAuthentication: { username: string; password: string } | undefined;
       if (this.config.proxy) {
         if (isSupportedProxyUrl(this.config.proxy.url)) {
-          puppeteerArgs.push(`--proxy-server=${this.config.proxy.url}`);
-          this.logger.log(
-            `Using proxy: ${this.config.proxy.type}://${this.config.proxy.url.replace(/:[^:@]*@/, ':***@')}`,
-          );
+          // Chromium ignores credentials in --proxy-server; pass a credential-less server and hand the
+          // username/password to wwjs's proxyAuthentication (page.authenticate) for HTTP/HTTPS proxies (#628).
+          const proxyLaunch = buildProxyLaunchConfig(this.config.proxy.url);
+          puppeteerArgs.push(`--proxy-server=${proxyLaunch.serverArg}`);
+          proxyAuthentication = proxyLaunch.proxyAuthentication;
+          if (proxyLaunch.socksAuthUnsupported) {
+            this.logger.warn(
+              `Proxy for session ${this.config.sessionId} has credentials on a SOCKS proxy, but Chromium ` +
+                `cannot authenticate SOCKS proxies. Use an IP-authorized proxy or an HTTP/HTTPS proxy instead.`,
+            );
+          }
+          this.logger.log(`Using proxy: ${proxyLaunch.serverArg}`);
         } else {
           this.logger.warn(`Ignoring invalid proxy URL for session ${this.config.sessionId}`);
         }
@@ -368,11 +435,20 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
         puppeteer: {
           headless: this.config.puppeteer?.headless ?? true,
           args: puppeteerArgs,
+          // Do NOT let Puppeteer install its own process signal handlers. By default it handles
+          // SIGINT (→ synchronous process.exit(130), which would skip the graceful drain entirely)
+          // and SIGTERM/SIGHUP (→ kills Chromium at signal time, defeating the drain window). We own
+          // signal handling in main.ts. Puppeteer's unconditional `exit` hook still SIGKILLs this
+          // browser when the process actually exits, so nothing is orphaned.
+          handleSIGINT: false,
+          handleSIGTERM: false,
+          handleSIGHUP: false,
           // Only override the executable when explicitly configured; otherwise let
           // whatsapp-web.js fall back to Puppeteer's bundled Chromium.
           ...(this.config.puppeteer?.executablePath ? { executablePath: this.config.puppeteer.executablePath } : {}),
         },
         ...(authTimeoutMs !== undefined ? { authTimeoutMs } : {}),
+        ...(proxyAuthentication ? { proxyAuthentication } : {}),
         ...(versionPin ?? {}),
       });
 
@@ -381,6 +457,24 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
     } catch (error) {
       this.setStatus(EngineStatus.FAILED);
       const reason = error instanceof Error ? error.message : String(error);
+      if (isExecutionContextDestroyedError(reason)) {
+        // #708: Puppeteer's "Execution context was destroyed" during inject reads like a Puppeteer bug.
+        // During initialize() its dominant cause is a browser profile left stale by an upgrade that
+        // changed the Chromium/Chrome binary (e.g. v0.8.12 amd64: Debian Chromium → Chrome for Testing,
+        // #663) — but it can also follow a page navigation or a renderer crash, so advise, don't assert.
+        // The profile dir is the same one clearLocalAuth() removes on a clean re-pair. Safe to compute
+        // here: sessionDataPath is a required config field already resolved in the try block above, so
+        // this can't throw and mask the original error we are about to rethrow.
+        this.logger.warn(
+          `"${reason}" during initialize. If this followed an OpenWA upgrade that changed the ` +
+            `Chromium/Chrome binary (v0.8.12 amd64 switched Debian Chromium → Chrome for Testing), the ` +
+            `session's browser profile is likely stale — delete the profile dir ` +
+            `"${path.join(path.resolve(this.config.sessionDataPath), `session-${this.config.sessionId}`)}" ` +
+            `and start again to re-scan. If no upgrade happened, Puppeteer also raises this on a page ` +
+            `navigation or renderer crash (check for memory pressure or a WhatsApp Web reload). ` +
+            `See docs/12-troubleshooting-faq.md.`,
+        );
+      }
       this.callbacks.onError?.(reason);
       throw error;
     }
@@ -743,7 +837,7 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
   private async clearLocalAuth(): Promise<void> {
     const dir = path.join(path.resolve(this.config.sessionDataPath), `session-${this.config.sessionId}`);
     await fs.promises.rm(dir, { recursive: true, force: true }).catch((error: unknown) => {
-      this.logger.warn(`Could not clear stale auth at ${dir}`, String(error));
+      this.logger.warn(`Could not clear stale auth at ${dir}`, { error: String(error) });
     });
   }
 
@@ -794,7 +888,7 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
       // This allows reconnecting without needing to scan QR again
       await client.destroy();
     } catch (error) {
-      this.logger.warn('Destroy client failed:', String(error));
+      this.logger.warn('Destroy client failed:', { error: String(error) });
       // Already destroyed or not initialized - ignore
     } finally {
       this.finishClientTeardown(client);
@@ -809,12 +903,12 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
       // Logout clears session data - user will need to scan QR again
       await client.logout();
     } catch (error) {
-      this.logger.warn('Logout failed:', String(error));
+      this.logger.warn('Logout failed:', { error: String(error) });
       // Fall back to destroy if logout fails
       try {
         await client.destroy();
       } catch (destroyError) {
-        this.logger.warn('Client destroy also failed during logout fallback', String(destroyError));
+        this.logger.warn('Client destroy also failed during logout fallback', { error: String(destroyError) });
       }
     } finally {
       this.finishClientTeardown(client);
@@ -995,6 +1089,7 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
     extraOptions?: { sendAudioAsVoice?: boolean },
   ): Promise<MessageResult> {
     this.ensureReady();
+    this.ensureNotChannelRecipient(chatId);
 
     let messageMedia: MessageMedia;
 
@@ -1054,7 +1149,7 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
         isBlocked: contact.isBlocked,
       };
     } catch (error) {
-      this.logger.warn(`Failed to get contact: ${contactId}`, String(error));
+      this.logger.warn(`Failed to get contact: ${contactId}`, { error: String(error) });
       return null;
     }
   }
@@ -1151,6 +1246,10 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
 
   async sendStickerMessage(chatId: string, media: MediaInput): Promise<MessageResult> {
     this.ensureReady();
+    // Sticker has its own send path (sendMediaAsSticker), not the sendMediaMessage funnel, but it
+    // hits the same channel crash: for a channel wwjs drops the sticker form and runs processMediaData
+    // with sendToChannel, which still ends at msg.avParams() (Utils.js:518). Guard it too (#673).
+    this.ensureNotChannelRecipient(chatId);
     let messageMedia: MessageMedia;
 
     if (typeof media.data === 'string') {
@@ -1167,6 +1266,28 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
       this.client!.sendMessage(to, messageMedia, {
         sendMediaAsSticker: true,
       }),
+    );
+    return {
+      id: msg.id._serialized,
+      timestamp: msg.timestamp,
+    };
+  }
+
+  async sendPollMessage(chatId: string, poll: PollInput): Promise<MessageResult> {
+    this.ensureReady();
+    // Import Poll dynamically like Location; the .default fallback covers builds where the
+    // classes land on module.default (a plain `module.Poll` would be undefined there and
+    // `new Poll` fails with "not a constructor").
+    const module = await import('whatsapp-web.js');
+    const Poll = module.Poll || module.default?.Poll;
+
+    // wwebjs's typings mark `messageSecret` as required, but at runtime it is optional (it is
+    // only used as a custom poll id), so cast to the constructor's options type to pass just
+    // allowMultipleAnswers.
+    type PollSendOptions = ConstructorParameters<typeof Poll>[2];
+    const pollOptions = { allowMultipleAnswers: poll.allowMultipleAnswers === true } as PollSendOptions;
+    const msg = await this.sendResolved(chatId, to =>
+      this.client!.sendMessage(to, new Poll(poll.name, poll.options, pollOptions)),
     );
     return {
       id: msg.id._serialized,
@@ -1270,7 +1391,7 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
         linkedParentJID: extractLinkedParentJID(groupChat.groupMetadata),
       };
     } catch (error) {
-      this.logger.warn(`Failed to get group: ${groupId}`, String(error));
+      this.logger.warn(`Failed to get group: ${groupId}`, { error: String(error) });
       return null;
     }
   }
@@ -1514,23 +1635,9 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
 
   async getChannelById(channelId: string): Promise<Channel | null> {
     this.ensureReady();
-    try {
-      const ch = await (this.client as unknown as BusinessClient).getChannelById(channelId);
-      if (!ch) {
-        return null;
-      }
-      return {
-        id: String(typeof ch.id === 'object' ? ch.id._serialized : ch.id),
-        name: String(ch.name || ''),
-        description: ch.description ? String(ch.description) : undefined,
-        inviteCode: ch.inviteCode ? String(ch.inviteCode) : undefined,
-        subscriberCount: ch.subscriberCount ? Number(ch.subscriberCount) : undefined,
-        verified: ch.verified ? Boolean(ch.verified) : undefined,
-      };
-    } catch (error) {
-      this.logger.warn(`Failed to get channel: ${channelId}`, String(error));
-      return null;
-    }
+    // wwebjs 1.34.x exposes no client.getChannelById; resolve from the subscribed-channel list (#625).
+    const channels = await this.getSubscribedChannels();
+    return channels.find(c => c.id === channelId) ?? null;
   }
 
   async subscribeToChannel(inviteCode: string): Promise<Channel> {
@@ -1552,26 +1659,24 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
 
   async getChannelMessages(channelId: string, limit: number = 50): Promise<ChannelMessage[]> {
     this.ensureReady();
-    try {
-      const ch = await (this.client as unknown as BusinessClient).getChannelById(channelId);
-      if (!ch) {
-        throw new Error(`Channel ${channelId} not found`);
-      }
-      const messages = await ch.fetchMessages({ limit });
-      if (!messages) {
-        return [];
-      }
-      return messages.map(msg => ({
-        id: String(typeof msg.id === 'object' ? msg.id._serialized : msg.id),
-        body: String(msg.body || ''),
-        timestamp: Number(msg.timestamp),
-        hasMedia: Boolean(msg.hasMedia),
-        mediaUrl: msg.mediaUrl ? String(msg.mediaUrl) : undefined,
-      }));
-    } catch (error) {
-      this.logger.error(`Failed to get channel messages: ${String(error)}`);
-      return [];
+    // wwebjs 1.34.x has no client.getChannelById (calling it threw and the error was swallowed into an
+    // empty list, #625). The subscribed Channel instances returned by getChannels() carry fetchMessages(),
+    // so resolve the channel from that list and read its messages. A missing channel surfaces as a
+    // ChannelNotFoundError (→ 404, like getChannelById) so callers can tell "no messages" apart from
+    // "wrong/unsubscribed channel" instead of getting a silent [].
+    const channels = await (this.client as unknown as BusinessClient).getChannels();
+    const channel = channels?.find(c => (typeof c.id === 'object' ? c.id._serialized : c.id) === channelId);
+    if (!channel) {
+      throw new ChannelNotFoundError(channelId);
     }
+    const messages = await channel.fetchMessages({ limit });
+    return (messages ?? []).map(msg => ({
+      id: String(typeof msg.id === 'object' ? msg.id._serialized : msg.id),
+      body: String(msg.body || ''),
+      timestamp: Number(msg.timestamp),
+      hasMedia: Boolean(msg.hasMedia),
+      mediaUrl: msg.mediaUrl ? String(msg.mediaUrl) : undefined,
+    }));
   }
 
   // Synchroniza mensajes recientes por chat al conectar para simular
@@ -1899,6 +2004,25 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
       out.isStatusBroadcast = chatId === 'status@broadcast';
       const call = extractWwebjsCall(msg);
       if (call) out.call = call;
+      // Mirror the live handler's location + quoted-message enrichment so history renders identically —
+      // buildIncomingMessageBase sets type='location' but no coordinates, and never resolves quotes.
+      if (msg.type === MessageTypes.LOCATION && msg.location) {
+        out.location = {
+          latitude: Number(msg.location.latitude),
+          longitude: Number(msg.location.longitude),
+          description: msg.location.description || undefined,
+          address: msg.location.address || undefined,
+          url: msg.location.url || undefined,
+        };
+      }
+      if (msg.hasQuotedMsg) {
+        try {
+          const quoted = await msg.getQuotedMessage();
+          out.quotedMessage = { id: quoted.id._serialized, body: quoted.body };
+        } catch (error) {
+          this.logger.warn(`Failed to resolve quoted message for ${msg.id._serialized}: ${String(error)}`);
+        }
+      }
       if (includeMedia && msg.hasMedia) {
         try {
           // Same pre-gate + limiter as live media: a large historical blob shouldn't bloat the response/heap.
@@ -1987,38 +2111,125 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
 
   async getContactStatuses(): Promise<Status[]> {
     this.ensureReady();
-    // whatsapp-web.js has limited Status API support
-    // This is a stub that can be enhanced when the library adds support
-    this.logger.warn('getContactStatuses not fully implemented in whatsapp-web.js');
-    return [];
+    return this.collectStatuses(await this.client!.getBroadcasts());
   }
 
-  async getContactStatus(_contactId: string): Promise<Status[]> {
+  async getContactStatus(contactId: string): Promise<Status[]> {
     this.ensureReady();
-    this.logger.warn('getContactStatus not fully implemented in whatsapp-web.js');
-    return [];
+    // A contact with no active 24h story resolves to an "empty" Broadcast (id/msgs/getContact
+    // undefined — Broadcast._patch only runs when data is truthy). That is the common case, so guard
+    // it: return [] rather than dereferencing undefined inside collectStatuses (→ 500).
+    const broadcast = await this.client!.getBroadcastById(contactId);
+    return broadcast?.msgs?.length ? this.collectStatuses([broadcast]) : [];
   }
 
-  async postTextStatus(_text: string, _options?: StatusPostOptions): Promise<StatusResult> {
-    this.ensureReady();
-    // whatsapp-web.js doesn't have native status posting
-    // This would require using the underlying WhatsApp Web API directly
-    throw new EngineNotSupportedError('postTextStatus (Baileys-only; wwebjs blocked upstream, see #455)');
+  /**
+   * Map whatsapp-web.js story Broadcasts (+ their Messages) into the neutral Status shape. Each
+   * Broadcast is one contact's story (its `msgs`); we flatten across broadcasts. type collapses to
+   * the Status union (image/video, else text — audio/other stories are rare and become 'text').
+   * expiresAt is timestamp + 24h (WhatsApp status TTL). Broadcasts without msgs are skipped (a story
+   * that expired between getBroadcasts and here, or a phantom entry).
+   */
+  private async collectStatuses(
+    broadcasts: ReadonlyArray<{
+      msgs?: Message[];
+      getContact: () => Promise<{ id: { _serialized: string }; name?: string; pushname?: string }>;
+    }>,
+  ): Promise<Status[]> {
+    const statuses: Status[] = [];
+    for (const broadcast of broadcasts) {
+      if (!broadcast?.msgs?.length) {
+        continue;
+      }
+      const contact = await broadcast.getContact();
+      const contactSummary = {
+        id: contact.id._serialized,
+        ...(contact.name ? { name: contact.name } : {}),
+        ...(contact.pushname ? { pushName: contact.pushname } : {}),
+      };
+      for (const msg of broadcast.msgs) {
+        const ts = new Date(msg.timestamp * 1000);
+        statuses.push({
+          id: msg.id._serialized,
+          contact: contactSummary,
+          type: msg.type === MessageTypes.IMAGE ? 'image' : msg.type === MessageTypes.VIDEO ? 'video' : 'text',
+          ...(msg.body ? { caption: msg.body } : {}),
+          timestamp: ts,
+          expiresAt: new Date(ts.getTime() + 24 * 3_600_000),
+        });
+      }
+    }
+    return statuses;
   }
 
-  async postImageStatus(_media: MediaInput, _options?: StatusPostOptions): Promise<StatusResult> {
+  private warnedStatusRecipients = false;
+
+  async postTextStatus(text: string, options: StatusPostOptions): Promise<StatusResult> {
     this.ensureReady();
-    throw new EngineNotSupportedError('postImageStatus (Baileys-only; wwebjs blocked upstream, see #455)');
+    this.warnStatusRecipientsOnce(options);
+    // whatsapp-web.js posts a text status by messaging status@broadcast with styling in `extra`
+    // (Client.js maps options.extra → page extraOptions → sendStatusTextMsgAction in Utils.js).
+    // backgroundColor is a #RRGGBB hex; font is the fontStyle index 0-7.
+    const msg = await this.client!.sendMessage('status@broadcast', text, {
+      extra: {
+        ...(options.backgroundColor !== undefined ? { backgroundColor: options.backgroundColor } : {}),
+        ...(options.font !== undefined ? { fontStyle: options.font } : {}),
+      },
+    });
+    return this.toStatusResult(msg);
   }
 
-  async postVideoStatus(_media: MediaInput, _options?: StatusPostOptions): Promise<StatusResult> {
-    this.ensureReady();
-    throw new EngineNotSupportedError('postVideoStatus (Baileys-only; wwebjs blocked upstream, see #455)');
+  async postImageStatus(media: MediaInput, options: StatusPostOptions): Promise<StatusResult> {
+    return this.postMediaStatus(media, options);
   }
 
-  async deleteStatus(_statusId: string): Promise<void> {
+  async postVideoStatus(media: MediaInput, options: StatusPostOptions): Promise<StatusResult> {
+    return this.postMediaStatus(media, options);
+  }
+
+  private async postMediaStatus(media: MediaInput, options: StatusPostOptions): Promise<StatusResult> {
     this.ensureReady();
-    throw new EngineNotSupportedError('deleteStatus');
+    this.warnStatusRecipientsOnce(options);
+    const messageMedia = await this.toStatusMessageMedia(media);
+    const msg = await this.client!.sendMessage('status@broadcast', messageMedia, {
+      ...(options.caption !== undefined ? { caption: options.caption } : {}),
+    });
+    return this.toStatusResult(msg);
+  }
+
+  /** Build a MessageMedia from a MediaInput (URL → fetched, base64/Buffer → wrapped). */
+  private async toStatusMessageMedia(media: MediaInput): Promise<MessageMedia> {
+    if (typeof media.data === 'string') {
+      if (isHttpUrl(media.data)) return loadRemoteMedia(media.data);
+      return new MessageMedia(media.mimetype, media.data, media.filename);
+    }
+    return new MessageMedia(media.mimetype, media.data.toString('base64'), media.filename);
+  }
+
+  private toStatusResult(msg: Message | undefined): StatusResult {
+    const ts = msg?.timestamp ? new Date(msg.timestamp * 1000) : new Date();
+    return {
+      statusId: msg?.id?._serialized ?? '',
+      timestamp: ts,
+      expiresAt: new Date(ts.getTime() + 24 * 3_600_000),
+    };
+  }
+
+  private warnStatusRecipientsOnce(options: StatusPostOptions): void {
+    if (this.warnedStatusRecipients || !options.recipients?.length) return;
+    this.warnedStatusRecipients = true;
+    this.logger.warn(
+      "postStatus on the whatsapp-web.js engine broadcasts to the account's status-privacy audience; " +
+        'the recipients allow-list is not honored by whatsapp-web.js (it is on the Baileys engine).',
+    );
+  }
+
+  async deleteStatus(statusId: string): Promise<void> {
+    this.ensureReady();
+    // Revokes the caller's own status post. revokeStatusMessage resolves the message by id and
+    // throws if it isn't fromMe/isn't a status — the statusId returned by postText/Image/VideoStatus
+    // (msg.id._serialized) is the id it expects.
+    await this.client!.revokeStatusMessage(statusId);
   }
 
   // ========== Catalog (Phase 3) ==========
@@ -2158,7 +2369,7 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
       // Presence is best-effort and already swallowed here — it never breaks the surrounding send —
       // so log at WARN, not ERROR: a migrated contact routinely yields `No LID for user` on the
       // presence path and an ERROR line reads as a fault when nothing actually failed (#582).
-      this.logger.warn(`Could not set chat state '${state}' for ${chatId} (best-effort)`, String(error));
+      this.logger.warn(`Could not set chat state '${state}' for ${chatId} (best-effort)`, { error: String(error) });
     }
   }
 
@@ -2168,6 +2379,15 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
       // instead of a 500 when an engine op is attempted while the session is
       // disconnected / reconnecting / still initializing (#100).
       throw new EngineNotReadyError();
+    }
+  }
+
+  private ensureNotChannelRecipient(chatId: string): void {
+    // whatsapp-web.js crashes building a channel media message (`msg.avParams is not a function`,
+    // upstream wwebjs#201823 — WA Web removed Msg.avParams). Text→channel works; media does not.
+    // Fail fast with a typed 501 instead of surfacing the raw TypeError as a 500 (#673).
+    if (isChannelJid(chatId)) {
+      throw new ChannelMediaNotSupportedError();
     }
   }
 }

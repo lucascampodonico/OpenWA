@@ -20,7 +20,7 @@ A global API-key guard protects every route unless it is explicitly marked **pub
 X-API-Key: owa_k1_your-api-key-here
 ```
 
-> **REST auth is header-only.** A query-parameter API key is **not** accepted on REST routes. The only place an `?apiKey=` query value is honoured is the WebSocket (Socket.IO) handshake — see §6.5 Real-time API — which accepts the key via the handshake `auth.apiKey` field, the `X-API-Key` header, or an `?apiKey=` query string. Do not put the key in a REST URL.
+> **Auth is header-only (never in a URL).** A query-parameter API key is **not** accepted anywhere. REST routes take the key via the `X-API-Key` header; the WebSocket (Socket.IO) handshake — see §6.5 Real-time API — accepts it via the handshake `auth.apiKey` field or the `X-API-Key` header. The former `?apiKey=` query fallback was **removed** (it leaked the credential into proxy/access logs). Never put the key in a URL.
 
 The metrics endpoint is the lone exception to the API-key scheme: it authenticates with `Authorization: Bearer <METRICS_TOKEN>` instead of `X-API-Key`.
 
@@ -1137,6 +1137,39 @@ Send a sticker (by URL or base64; typically webp). Reuses `SendMediaMessageDto`.
 ```
 
 **Errors:** `400` media validation failure / session not active / unknown body field · `401` missing/invalid API key · `403` key role below OPERATOR · `500` engine error
+
+#### POST /api/sessions/:sessionId/messages/send-poll
+
+Send a native WhatsApp poll.
+
+**Auth:** API key (OPERATOR)
+
+**Path parameters**
+
+| Name | Type | Description |
+| --- | --- | --- |
+| sessionId | string | Session ID |
+
+**Request body** — `SendPollDto`
+
+| Field | Type | Required | Constraints | Description |
+| --- | --- | --- | --- | --- |
+| chatId | string | Yes | non-empty | Target chat |
+| name | string | Yes | max 255 | Poll question / title |
+| options | string[] | Yes | 2–12 items, each non-empty, max 100 chars | Options to vote on |
+| allowMultipleAnswers | boolean | No | — | Allow picking several options (default single choice) |
+
+```json
+{ "chatId": "1203630000@g.us", "name": "Where should we meet?", "options": ["Park", "Beach", "Downtown"], "allowMultipleAnswers": false }
+```
+
+**Response** `201`
+
+```json
+{ "messageId": "true_1203630000@g.us_3EB0ABCD", "timestamp": 1719312000 }
+```
+
+**Errors:** `400` validation failure (option count/length) / session not active / unknown body field · `401` missing/invalid API key · `403` key role below OPERATOR · `500` engine error
 
 #### POST /api/sessions/:sessionId/messages/reply
 
@@ -3760,6 +3793,7 @@ Merge-save infrastructure config to `data/.env.generated` (a `0600` secret file)
 | `database.sslRejectUnauthorized` | boolean | No | — | Only written when `sslEnabled` is true; default true |
 | `redis.enabled` / `.builtIn` | boolean | No | — | `builtIn`+enabled forces `redis` container + profile |
 | `redis.host` / `.port` | string | No | `port` is a string | Defaults `localhost`/`6379` |
+| `redis.username` | string | No | — | Redis ACL username |
 | `redis.password` | string | No | secret | Empty keeps existing |
 | `queue.enabled` | boolean | No | — | Writes `QUEUE_ENABLED` |
 | `storage.type` | `'local' \| 's3'` | No | — | `local` drops stale S3 keys; `s3` drops `STORAGE_LOCAL_PATH` |
@@ -4332,7 +4366,7 @@ MCP Streamable-HTTP / JSON-RPC 2.0 transport that exposes the agent-tool registr
 Key facts:
 - **Path is exactly `POST /mcp` — no `/api` prefix.** The global `api` prefix applies only to Nest controllers; this route is mounted straight on Express.
 - Gated by **`MCP_ENABLED=true`**. When off, the module/route is never mounted and `POST /mcp` returns `404`.
-- `MCP_READONLY=true` registers only read-tier tools. Per-key sliding-window rate limit: `MCP_RATE_LIMIT_MAX` (default 60) per `MCP_RATE_LIMIT_WINDOW_MS` (default 60000).
+- MCP is **read-only by default**: only read-tier tools are registered unless you set `MCP_READONLY=false` to expose write tools. Per-key sliding-window rate limit: `MCP_RATE_LIMIT_MAX` (default 60) per `MCP_RATE_LIMIT_WINDOW_MS` (default 60000).
 - Stateless transport (no SSE/session id for normal calls).
 
 **Request body** — JSON-RPC 2.0 envelope (validated by the MCP SDK, **not** the Nest ValidationPipe)
@@ -4364,6 +4398,81 @@ For `tools/call` the result is an MCP `CallToolResult` (`content` array of `text
 
 > The full catalog of MCP tools (names, tiers, schemas) is documented separately — see **doc 24, MCP Integration**. This section documents only the transport endpoint.
 
+### 6.4.12 Search
+
+Base path `/api/search`. Cross-session full-text message search over an open `SearchProvider` contract;
+the built-in database full-text provider (PostgreSQL `tsvector`/`GIN`, SQLite `FTS5`) answers by
+default with zero external dependencies. Search is on by default; set `SEARCH_ENABLED=false` to remove
+the route and module entirely (the index is DB-maintained regardless — see
+[26 - Global Search](./26-global-search.md)). Requires at least `OPERATOR` role.
+
+**Auth:** API key (≥ `OPERATOR`)  ·  **Scope:** session-scoped — a scoped key's `allowedSessions` is
+injected server-side from the key (never from the query), so a scoped key cannot broaden its reach; an
+ADMIN / null-allowlist key searches all sessions.
+
+#### GET /api/search
+
+Search messages across sessions (active search provider).
+
+**Query parameters**
+
+| Name | Type | Required | Default | Description |
+| --- | --- | --- | --- | --- |
+| `q` | string | **Yes** | — | Search term. Must be non-empty after trim; whitespace-only is rejected with `400`. Passed to the active provider's native full-text matcher. |
+| `sessionId` | string | No | — | Restrict to a single session id (intersected with the key's `allowedSessions` scope). |
+| `chatId` | string | No | — | Restrict to a single chat id. |
+| `direction` | enum (`incoming` \| `outgoing`) | No | — | Filter by message direction. |
+| `type` | string | No | — | Filter by stored message `type` (e.g. `text`, `image`, `video`). Compared against `messages.type`; not an enum validation, any string is accepted and unmatched values simply return no hits. |
+| `from` | string | No | — | Filter by sender. |
+| `dateFrom` | integer (epoch ms) | No | — | Inclusive lower bound on `timestamp`. A non-numeric value is rejected with `400`. |
+| `dateTo` | integer (epoch ms) | No | — | Inclusive upper bound on `timestamp`. A non-numeric value is rejected with `400`. |
+| `limit` | integer (≥ 1) | No | `50` | Max hits to return. Clamped to `SEARCH_LIMIT_MAX` (default `100`). A non-numeric value is rejected with `400`. |
+| `offset` | integer (≥ 0) | No | `0` | Pagination offset. A non-numeric value is rejected with `400`. |
+
+**Response** `200` — `SearchResults`
+
+```json
+{
+  "hits": [
+    {
+      "messageId": "8f3c2b1a-9d4e-4c7a-8b2f-1e6d5a4c3b2a",
+      "waMessageId": "true_62812...@c.us_3A...",
+      "sessionId": "a1b2c3d4-...",
+      "chatId": "6281234567890@c.us",
+      "body": "full original message body...",
+      "snippet": "...order <mark>confirmed</mark> for tomorrow…",
+      "timestamp": 1751904000000,
+      "type": "text",
+      "direction": "incoming",
+      "from": "6281234567890@c.us",
+      "score": 0.075
+    }
+  ],
+  "total": 23,
+  "tookMs": 6,
+  "provider": "builtin-fts"
+}
+```
+
+- `snippet` is an XSS-safe text excerpt with `<mark>`/`</mark>` highlight markers around the matched
+  term (both dialects emit the same markers). Render it as text, never as HTML.
+- `total` is an exact count for pagination, computed lazily only when the returned page could be full.
+- `provider` names which backend answered (e.g. `builtin-fts`); it is the registered `SearchProvider`
+  id, so it changes when a plugin backend is selected via `SEARCH_PROVIDER`.
+- `score` is optional and provider-specific (rank ordering is stable within a provider; cross-provider
+  scores are not comparable).
+
+**Errors:** `400` empty/whitespace `q`, a non-numeric `dateFrom`/`dateTo`/`limit`/`offset`, or a malformed
+SQLite FTS5 query (unbalanced quote/paren, bare operator) — Postgres's `websearch_to_tsquery` is
+tolerant and has no equivalent · `401` missing/invalid `X-API-Key` · `403` key role below `OPERATOR` ·
+`501` no search provider configured (including a non-FTS5 SQLite build, where the provider is absent) ·
+`503` active provider unhealthy (**reserved**: the built-in provider does not return it; it is the
+contract surface for a future plugin provider whose `search()` throws `ServiceUnavailableException`).
+
+> Scoping is authoritative: a scoped API key's `allowedSessions` is applied server-side and cannot be
+> overridden via the query — there is no `sessionIds` query parameter, and `SearchService` overwrites
+> any session scope at the provider boundary.
+
 ## 6.5 Real-time API (WebSocket)
 
 Live events are delivered over a **Socket.IO** connection (not a raw WebSocket). The server mounts a single Socket.IO namespace, **`/events`**, on the same port as the REST API. There are no REST routes in this module.
@@ -4376,11 +4485,12 @@ Point a Socket.IO client at `<host>:2785` with path-less namespace `/events`:
 ws://<host>:2785/events      (or wss:// behind TLS)
 ```
 
-The client must authenticate during the Socket.IO handshake. Three sources are accepted, in this precedence order:
+The client must authenticate during the Socket.IO handshake. Two sources are accepted, in this precedence order:
 
 1. **Handshake `auth` (recommended)** — `io(url, { auth: { apiKey } })`. Not written to URLs or access logs.
 2. **Header** — `x-api-key: <key>`.
-3. **Query param (deprecated fallback)** — `?apiKey=<key>`. The key leaks into access logs; avoid in production.
+
+> The former `?apiKey=<key>` query fallback was **removed** — it leaked the credential into proxy/access logs. Pass the key via the handshake `auth` field or the `x-api-key` header only.
 
 If no key is supplied, or validation fails, the server emits an `error` message (`code: "UNAUTHORIZED"`) on the `message` event and immediately disconnects the socket. CORS for the namespace reuses the HTTP `CORS_ORIGINS` policy (dev allows any origin; production uses the allowlist).
 

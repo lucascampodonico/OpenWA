@@ -1,4 +1,4 @@
-import { IngressEnqueueService } from './ingress-enqueue.service';
+import { IngressEnqueueService, resolveIngressJobOptions, buildIngressDeadLetterRow } from './ingress-enqueue.service';
 import { PluginLoaderService } from '../../core/plugins/plugin-loader.service';
 import { ConfigService } from '@nestjs/config';
 
@@ -26,9 +26,13 @@ describe('IngressEnqueueService', () => {
     (config.get as jest.Mock).mockReturnValue(true);
     const svc = new IngressEnqueueService(loader as PluginLoaderService, config as ConfigService, queue as never);
 
-    await svc.enqueue(data, 'd1');
+    expect(await svc.enqueue(data, 'd1')).toEqual({ outcome: 'queued' });
 
-    expect(queue.add).toHaveBeenCalledWith('ingress', data, { jobId: 'd1' });
+    expect(queue.add).toHaveBeenCalledWith('ingress', data, {
+      jobId: 'd1',
+      attempts: 3,
+      backoff: { type: 'exponential', delay: 5000 },
+    });
     expect(loader.dispatchWebhookForInstance).not.toHaveBeenCalled();
   });
 
@@ -36,7 +40,7 @@ describe('IngressEnqueueService', () => {
     (config.get as jest.Mock).mockReturnValue(false);
     const svc = new IngressEnqueueService(loader as PluginLoaderService, config as ConfigService, queue as never);
 
-    await svc.enqueue(data, 'd1');
+    expect(await svc.enqueue(data, 'd1')).toEqual({ outcome: 'dispatched' });
 
     expect(queue.add).not.toHaveBeenCalled();
     expect(loader.dispatchWebhookForInstance).toHaveBeenCalledWith(data);
@@ -46,17 +50,17 @@ describe('IngressEnqueueService', () => {
     (config.get as jest.Mock).mockReturnValue(true);
     const svc = new IngressEnqueueService(loader as PluginLoaderService, config as ConfigService, undefined);
 
-    await svc.enqueue(data, 'd1');
+    expect(await svc.enqueue(data, 'd1')).toEqual({ outcome: 'dispatched' });
 
     expect(loader.dispatchWebhookForInstance).toHaveBeenCalledWith(data);
   });
 
-  it('swallows an inline dispatch error and logs it rather than throwing (row already persisted for redrive)', async () => {
+  it('swallows an inline dispatch error and returns outcome "failed" rather than throwing (row stays redrivable)', async () => {
     (loader.dispatchWebhookForInstance as jest.Mock).mockRejectedValue(new Error('boom'));
     (config.get as jest.Mock).mockReturnValue(false);
     const svc = new IngressEnqueueService(loader as PluginLoaderService, config as ConfigService, undefined);
 
-    await expect(svc.enqueue(data, 'd1')).resolves.toBeUndefined();
+    expect(await svc.enqueue(data, 'd1')).toEqual({ outcome: 'failed', error: 'boom' });
   });
 
   it('falls back to inline dispatch (never throws) when queue.add() fails, e.g. Redis unreachable', async () => {
@@ -66,8 +70,55 @@ describe('IngressEnqueueService', () => {
     queue.add.mockRejectedValue(new Error('Redis connection is closed'));
     const svc = new IngressEnqueueService(loader as PluginLoaderService, config as ConfigService, queue as never);
 
-    await expect(svc.enqueue(data, 'd1')).resolves.toBeUndefined();
-    expect(queue.add).toHaveBeenCalledWith('ingress', data, { jobId: 'd1' });
+    expect(await svc.enqueue(data, 'd1')).toEqual({ outcome: 'dispatched' });
+    expect(queue.add).toHaveBeenCalledWith('ingress', data, {
+      jobId: 'd1',
+      attempts: 3,
+      backoff: { type: 'exponential', delay: 5000 },
+    });
     expect(loader.dispatchWebhookForInstance).toHaveBeenCalledWith(data);
+  });
+
+  describe('resolveIngressJobOptions', () => {
+    it('defaults to 3 attempts with exponential backoff', () => {
+      expect(resolveIngressJobOptions()).toEqual({ attempts: 3, backoff: { type: 'exponential', delay: 5000 } });
+    });
+
+    it('honors INGRESS_MAX_ATTEMPTS / INGRESS_RETRY_DELAY_MS overrides', () => {
+      const prevA = process.env.INGRESS_MAX_ATTEMPTS;
+      const prevD = process.env.INGRESS_RETRY_DELAY_MS;
+      try {
+        process.env.INGRESS_MAX_ATTEMPTS = '5';
+        process.env.INGRESS_RETRY_DELAY_MS = '1000';
+        expect(resolveIngressJobOptions()).toEqual({ attempts: 5, backoff: { type: 'exponential', delay: 1000 } });
+      } finally {
+        if (prevA === undefined) delete process.env.INGRESS_MAX_ATTEMPTS;
+        else process.env.INGRESS_MAX_ATTEMPTS = prevA;
+        if (prevD === undefined) delete process.env.INGRESS_RETRY_DELAY_MS;
+        else process.env.INGRESS_RETRY_DELAY_MS = prevD;
+      }
+    });
+  });
+
+  describe('buildIngressDeadLetterRow', () => {
+    it('mirrors the ingress-processor dead-letter shape so a redrive reads it back (attempts=1, redriven=false)', () => {
+      expect(buildIngressDeadLetterRow(data, 'boom')).toEqual({
+        direction: 'inbound',
+        pluginId: 'chatwoot',
+        instanceId: 'acct1',
+        sessionId: 'sess-1',
+        deliveryId: 'd1',
+        attempts: 1,
+        lastError: 'boom',
+        payload: { route: 'chatwoot', providerConversationId: undefined, ingress: data.payload },
+        redriven: false,
+      });
+    });
+
+    it('defaults sessionId to null and supplies a fallback lastError when the error is absent', () => {
+      const row = buildIngressDeadLetterRow({ ...data, sessionId: undefined }, undefined);
+      expect(row.sessionId).toBeNull();
+      expect(row.lastError).toBe('inline ingress dispatch failed');
+    });
   });
 });

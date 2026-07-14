@@ -14,7 +14,7 @@ import { Test, TestingModule } from '@nestjs/testing';
 import { getRepositoryToken } from '@nestjs/typeorm';
 import { getQueueToken } from '@nestjs/bullmq';
 import { In, Repository } from 'typeorm';
-import { NotFoundException, BadRequestException } from '@nestjs/common';
+import { NotFoundException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import * as crypto from 'crypto';
 import { fetch as undiciFetch } from 'undici';
@@ -26,6 +26,7 @@ import { LidMappingStoreService } from '../../engine/identity/lid-mapping-store.
 import { HookManager } from '../../core/hooks';
 import { QUEUE_NAMES } from '../queue/queue-names';
 import { Session } from '../session/entities/session.entity';
+import { getWebhookDeliveryFailuresTotal } from '../../common/metrics/webhook-delivery-metrics';
 
 function createMockWebhook(overrides: Partial<Webhook> = {}): Webhook {
   return {
@@ -68,6 +69,7 @@ describe('WebhookService', () => {
     failureRepository = {
       insert: jest.fn().mockResolvedValue({}),
       find: jest.fn().mockResolvedValue([]),
+      delete: jest.fn().mockResolvedValue({ affected: 0 }),
     };
 
     configService = {
@@ -76,6 +78,8 @@ describe('WebhookService', () => {
         if (key === 'webhook.retryDelay') return 100;
         // Distinct from the hardcoded 10000 fallback so a regression to a literal timeout is caught.
         if (key === 'webhook.timeout') return 25000;
+        // A small, non-default cap so the fan-out-bound test (5 webhooks) can assert the limiter holds.
+        if (key === 'webhook.dispatchConcurrency') return 2;
         return def as T;
       }),
     };
@@ -153,13 +157,13 @@ describe('WebhookService', () => {
 
     // ── validate URL at registration, default-on ──────────
 
-    it('rejects an internal webhook URL at registration with 400 (protection on by default)', async () => {
+    it('rejects an internal webhook URL at registration with 400 and a generic message (no IP leak)', async () => {
       const origProtect = process.env.WEBHOOK_SSRF_PROTECT;
       delete process.env.WEBHOOK_SSRF_PROTECT; // default → on
       try {
-        await expect(service.create('sess-1', { url: 'http://127.0.0.1/hook' })).rejects.toBeInstanceOf(
-          BadRequestException,
-        );
+        await expect(service.create('sess-1', { url: 'http://127.0.0.1/hook' })).rejects.toMatchObject({
+          response: { message: 'Destination address is not allowed' },
+        });
         expect(repository.create).not.toHaveBeenCalled();
       } finally {
         if (origProtect === undefined) delete process.env.WEBHOOK_SSRF_PROTECT;
@@ -267,6 +271,40 @@ describe('WebhookService', () => {
 
   // ── dispatch (direct mode — queue disabled) ───────────────────────
 
+  describe('delivery-failure retention', () => {
+    afterEach(() => service.onModuleDestroy());
+
+    it('pruneDeliveryFailures deletes rows older than the retention window and returns the count', async () => {
+      (failureRepository.delete as jest.Mock).mockResolvedValue({ affected: 3 });
+      await expect(service.pruneDeliveryFailures(90)).resolves.toBe(3);
+      expect(failureRepository.delete).toHaveBeenCalledTimes(1);
+    });
+
+    it('onModuleInit skips scheduling when WEBHOOK_FAILURE_RETENTION_DAYS <= 0 (retention disabled)', () => {
+      const prev = process.env.WEBHOOK_FAILURE_RETENTION_DAYS;
+      process.env.WEBHOOK_FAILURE_RETENTION_DAYS = '0';
+      try {
+        service.onModuleInit();
+        expect(failureRepository.delete).not.toHaveBeenCalled();
+      } finally {
+        if (prev === undefined) delete process.env.WEBHOOK_FAILURE_RETENTION_DAYS;
+        else process.env.WEBHOOK_FAILURE_RETENTION_DAYS = prev;
+      }
+    });
+
+    it('onModuleInit prunes once at startup when retention is enabled', () => {
+      const prev = process.env.WEBHOOK_FAILURE_RETENTION_DAYS;
+      process.env.WEBHOOK_FAILURE_RETENTION_DAYS = '30';
+      try {
+        service.onModuleInit();
+        expect(failureRepository.delete).toHaveBeenCalledTimes(1);
+      } finally {
+        if (prev === undefined) delete process.env.WEBHOOK_FAILURE_RETENTION_DAYS;
+        else process.env.WEBHOOK_FAILURE_RETENTION_DAYS = prev;
+      }
+    });
+  });
+
   describe('dispatch (direct mode)', () => {
     const mockFetch = undiciFetch as jest.Mock;
 
@@ -346,6 +384,71 @@ describe('WebhookService', () => {
 
       resolveSlow({ ok: true, status: 200 });
       await dispatchP;
+    });
+
+    it('bounds concurrent delivery to WEBHOOK_DISPATCH_CONCURRENCY (cap=2, 5 webhooks → peak ≤ 2)', async () => {
+      const hooks = Array.from({ length: 5 }, (_, i) =>
+        createMockWebhook({ id: `wh-${i}`, url: `https://h${i}.example/hook`, events: ['message.received'] }),
+      );
+      (repository.find as jest.Mock).mockResolvedValue(hooks);
+      (repository.update as jest.Mock).mockResolvedValue({ affected: 1 });
+      (hookManager.execute as jest.Mock).mockResolvedValue({ continue: true, data: {} });
+
+      let inFlight = 0;
+      let peak = 0;
+      let resolved = 0;
+      const releasers: Array<() => void> = [];
+      mockFetch.mockImplementation(
+        () =>
+          new Promise(resolve => {
+            inFlight += 1;
+            peak = Math.max(peak, inFlight);
+            releasers.push(() => {
+              inFlight -= 1;
+              resolved += 1;
+              resolve({ ok: true, status: 200 });
+            });
+          }),
+      );
+
+      const dispatchP = service.dispatch('sess-1', 'message.received', { from: 'x@c.us' });
+      // Let the limiter admit up to the cap (2) and each reach fetch. The other 3 stay parked.
+      for (let i = 0; i < 20 && releasers.length < 2; i++) {
+        await new Promise(r => setImmediate(r));
+      }
+      expect(inFlight).toBeLessThanOrEqual(2);
+      // Release in a macrotask loop: freeing a slot lets the limiter admit the next webhook, whose fetch
+      // pushes a fresh releaser on the NEXT tick — a single synchronous drain would miss it and hang.
+      for (let i = 0; i < 50 && resolved < 5; i++) {
+        while (releasers.length) (releasers.shift() as () => void)();
+        await new Promise(r => setImmediate(r));
+      }
+      await dispatchP;
+      // Peak across the whole run never exceeded the cap. (An unbounded fan-out would reach 5.)
+      expect(peak).toBeLessThanOrEqual(2);
+      expect(mockFetch).toHaveBeenCalledTimes(5);
+    });
+
+    it('salts each sibling webhook with a distinct idempotency key so one receiver cannot dedupe out another', async () => {
+      const wA = createMockWebhook({ id: 'wh-a', url: 'https://a.example/hook', events: ['message.received'] });
+      const wB = createMockWebhook({ id: 'wh-b', url: 'https://b.example/hook', events: ['message.received'] });
+      (repository.find as jest.Mock).mockResolvedValue([wA, wB]);
+      (repository.update as jest.Mock).mockResolvedValue({ affected: 1 });
+      (hookManager.execute as jest.Mock).mockResolvedValue({ continue: true, data: {} });
+      mockFetch.mockResolvedValue({ ok: true, status: 200 });
+
+      await service.dispatch('sess-1', 'message.received', { from: 'x@c.us' });
+
+      const keyByUrl = new Map<string, string>();
+      for (const call of mockFetch.mock.calls as [string, { headers: Record<string, string> }][]) {
+        keyByUrl.set(call[0], call[1].headers['X-OpenWA-Idempotency-Key']);
+      }
+      const keyA = keyByUrl.get('https://a.example/hook');
+      const keyB = keyByUrl.get('https://b.example/hook');
+      // Same event + payload, but two distinct endpoints must not collide on the dedupe header.
+      expect(keyA).toBeTruthy();
+      expect(keyB).toBeTruthy();
+      expect(keyA).not.toBe(keyB);
     });
 
     it('falls back to the original payload when a before-hook omits payload (no undefined body)', async () => {
@@ -437,6 +540,28 @@ describe('WebhookService', () => {
       expect(mockFetch).toHaveBeenCalled();
       expect(timeoutSpy).toHaveBeenCalledWith(25000);
       timeoutSpy.mockRestore();
+    });
+
+    // A literal link-local IP is rejected synchronously by the SSRF guard before any fetch/DNS, so this
+    // is fully offline. The raw SsrfBlockedError message names the resolved internal IP — an SSRF
+    // disclosure oracle — so the test() response must surface the generic constant instead.
+    it('test() does not leak the resolved internal IP when the SSRF guard blocks the URL', async () => {
+      const origProtect = process.env.WEBHOOK_SSRF_PROTECT;
+      delete process.env.WEBHOOK_SSRF_PROTECT; // default → on
+      try {
+        const webhook = createMockWebhook({ url: 'https://169.254.169.254/' });
+        (repository.findOne as jest.Mock).mockResolvedValue(webhook);
+
+        const result = await service.test('sess-1', webhook.id);
+
+        expect(result.success).toBe(false);
+        expect(result.error).toBe('Destination address is not allowed');
+        expect(result.error).not.toMatch(/169\.254\.169\.254/);
+        expect(mockFetch).not.toHaveBeenCalled(); // blocked before any network
+      } finally {
+        if (origProtect === undefined) delete process.env.WEBHOOK_SSRF_PROTECT;
+        else process.env.WEBHOOK_SSRF_PROTECT = origProtect;
+      }
     });
 
     it('should NOT dispatch to webhooks that do not match the event', async () => {
@@ -909,6 +1034,7 @@ describe('WebhookService', () => {
       const mockFetch = undiciFetch as jest.Mock;
       mockFetch.mockResolvedValue({ ok: false, status: 500, statusText: 'Server Error' });
 
+      const failuresBefore = getWebhookDeliveryFailuresTotal();
       await service.dispatch('sess-1', 'message.received', {});
 
       expect(failureRepository.insert).toHaveBeenCalledWith(
@@ -919,6 +1045,8 @@ describe('WebhookService', () => {
           lastError: 'HTTP 500: Server Error',
         }),
       );
+      // The terminal failure also bumps the Prometheus counter exactly once.
+      expect(getWebhookDeliveryFailuresTotal()).toBe(failuresBefore + 1);
       mockFetch.mockReset();
     });
 

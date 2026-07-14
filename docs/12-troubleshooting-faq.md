@@ -274,6 +274,111 @@ will exit at startup with a clear `FATAL:` message rather than crash-looping lat
 Do **not** work around this by dropping `--no-sandbox` security hardening or using `seccomp:unconfined`
 (confirmed not to help, and it widens the attack surface).
 
+### Issue: Session fails to launch with `Failed to launch the browser process: Code: null`
+
+> **Engine:** This issue applies to the `whatsapp-web.js` engine only (Chromium/Puppeteer-based). It does not affect `ENGINE_TYPE=baileys`.
+
+**Symptoms:** The session fails within a few seconds of clicking **Start**; no QR code is ever produced. The
+session's `lastError` and the container log both show:
+
+```text
+Failed to launch the browser process:  Code: null
+```
+
+often accompanied by a wall of `ERROR:dbus/bus.cc` / `crashpad ... /sys/devices/system/cpu/...` lines.
+**Those dbus/crashpad lines are non-fatal noise** that headless Chromium always prints inside a container —
+ignore them. The actual signal is `Code: null`, which means the browser process was killed during startup
+before it could report an exit code. The cause is *not* in the log — it's a host/container resource limit,
+and there are three distinct ones. Diagnose which one before changing anything:
+
+**Cause A — per-container PID limit hit (most common under multi-session).**
+whatsapp-web.js runs a full Chromium instance per session, and Chromium is multi-process (browser + renderer
++ GPU + zygote + utilities); WhatsApp Web is itself process-heavy (service workers, iframes). A handful of
+concurrent sessions can approach the container's `pids_limit`, and the next session's Chromium gets killed
+mid-spawn when a `fork()` returns `EAGAIN`. This is silent in the log.
+
+*Diagnose:* watch the PIDS column while you click **Start**:
+
+```bash
+docker stats openwa-api   # watch the PIDS column — does it climb toward the limit right before the failure?
+```
+
+*Fix:* raise the ceiling. The bundled `docker-compose.yml` exposes it as `OPENWA_PIDS_LIMIT` (default `2048`,
+which fits ~8-10 sessions with startup-spike headroom):
+
+```bash
+OPENWA_PIDS_LIMIT=4096   # in your .env, then docker compose up -d
+```
+
+Do **not** set `-1` (unlimited) — the PID ceiling is a fork-bomb guard and should stay finite. Baileys
+(no Chromium) uses only a handful of PIDs regardless, so raising this is a no-op there.
+
+**Cause B — out-of-memory kill.**
+The container's `mem_limit` (or the host VM, e.g. Docker Desktop on macOS/Windows) ran out of RAM while
+Chromium was starting. The OOM killer sends `SIGKILL`, which Puppeteer reports as `Code: null`.
+
+*Diagnose:* check the host kernel log for an OOM kill:
+
+```bash
+dmesg -T | grep -i "killed process"          # Linux host
+# Docker Desktop: check the VM via the app, or nudge OPENWA_MEM_LIMIT up and retry
+```
+
+*Fix:* raise the ceiling (`OPENWA_MEM_LIMIT=4g` in your `.env`, or Docker Desktop → Settings → Resources →
+Memory for the VM).
+
+**Cause C — the XDG/crashpad home-dir crash.**
+If `Code: null` is accompanied by `chrome_crashpad_handler: --database is required`, that is a different,
+specific failure (Chromium can't resolve its home directory on a read-only rootfs) — see the entry
+immediately above this one for the fix. The bundled image already handles this; it only resurfaces on a
+custom container that drops the `XDG_CONFIG_HOME` / `XDG_CACHE_HOME` setup or the writable `/tmp` tmpfs.
+
+**Cause D — Debian 12 OS Chromium SIGTRAP in non-root Pods.**
+If `Code: null` happens on Kubernetes, and the host kernel logs or `dmesg` shows `Trace/breakpoint trap (core dumped)` with exit code 133, the underlying Debian 12 OS `chromium` package has crashed due to strict non-root or seccomp constraints (even with `--no-zygote` or `Unconfined` seccomp). 
+*Fix:* On amd64, do not use the `chromium` package from Debian's `apt` — it SIGTRAPs under strict non-root/seccomp. Instead, download Chrome for Testing via Puppeteer during the Docker build (`./node_modules/.bin/puppeteer browsers install 'chrome@146.0.7680.31'`) and point `PUPPETEER_EXECUTABLE_PATH` to it. (Chrome for Testing has no linux-arm64 build, so arm64 keeps Debian's `chromium`, which ships a native arm64 binary.) The official `Dockerfile` implements this mixed approach.
+
+**Quick triage:** run `docker stats openwa-api`, click **Start**, and watch which resource spikes toward its
+limit the instant before the failure — that tells you A vs B. If neither moves and you see the crashpad
+`--database` line, it's C. If running in K8s as non-root with the Debian `chromium` package, it is likely D.
+
+### Issue: `Execution context was destroyed` on the first start after an upgrade
+
+> **Engine:** This issue applies to the `whatsapp-web.js` engine only (Chromium/Puppeteer-based). It does not affect `ENGINE_TYPE=baileys`.
+
+**Symptoms:** A `whatsapp-web.js` session that was already authenticated fails within seconds of
+**Start** after upgrading OpenWA — no QR is produced — and the session's `lastError` / container log
+show:
+
+```text
+Protocol error (Runtime.callFunctionOn): Execution context was destroyed.
+```
+
+**Cause:** The session's persistent browser profile (`<SESSION_DATA_PATH>/session-<name>`, created by
+whatsapp-web.js's `LocalAuth`) was built with a different Chromium/Chrome binary than the one the new
+image runs. A browser profile carries binary-bound state (page caches, GPU shader caches, IndexedDB /
+Local Storage version markers) that is not safely portable across Chromium major versions or binary
+flavours; loading the stale profile destroys the page context during `Client.inject()`. The dominant
+trigger today is the **v0.8.12** amd64 switch from Debian's `chromium` package to Chrome for Testing
+(#663), but the same symptom can follow any future change to the bundled browser binary. The error
+reads like a Puppeteer bug and gives no hint that the profile is the cause — the adapter now logs an
+advisory when it detects this error.
+
+**Fix:** delete the affected session's profile dir and start the session again to scan a new QR. The
+profile cannot be salvaged — clearing only the cache subdirs (`Cache`, `GPUCache`, `Code Cache`, …) is
+**not** enough, the taint is deeper than the caches — so a one-time re-authentication is required.
+
+The profile dir is named after the session **name**, while the REST API addresses a session by its
+**id** (a UUID) — so the two placeholders below are different values:
+
+```bash
+docker exec openwa-api rm -rf /app/data/sessions/session-<name>
+# then POST /sessions/<id>/force-kill and POST /sessions/<id>/start (the session's UUID id), and scan the new QR
+```
+
+Re-creating the session (`DELETE /sessions/<id>`) also purges its profile dir; create it again and
+scan. Messages are unaffected — they live in the database, not the browser profile — so nothing is lost
+except the WhatsApp pairing, which must be re-scanned.
+
 ### Issue: Frequent Disconnections
 
 **Symptoms:**
@@ -607,6 +712,8 @@ npm run migration:revert
 # The auth/audit DB has parallel :main variants, e.g.:
 npm run migration:run:main
 ```
+
+**PostgreSQL crash-loop on boot after upgrade** — if logs show `column "id" is of type uuid but default expression is of type character varying` or `foreign key constraint ... cannot be implemented ... incompatible types: character varying and uuid`, the deployment was previously bootstrapped with `DATABASE_SYNCHRONIZE=true` (native `uuid` columns vs the migrations' `varchar`). A guard migration converts the columns automatically on the next boot; for large `messages` tables, run the migration against the stopped app (`npm run migration:run`) during a maintenance window. See [14.5 / 14.9 — PostgreSQL crash-loop after upgrading a `DATABASE_SYNCHRONIZE=true` deployment](./14-migration-guide.md). `DATABASE_SYNCHRONIZE=true` is unsupported on PostgreSQL for production.
 
 ## 12.6 Docker Issues
 

@@ -26,6 +26,8 @@ export const BLANK_SHADOWED_ENV_KEYS: string[] = [
   'DATABASE_USERNAME',
   'DATABASE_NAME',
   'DATABASE_PASSWORD',
+  // PostgreSQL schema (dashboard-managed + compose blank-forwarded, like the other DATABASE_* keys)
+  'POSTGRES_SCHEMA',
   // Storage selection + S3 details (#488)
   'STORAGE_TYPE',
   'STORAGE_LOCAL_PATH',
@@ -42,6 +44,12 @@ export const BLANK_SHADOWED_ENV_KEYS: string[] = [
   'REDIS_ENABLED',
   'REDIS_HOST',
   'REDIS_PORT',
+  // Engine launch options the dashboard saves (data/.env.generated). Compose blank-forwards these so a
+  // dashboard edit is not shadowed by a pinned container default; the app layer (configuration.ts)
+  // supplies the sane default when nothing is set.
+  'PUPPETEER_HEADLESS',
+  'SESSION_DATA_PATH',
+  'PUPPETEER_ARGS',
 ];
 
 export function clearBlankEnv(env: NodeJS.ProcessEnv, keys: string[]): void {

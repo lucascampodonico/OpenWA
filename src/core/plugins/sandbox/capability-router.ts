@@ -25,7 +25,7 @@ export type CapabilityContext = Pick<PluginContext, 'messages' | 'engine' | 'sto
  * worker cannot invoke an arbitrary method on the context. Args are positional, one per signature.
  *
  * Permission + session-scope checks are NOT here — they live inside the context's own verbs
- * (assertPermission / assertSessionAllowed), so a sandboxed call is gated exactly like an in-process
+ * (assertPermission / assertSessionActive), so a sandboxed call is gated exactly like an in-process
  * one. This router is purely the wire-to-method mapping.
  */
 export async function dispatchCapabilityVerb(
@@ -49,6 +49,10 @@ export async function dispatchCapabilityVerb(
       return context.engine.checkNumberExists(s(0), s(1));
     case 'engine.getChats':
       return context.engine.getChats(s(0));
+    case 'engine.getChatHistory':
+      return context.engine.getChatHistory(s(0), s(1), args[2] as number | undefined, args[3] as boolean | undefined);
+    case 'engine.canonicalChatId':
+      return context.engine.canonicalChatId(s(0), s(1));
     case 'storage.get':
       return context.storage.get(s(0));
     case 'storage.set':

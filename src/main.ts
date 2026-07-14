@@ -3,17 +3,22 @@
 // webhook Worker's @Processor connection) see the configured values rather than pre-dotenv defaults.
 import './config/load-env';
 import { NestFactory } from '@nestjs/core';
-import { ValidationPipe } from '@nestjs/common';
+import { ValidationPipe, ShutdownSignal } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { SwaggerModule } from '@nestjs/swagger';
 import helmet from 'helmet';
 import { AppModule, DASHBOARD_DIST, dashboardServingEnabled, dashboardBuildPresent } from './app.module';
 import { ShutdownService } from './common/services/shutdown.service';
 import { LoggerService, LogLevel, createLogger } from './common/services/logger.service';
-import { createSwaggerConfig } from './config/swagger.config';
+import { createSwaggerConfig, exemptPublicOperations } from './config/swagger.config';
+import { registerUncaughtExceptionMonitor } from './config/process-error-monitor';
+import { applyHttpTimeouts, HttpTimeoutConfig, HttpTimeoutSink } from './config/http-timeouts';
+import { requestContextMiddleware } from './common/middleware/request-context.middleware';
 import {
   resolveCorsPolicy,
   isSwaggerEnabled,
+  isValidationErrorDetailEnabled,
+  isUpgradeInsecureRequestsEnabled,
   resolveBodyLimit,
   assertNoDefaultSecretsInProduction,
   isApiKeyPepperMissingInProduction,
@@ -36,6 +41,11 @@ async function bootstrap() {
   process.on('unhandledRejection', (reason: unknown) => {
     bootstrapLogger.error('Unhandled promise rejection', reason instanceof Error ? reason.stack : String(reason));
   });
+
+  // A synchronous throw from a non-promise context (e.g. a sync timer callback) is fatal — Node prints a
+  // raw stack to stderr, bypassing the structured log pipeline, and exits(1). Route the stack through the
+  // logger WITHOUT swallowing the exception, so the crash-and-restart posture is unchanged (see the helper).
+  registerUncaughtExceptionMonitor(bootstrapLogger);
 
   // Fail fast: never start production with default/placeholder secrets.
   assertNoDefaultSecretsInProduction({
@@ -84,8 +94,17 @@ async function bootstrap() {
   );
   app.use(urlencoded({ extended: true, limit: bodyLimit }));
 
-  // Enable shutdown hooks for graceful shutdown
-  app.enableShutdownHooks();
+  // Assign a request id to every inbound request (X-Request-ID), echo it on the response, and run
+  // the whole downstream chain inside its scope so every log line + audit row carries it.
+  app.use(requestContextMiddleware);
+
+  // Let Nest own every shutdown signal EXCEPT SIGTERM/SIGINT — those we route through the bounded
+  // drain below, so a load balancer / orchestrator observes readiness=503 and stops routing BEFORE
+  // teardown begins. (enableShutdownHooks with an EMPTY array registers ALL signals; this filtered
+  // list is non-empty, so the exclusion is honoured.)
+  app.enableShutdownHooks(
+    Object.values(ShutdownSignal).filter(s => s !== ShutdownSignal.SIGTERM && s !== ShutdownSignal.SIGINT),
+  );
 
   // Wire up graceful shutdown service
   const shutdownService = app.get(ShutdownService);
@@ -93,11 +112,22 @@ async function bootstrap() {
     await app.close();
   });
 
-  // On a termination signal, flip readiness to 503 immediately so the load
-  // balancer/orchestrator stops routing new traffic. This only sets a flag — NestJS's
-  // own shutdown hooks (enabled above) still perform the actual app.close()/teardown.
+  // On SIGTERM/SIGINT: drain gracefully. shutdown() flips readiness to 503 immediately (the LB stops
+  // routing), keeps serving in-flight requests for a bounded grace, then runs app.close() (the SAME
+  // Nest lifecycle hooks Nest's own handler would run) and exits deterministically. A SECOND signal
+  // forces an immediate exit — a dev double-Ctrl+C, or an operator not willing to wait out a wedged
+  // teardown. The gate is a dedicated "a signal already arrived" flag, NOT isShuttingDown() (which an
+  // admin restart also sets) — so a first real signal during an admin-restart grace still drains
+  // gracefully instead of hard-exiting.
+  let signalReceived = false;
   for (const signal of ['SIGTERM', 'SIGINT'] as const) {
-    process.on(signal, () => shutdownService.markShuttingDown());
+    process.on(signal, () => {
+      if (signalReceived) {
+        process.exit(130);
+      }
+      signalReceived = true;
+      shutdownService.shutdown();
+    });
   }
 
   // Enhanced Security Headers
@@ -121,7 +151,14 @@ async function bootstrap() {
           connectSrc: ["'self'"],
           fontSrc: ["'self'", 'https://fonts.gstatic.com'],
           objectSrc: ["'none'"],
-          upgradeInsecureRequests: null, // Let reverse proxy (Traefik, Nginx) handle HTTPS redirection
+          // Auto-upgrade HTTP→HTTPS in production, unless CSP_UPGRADE_INSECURE_REQUESTS opts out for an
+          // HTTP-only private-network deployment (otherwise the browser forces the dashboard to https). (#611)
+          upgradeInsecureRequests: isUpgradeInsecureRequestsEnabled(
+            process.env.CSP_UPGRADE_INSECURE_REQUESTS,
+            process.env.NODE_ENV,
+          )
+            ? []
+            : null,
         },
       },
       hsts: {
@@ -179,7 +216,9 @@ async function bootstrap() {
       transformOptions: {
         enableImplicitConversion: true,
       },
-      disableErrorMessages: process.env.NODE_ENV === 'production', // Hide details in prod
+      // Hide field-level validation messages by default in production (so a 400 doesn't reflect the DTO
+      // shape back); opt in with VALIDATION_ERROR_DETAIL=true to debug an SDK/integration against prod.
+      disableErrorMessages: !isValidationErrorDetailEnabled(process.env.VALIDATION_ERROR_DETAIL, process.env.NODE_ENV),
     }),
   );
 
@@ -189,6 +228,7 @@ async function bootstrap() {
   if (swaggerEnabled) {
     const config = createSwaggerConfig();
     const document = SwaggerModule.createDocument(app, config);
+    exemptPublicOperations(document);
     SwaggerModule.setup('api/docs', app, document);
   }
 
@@ -200,6 +240,21 @@ async function bootstrap() {
   app.use('/api/admin/queues', (req: Request, res: Response, next: NextFunction) => {
     void bullBoardAuth.use(req, res, next);
   });
+
+  // Apply explicit HTTP server timeouts so they are operator-tunable (REQUEST_TIMEOUT_MS /
+  // HEADERS_TIMEOUT_MS / KEEPALIVE_TIMEOUT_MS) and observable at boot, instead of Node's implicit
+  // defaults. Done after the adapter exists and before listen(). Target MUST be the http.Server
+  // (app.getHttpServer()) — NOT getHttpAdapter().getInstance(), which is the Express APPLICATION
+  // (a function with no requestTimeout/headersTimeout/keepAliveTimeout props); writing onto it is
+  // inert. The timeouts only take effect on the real server.
+  const appliedHttpTimeouts = applyHttpTimeouts(
+    app.getHttpServer() as HttpTimeoutSink,
+    app.get(ConfigService).get<HttpTimeoutConfig>('http')!,
+  );
+  bootstrapLogger.log(
+    `HTTP server timeouts applied: requestTimeout=${appliedHttpTimeouts.requestTimeoutMs}ms ` +
+      `headersTimeout=${appliedHttpTimeouts.headersTimeoutMs}ms keepAliveTimeout=${appliedHttpTimeouts.keepAliveTimeoutMs}ms`,
+  );
 
   const port = process.env.PORT || 2785;
   await app.listen(port);
