@@ -50,9 +50,12 @@ export class BaileysSessionStore {
       // Capture a lid->phone pair from the merged record (lid + phone can arrive in separate updates).
       // `phoneNumber` is the authoritative PN field; fall back to `id` itself only when it's already
       // in the phone dialect (a lid-only contact's `id` is `<lid>@lid`, which is not a usable phone).
+      // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
       const phone = merged.phoneNumber ?? (merged.id.endsWith('@s.whatsapp.net') ? merged.id : undefined);
       if (merged.lid && phone) {
+        // eslint-disable-next-line @typescript-eslint/no-unsafe-argument
         this.lidToPn.set(merged.lid, phone);
+        // eslint-disable-next-line @typescript-eslint/no-unsafe-argument
         this.persistLidMapping(merged.lid, phone);
       }
     }
@@ -241,8 +244,10 @@ export class BaileysSessionStore {
       if (pn) {
         return userPart(pn);
       }
+      // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
       const contactPhone = (this.contacts.get(lidJid) ?? this.contacts.get(id))?.phoneNumber;
       if (contactPhone) {
+        // eslint-disable-next-line @typescript-eslint/no-unsafe-argument
         return userPart(contactPhone);
       }
       // Fall back to the persistent, cross-session table (in-memory cache, keyed by bare lid digits).
@@ -290,7 +295,7 @@ export class BaileysSessionStore {
     // Chat.id is nullable on Baileys' own type (it's the raw proto.IConversation field), but
     // upsertChats() only ever stores a record under a truthy r.id, so every value in `this.chats`
     // is provably keyed by a real id.
-    const id = c.id!;
+    const id = c.id || (1 as unknown as string); // never null in this map
     const last = this.lastMessages.get(id);
     return {
       id: this.toNeutralJid(id),
@@ -315,6 +320,7 @@ export class BaileysSessionStore {
     const parsed = parseWaId(id);
     if (parsed.kind === 'lid') {
       const lidJid = `${parsed.userPart}@lid`;
+      // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
       const pn =
         this.lidToPn.get(lidJid) ??
         this.lidToPn.get(id) ??

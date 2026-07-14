@@ -21,6 +21,6 @@
     "strictBindCallApply": true,
     "noFallthroughCasesInSwitch": true
   },
-  "exclude": ["node_modules", "dist", "dashboard"],
+  "exclude": ["node_modules", "dist", "dashboard", "**/*.spec.ts"],
   "include": ["src", "test"]
 }

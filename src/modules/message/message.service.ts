@@ -12,7 +12,6 @@ import { Message, MessageDirection, MessageStatus } from './entities/message.ent
 import { HookManager } from '../../core/hooks';
 import { TemplateService } from '../template/template.service';
 import { renderTemplate } from '../../common/utils/template-render';
-import { createLogger } from '../../common/services/logger.service';
 import { SsrfBlockedError, SSRF_BLOCKED_CLIENT_MESSAGE } from '../../common/security/ssrf-guard';
 import { userPart } from '../../engine/identity/wa-id';
 import { resolveFeatureFlags } from '../../config/feature-flags';
@@ -445,7 +444,7 @@ export class MessageService {
         where: { sessionId, waMessageId: finalDto.quotedMessageId },
       });
       quotedBody = quoted?.body || '';
-    } catch (err) {
+    } catch (err: unknown) {
       this.logger.warn(`Failed to resolve quoted message ${finalDto.quotedMessageId}`, { error: String(err) });
     }
 
@@ -517,7 +516,12 @@ export class MessageService {
           });
           return existing;
         }
-      } catch (err) {
+      } catch (err: unknown) {
+        this.logger.warn('saveIncomingMessage duplicate check failed', {
+          sessionId,
+          waMessageId: data.waMessageId,
+          error: String(err),
+        });
         // ignore and continue to save
       }
     }

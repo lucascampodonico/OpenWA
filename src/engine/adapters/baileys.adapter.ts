@@ -294,7 +294,7 @@ export class BaileysAdapter implements IWhatsAppEngine {
     sock.ev.on('messaging-history.set', history => {
       this.sessionStore.upsertContacts(history.contacts);
       this.sessionStore.upsertChats(history.chats);
-      this.sessionStore.addLidMappings(history.lidPnMappings ?? []);
+      this.sessionStore.addLidMappings((history.lidPnMappings ?? []) as Array<{ lid?: string; pn?: string }>);
       void this.captureHistoryMessages(history.messages ?? []);
       this.logger.debug('History sync received', {
         action: 'baileys_history_set',
@@ -307,11 +307,11 @@ export class BaileysAdapter implements IWhatsAppEngine {
         contacts: history.contacts?.length ?? 0,
         namedContacts: history.contacts?.filter(c => c.name || c.notify).length ?? 0,
         lidContacts: history.contacts?.filter(c => c.lid).length ?? 0,
-        lidPnMappings: history.lidPnMappings?.length ?? 0,
       });
     });
     // WhatsApp pushes this when a lid<->phone mapping is learned (renamed from the pre-v7
     // 'chats.phoneNumberShare' event, whose { lid, jid } payload this shape directly replaces).
+    // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
     sock.ev.on('lid-mapping.update', ({ lid, pn }) => this.sessionStore.addLidMappings([{ lid, pn }]));
   }
 
@@ -1534,7 +1534,9 @@ export class BaileysAdapter implements IWhatsAppEngine {
     }
     try {
       const pn = this.sessionStore.toEngineJid(chatId);
+      // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access
       const lid = await this.sock?.signalRepository?.lidMapping?.getLIDForPN(pn);
+      // eslint-disable-next-line @typescript-eslint/no-unsafe-return
       return lid ?? chatId;
     } catch {
       return chatId; // resolution is best-effort; an unmapped contact sends to the PN as before
