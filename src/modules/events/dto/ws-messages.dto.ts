@@ -21,6 +21,7 @@ export const SUBSCRIBABLE_EVENTS = [
   'message.revoked',
   'message.reaction',
   'messages.synced',
+  'message.edited',
   'session.status',
   'session.qr',
   'session.authenticated',

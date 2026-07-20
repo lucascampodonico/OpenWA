@@ -969,33 +969,13 @@ Remember OpenWA is **single-port**: the Dashboard, REST API, and Socket.IO all s
 
 **Q: How to backup sessions automatically?**
 ```bash
-#!/bin/bash
-# backup-cron.sh - Add to crontab: 0 */6 * * * /path/to/backup-cron.sh
-
-BACKUP_DIR="/backups/openwa"
-DATE=$(date +%Y%m%d-%H%M%S)
-
-# Create backup directory
-mkdir -p "$BACKUP_DIR/$DATE"
-
-# Backup database
-if [ "$DATABASE_ADAPTER" = "postgresql" ]; then
-    pg_dump $DATABASE_URL > "$BACKUP_DIR/$DATE/database.sql"
-else
-    cp ./data/openwa.db "$BACKUP_DIR/$DATE/"
-fi
-
-# Backup auth sessions
-# whatsapp-web.js engine:
-cp -r ./data/.wwebjs_auth "$BACKUP_DIR/$DATE/"
-# Baileys engine (ENGINE_TYPE=baileys): back up BAILEYS_AUTH_DIR (default: ./data/baileys)
-# cp -r ./data/baileys "$BACKUP_DIR/$DATE/"
-
-# Keep only last 7 days
-find "$BACKUP_DIR" -type d -mtime +7 -exec rm -rf {} \;
-
-echo "Backup completed: $BACKUP_DIR/$DATE"
+# Add to crontab, for example: 0 */6 * * * cd /path/to/openwa && ./scripts/backup.sh
+BACKUP_DIR=/backups/openwa ./scripts/backup.sh
 ```
+
+The shipped script also covers `main.sqlite`, the selected data store, whatsapp-web.js state,
+`BAILEYS_AUTH_DIR` (default `./data/baileys`), media, plugin packages/state, and generated secrets. Apply
+retention/encryption to completed archives externally; see the [backup and restore runbooks](./11-operational-runbooks.md#runbook-database-backup).
 
 ### Webhook Questions
 
@@ -1009,12 +989,14 @@ available_events:
   - message.failed       # Receipt resolved to failed
   - message.revoked      # Message deleted
   - message.reaction     # Reaction added, changed, or removed
+  - message.edited       # Message body or media caption edited
 
   # Session
   - session.status       # Session status change
   - session.qr           # New QR code generated
   - session.authenticated  # Session authenticated
   - session.disconnected   # Session disconnected
+  - session.reconnect_loop # Every 5th consecutive reconnect attempt (payload: sessionId, attempts, nextDelayMs)
 
   # Groups (reserved but NOT currently emitted — accepted in events list, never delivered)
   - group.join           # reserved, not emitted

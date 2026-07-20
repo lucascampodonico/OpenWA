@@ -106,7 +106,7 @@ export interface IncomingMessage {
     mimetype: string;
     filename?: string;
     data?: string; // base64; absent when the payload was omitted (see `omitted`)
-    /** True when the media exceeded the inbound size cap and the blob was dropped (envelope kept). */
+    /** True when the media blob was dropped due to a size cap, timeout, or concurrency saturation. */
     omitted?: boolean;
     /** Decoded byte size of the media; always set when `omitted` is true. */
     sizeBytes?: number;
@@ -382,6 +382,25 @@ export interface RevokedMessage {
   timestamp: number;
 }
 
+export interface EditedMessage {
+  messageId: string;
+  chatId: string;
+  body: string;
+  senderId: string;
+  from: string;
+  to: string;
+  fromMe: boolean;
+  isGroup: boolean;
+  type: MessageType;
+  hasMedia: boolean;
+  /** For group messages, the participant that authored the edited message. */
+  author?: string;
+  /** WIDs mentioned by the edited message's latest content. */
+  mentionedIds?: string[];
+  /** Unix seconds when the edit occurred (not the original message creation time). */
+  timestamp: number;
+}
+
 export interface ReactionEvent {
   messageId: string;
   chatId: string;
@@ -406,6 +425,7 @@ export interface EngineEventCallbacks {
   onMessagesSynced?: (chatId: string, messages: IncomingMessage[], chatName?: string) => void;
   onMessageRevoked?: (message: RevokedMessage) => void;
   onMessageReaction?: (event: ReactionEvent) => void;
+  onMessageEdited?: (message: EditedMessage) => void;
   /**
    * Bulk historical messages from an engine's initial sync (e.g. Baileys `messaging-history.set`).
    * They predate the live session, so consumers persist them for the chat view but must not dispatch.
@@ -436,6 +456,15 @@ export interface IWhatsAppEngine {
 
   // Status
   getStatus(): EngineStatus;
+  /**
+   * Active liveness probe: performs a real round-trip against the engine's connection and
+   * resolves true only when the session is genuinely alive. Implementations must treat probe
+   * failure/timeout as "dead" — a wedged connection can keep reporting READY (cached status),
+   * so getStatus() alone is not proof of life. Optional: engines whose transport already
+   * self-detects death (e.g. Baileys keepalive emits a close event within ~35s) may return a
+   * cheap local check. Polled periodically by the session watchdog.
+   */
+  probeLiveness?(): Promise<boolean>;
   getQRCode(): string | null;
   /** Request an 8-char pairing code to link via phone number instead of scanning the QR. */
   requestPairingCode(phoneNumber: string): Promise<string>;

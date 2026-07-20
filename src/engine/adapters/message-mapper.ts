@@ -1,4 +1,4 @@
-import { IncomingMessage, MessageContact, MessageType } from '../interfaces/whatsapp-engine.interface';
+import { EditedMessage, IncomingMessage, MessageContact, MessageType } from '../interfaces/whatsapp-engine.interface';
 import type { SerializedWid } from '../types/whatsapp-web-js.types';
 
 /**
@@ -124,6 +124,28 @@ export function buildIncomingMessageBase(msg: RawMessageFields): IncomingMessage
   }
 
   return incoming;
+}
+
+/**
+ * Project an engine-neutral message base into the public edit-event contract. Keeping this projection
+ * shared prevents the two adapters from drifting on identity, direction, group, type, or filter fields.
+ */
+export function buildEditedMessage(message: IncomingMessage, hasMedia: boolean): EditedMessage {
+  return {
+    messageId: message.id,
+    chatId: message.chatId,
+    body: message.body,
+    senderId: message.author ?? message.from,
+    from: message.from,
+    to: message.to,
+    fromMe: message.fromMe,
+    isGroup: message.isGroup,
+    type: message.type,
+    hasMedia,
+    ...(message.author ? { author: message.author } : {}),
+    ...(message.mentionedIds ? { mentionedIds: message.mentionedIds } : {}),
+    timestamp: message.timestamp,
+  };
 }
 
 /**

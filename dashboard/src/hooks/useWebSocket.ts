@@ -41,6 +41,14 @@ interface MessageReactionEvent {
   timestamp: string;
 }
 
+interface MessageEditedEvent {
+  sessionId: string;
+  messageId: string;
+  chatId: string;
+  body: string;
+  timestamp: number;
+}
+
 interface MessageRevokedEvent {
   sessionId: string;
   id: string;
@@ -64,6 +72,7 @@ interface WebSocketEvents {
   onMessageAck?: (event: MessageAckEvent) => void;
   onMessageReaction?: (event: MessageReactionEvent) => void;
   onMessageRevoked?: (event: MessageRevokedEvent) => void;
+  onMessageEdited?: (event: MessageEditedEvent) => void;
 }
 
 // Shape of the server -> client event envelope produced by the NestJS gateway.
@@ -231,6 +240,25 @@ export function useWebSocket(events: WebSocketEvents = {}) {
             to: String(data.to),
             body: String(data.body ?? ''),
             type: String(data.type),
+            timestamp: Number(data.timestamp),
+          });
+          break;
+        case 'message.edited':
+          // Keep optional/malformed wire fields from becoming the truthy strings "undefined"/"null"
+          // and accidentally matching an unrelated cached row.
+          if (
+            typeof data.messageId !== 'string' ||
+            !data.messageId ||
+            typeof data.chatId !== 'string' ||
+            typeof data.body !== 'string'
+          ) {
+            break;
+          }
+          events.onMessageEdited?.({
+            sessionId,
+            messageId: data.messageId,
+            chatId: data.chatId,
+            body: data.body,
             timestamp: Number(data.timestamp),
           });
           break;

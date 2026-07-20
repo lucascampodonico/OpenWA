@@ -1,4 +1,4 @@
-import { MessageMedia, WAState } from 'whatsapp-web.js';
+import { Client, MessageMedia, WAState } from 'whatsapp-web.js';
 import { EventEmitter } from 'events';
 import {
   WhatsAppWebJsAdapter,
@@ -14,12 +14,13 @@ import {
 } from './whatsapp-web-js.adapter';
 import { getEffectiveWebVersionInfo, resolveWebVersionPin, __resetWebVersionCache } from '../wa-web-version';
 import * as fs from 'fs';
+import * as path from 'path';
 import * as qrcode from 'qrcode';
 import { InternalServerErrorException, UnprocessableEntityException } from '@nestjs/common';
 import { EngineNotReadyError } from '../../common/errors/engine-not-ready.error';
 import { ChannelNotFoundError } from '../../common/errors/channel-not-found.error';
 import { ChannelMediaNotSupportedError } from '../../common/errors/channel-media-not-supported.error';
-import { EngineStatus } from '../interfaces/whatsapp-engine.interface';
+import { EditedMessage, EngineStatus } from '../interfaces/whatsapp-engine.interface';
 import { SsrfBlockedError } from '../../common/security/ssrf-guard';
 import { fetch as undiciFetch } from 'undici';
 
@@ -37,6 +38,11 @@ jest.mock('qrcode', () => ({
   __esModule: true,
   toDataURL: jest.fn(() => Promise.resolve('data:image/png;base64,FAKEQR')),
 }));
+
+// Spying on child_process.execFile must target the real module exports: the TypeScript __importStar
+// namespace wrapper that `import * as childProcess` yields has non-configurable members, so
+// jest.spyOn cannot redefine execFile on it. The adapter reads execFile live off this same object.
+const childProcess = jest.requireActual<typeof import('child_process')>('child_process');
 
 describe('wwebjsAckToDeliveryStatus (engine ack-int -> neutral DeliveryStatus boundary, #265)', () => {
   // Regression-locks the integer boundary the decoupling moved behaviour into, incl. the
@@ -708,9 +714,10 @@ describe('WhatsAppWebJsAdapter.forceDestroy (recover a wedged session, #351)', (
     expect(adapter.getStatus()).toBe(EngineStatus.DISCONNECTED);
   });
 
-  it('is a no-op when there is no client', async () => {
+  it('records teardown intent even when startup has not assigned a client yet', async () => {
     const adapter = newAdapter();
     await expect(adapter.forceDestroy()).resolves.toBeUndefined();
+    expect((adapter as unknown as { tearingDown: boolean }).tearingDown).toBe(true);
   });
 });
 
@@ -1482,6 +1489,98 @@ describe('WhatsAppWebJsAdapter inbound media (MEDIA_DOWNLOAD_ENABLED=false)', ()
     const msg = onMessage.mock.calls[0][0] as { call?: { video: boolean; missed: boolean } };
     expect(msg.call).toEqual({ video: true, missed: true });
   });
+
+  it('enriches an own-send (message_create) echo with the media payload', async () => {
+    // buildIncomingMessageBase is sync and carries no media; without enrichment a phone-composed
+    // image persists/renders as a bare 📎 marker. The echo must reuse the same capped download path
+    // as the incoming handler, so the payload lands on the outgoing row.
+    const adapter = new WhatsAppWebJsAdapter({
+      sessionId: 'sess-echo-media',
+      sessionDataPath: './data/sessions',
+      puppeteer: {},
+    });
+    const client = Object.assign(new EventEmitter(), {
+      info: { wid: { user: '628123' }, pushname: 'Tester' },
+      getState: jest.fn().mockResolvedValue(WAState.CONNECTED),
+      pupPage: { evaluate: jest.fn().mockResolvedValue(true) },
+    });
+    (adapter as unknown as { client: unknown }).client = client;
+    const onMessageCreate = jest.fn();
+    (adapter as unknown as { callbacks: unknown }).callbacks = { onMessageCreate };
+    (adapter as unknown as { setupEventHandlers: () => void }).setupEventHandlers();
+
+    const mockMsg = {
+      id: { _serialized: 'OWN_MEDIA_1' },
+      from: '628123@c.us',
+      to: '628111@c.us',
+      body: '',
+      type: 'image',
+      timestamp: 1700000070,
+      fromMe: true,
+      hasMedia: true,
+      _data: { mimetype: 'image/png', size: 3 },
+      downloadMedia: jest.fn().mockResolvedValue({ mimetype: 'image/png', data: 'QUJD', filename: 'a.png' }),
+      getContact: jest.fn().mockResolvedValue(null),
+      hasQuotedMsg: false,
+    };
+
+    client.emit('message_create', mockMsg);
+    // The echo runs async (media download through the limiter) — flush the chain.
+    await new Promise(r => setImmediate(r));
+    await new Promise(r => setImmediate(r));
+
+    expect(onMessageCreate).toHaveBeenCalledTimes(1);
+    // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access
+    const msg = onMessageCreate.mock.calls[0][0] as {
+      media?: { mimetype?: string; data?: string; omitted?: boolean };
+    };
+    expect(msg.media?.mimetype).toBe('image/png');
+    expect(msg.media?.data).toBe('QUJD');
+    expect(msg.media?.omitted).toBeUndefined();
+  });
+
+  it('still emits the echo (without media) when the own-send media download fails', async () => {
+    const adapter = new WhatsAppWebJsAdapter({
+      sessionId: 'sess-echo-media-fail',
+      sessionDataPath: './data/sessions',
+      puppeteer: {},
+    });
+    const client = Object.assign(new EventEmitter(), {
+      info: { wid: { user: '628123' }, pushname: 'Tester' },
+      getState: jest.fn().mockResolvedValue(WAState.CONNECTED),
+      pupPage: { evaluate: jest.fn().mockResolvedValue(true) },
+    });
+    (adapter as unknown as { client: unknown }).client = client;
+    const onMessageCreate = jest.fn();
+    (adapter as unknown as { callbacks: unknown }).callbacks = { onMessageCreate };
+    (adapter as unknown as { setupEventHandlers: () => void }).setupEventHandlers();
+
+    const mockMsg = {
+      id: { _serialized: 'OWN_MEDIA_2' },
+      from: '628123@c.us',
+      to: '628111@c.us',
+      body: '',
+      type: 'image',
+      timestamp: 1700000071,
+      fromMe: true,
+      hasMedia: true,
+      _data: { mimetype: 'image/png', size: 3 },
+      downloadMedia: jest.fn().mockRejectedValue(new Error('media gone')),
+      getContact: jest.fn().mockResolvedValue(null),
+      hasQuotedMsg: false,
+    };
+
+    client.emit('message_create', mockMsg);
+    await new Promise(r => setImmediate(r));
+    await new Promise(r => setImmediate(r));
+
+    expect(onMessageCreate).toHaveBeenCalledTimes(1);
+    // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access
+    const msg = onMessageCreate.mock.calls[0][0] as { media?: unknown };
+    // The failure is contained at the call site: the echo still fires, just without the media field
+    // (the omitted marker is synthesized downstream, in SessionService's persistence).
+    expect(msg.media).toBeUndefined();
+  });
 });
 
 describe('WhatsAppWebJsAdapter message_reaction (id resolution across WA Web builds)', () => {
@@ -1622,6 +1721,71 @@ describe('WhatsAppWebJsAdapter message_revoke_everyone (forwards the original de
     const revoked = onMessageRevoked.mock.calls[0][0] as { id: string; revokedId?: string };
     expect(revoked.id).toBe('REVOKE_NOTIF_RENAMED');
     expect(revoked.revokedId).toBe('ORIGINAL_RENAMED');
+  });
+});
+
+describe('WhatsAppWebJsAdapter message_edit', () => {
+  const wireEditHandler = (): { onMessageEdited: jest.Mock; client: EventEmitter } => {
+    const adapter = new WhatsAppWebJsAdapter({
+      sessionId: 'sess-edit-test',
+      sessionDataPath: './data/sessions',
+      puppeteer: {},
+    });
+    const client = Object.assign(new EventEmitter(), {
+      info: { wid: { _serialized: 'me@c.us', user: '628123' }, pushname: 'Tester' },
+      getState: jest.fn().mockResolvedValue(WAState.CONNECTED),
+      pupPage: { evaluate: jest.fn().mockResolvedValue(true) },
+    });
+    (adapter as unknown as { client: unknown }).client = client;
+    const onMessageEdited = jest.fn();
+    (adapter as unknown as { callbacks: unknown }).callbacks = { onMessageEdited };
+    (adapter as unknown as { setupEventHandlers: () => void }).setupEventHandlers();
+    return { onMessageEdited, client };
+  };
+
+  it('emits onMessageEdited with the new body and mapped fields', () => {
+    const { onMessageEdited, client } = wireEditHandler();
+    const now = jest.spyOn(Date, 'now').mockReturnValue(1700000089123);
+
+    try {
+      client.emit(
+        'message_edit',
+        {
+          id: { _serialized: 'MSG_EDIT_1' },
+          from: 'peer@c.us',
+          to: 'me@c.us',
+          author: 'peer@c.us',
+          body: 'Old text',
+          type: 'chat',
+          fromMe: false,
+          hasMedia: false,
+          mentionedIds: ['mentioned@c.us'],
+          timestamp: 1700000080,
+        },
+        'Edited new text',
+        'Old text',
+      );
+    } finally {
+      now.mockRestore();
+    }
+
+    expect(onMessageEdited).toHaveBeenCalledTimes(1);
+    const calls = onMessageEdited.mock.calls as Array<[EditedMessage]>;
+    expect(calls[0][0]).toEqual({
+      messageId: 'MSG_EDIT_1',
+      chatId: 'peer@c.us',
+      body: 'Edited new text',
+      senderId: 'peer@c.us',
+      from: 'peer@c.us',
+      to: 'me@c.us',
+      fromMe: false,
+      isGroup: false,
+      type: 'text',
+      hasMedia: false,
+      author: 'peer@c.us',
+      mentionedIds: ['mentioned@c.us'],
+      timestamp: 1700000089,
+    });
   });
 });
 
@@ -2006,7 +2170,7 @@ describe('WhatsAppWebJsAdapter inbound media concurrency (slot held until the re
     // Time out BOTH callers' wall-clock deadline while the real download is still pending. With the old
     // coupling this freed the slot and admitted download2 (inFlight 2); the fix holds the slot.
     await jest.advanceTimersByTimeAsync(25);
-    expect(await r1).toBeUndefined(); // caller unblocked on the timeout race
+    expect(await r1).toEqual(expect.objectContaining({ mimetype: 'image/png', omitted: true, sizeBytes: 100 }));
     expect(downloads.length).toBe(1); // download2 still not started — slot held by the pending real download1
     expect(maxInFlight).toBe(1);
 
@@ -2018,7 +2182,7 @@ describe('WhatsAppWebJsAdapter inbound media concurrency (slot held until the re
 
     // Settle the rest so nothing dangles.
     await jest.advanceTimersByTimeAsync(25);
-    expect(await r2).toBeUndefined();
+    expect(await r2).toEqual(expect.objectContaining({ mimetype: 'image/png', omitted: true, sizeBytes: 100 }));
     downloads[1].resolve({ mimetype: 'image/png', data: Buffer.from('b').toString('base64') });
     await jest.advanceTimersByTimeAsync(0);
     expect(maxInFlight).toBe(1);
@@ -2197,5 +2361,468 @@ describe('WhatsAppWebJsAdapter createGroup (failure shapes)', () => {
     const res = await readyAdapter({ createGroup }).createGroup('team', ['628123@c.us', '628124@c.us']);
 
     expect(res).toEqual({ id: '120363000@g.us', name: 'team', participantsCount: 2 });
+  });
+});
+
+describe('WhatsAppWebJsAdapter puppeteer death detection (browser/page silent death)', () => {
+  type PuppeteerFakeClient = EventEmitter & {
+    getState: jest.Mock;
+    pupBrowser: EventEmitter;
+    pupPage: EventEmitter;
+    destroy?: jest.Mock;
+  };
+
+  const wireAdapter = (
+    overrides: { status?: EngineStatus; tearingDown?: boolean; client?: Partial<PuppeteerFakeClient> } = {},
+  ): { adapter: WhatsAppWebJsAdapter; client: PuppeteerFakeClient; onDisconnected: jest.Mock } => {
+    const adapter = new WhatsAppWebJsAdapter({
+      sessionId: 'sess-pup-death',
+      sessionDataPath: './data/sessions',
+      puppeteer: {},
+    });
+    const client = Object.assign(new EventEmitter(), {
+      getState: jest.fn().mockResolvedValue(WAState.CONNECTED),
+      pupBrowser: new EventEmitter(),
+      pupPage: new EventEmitter(),
+      ...overrides.client,
+    }) as PuppeteerFakeClient;
+    const onDisconnected = jest.fn();
+    (adapter as unknown as { client: unknown }).client = client;
+    (adapter as unknown as { callbacks: unknown }).callbacks = { onDisconnected };
+    (adapter as unknown as { status: EngineStatus }).status = overrides.status ?? EngineStatus.READY;
+    (adapter as unknown as { tearingDown: boolean }).tearingDown = overrides.tearingDown ?? false;
+    (adapter as unknown as { attachPuppeteerLifecycleListeners: () => void }).attachPuppeteerLifecycleListeners();
+    return { adapter, client, onDisconnected };
+  };
+
+  it('reports the browser process closing or crashing as a disconnect', () => {
+    const { adapter, client, onDisconnected } = wireAdapter();
+
+    client.pupBrowser.emit('disconnected');
+
+    expect(onDisconnected).toHaveBeenCalledTimes(1);
+    expect(onDisconnected).toHaveBeenCalledWith('Browser process closed or crashed');
+    expect(adapter.getStatus()).toBe(EngineStatus.DISCONNECTED);
+  });
+
+  it('reports a renderer crash (page error) as a disconnect', () => {
+    const { adapter, client, onDisconnected } = wireAdapter();
+
+    client.pupPage.emit('error', new Error('Page crashed!'));
+
+    expect(onDisconnected).toHaveBeenCalledTimes(1);
+    expect(onDisconnected).toHaveBeenCalledWith('Page crashed');
+    expect(adapter.getStatus()).toBe(EngineStatus.DISCONNECTED);
+  });
+
+  it('reports the page being closed as a disconnect', () => {
+    const { adapter, client, onDisconnected } = wireAdapter();
+
+    client.pupPage.emit('close');
+
+    expect(onDisconnected).toHaveBeenCalledTimes(1);
+    expect(onDisconnected).toHaveBeenCalledWith('Page closed');
+    expect(adapter.getStatus()).toBe(EngineStatus.DISCONNECTED);
+  });
+
+  it('does not double-report when page error and browser disconnected fire together', () => {
+    const { client, onDisconnected } = wireAdapter();
+
+    client.pupPage.emit('error', new Error('Page crashed!'));
+    client.pupBrowser.emit('disconnected');
+    client.pupPage.emit('close');
+
+    expect(onDisconnected).toHaveBeenCalledTimes(1);
+    expect(onDisconnected).toHaveBeenCalledWith('Page crashed');
+  });
+
+  it.each([
+    ['pupBrowser', 'disconnected'],
+    ['pupPage', 'error'],
+    ['pupPage', 'close'],
+  ] as const)('ignores %s %s during an intentional teardown', (handle, event) => {
+    const { client, onDisconnected } = wireAdapter({ tearingDown: true });
+
+    client[handle].emit(event, new Error('boom'));
+
+    expect(onDisconnected).not.toHaveBeenCalled();
+  });
+
+  it('ignores the death events once the status is already DISCONNECTED', () => {
+    const { client, onDisconnected } = wireAdapter({ status: EngineStatus.DISCONNECTED });
+
+    client.pupBrowser.emit('disconnected');
+    client.pupPage.emit('error', new Error('boom'));
+    client.pupPage.emit('close');
+
+    expect(onDisconnected).not.toHaveBeenCalled();
+  });
+
+  it('ignores the browser disconnected event raised by a deliberate disconnect()', async () => {
+    const destroy = jest.fn().mockResolvedValue(undefined);
+    const { adapter, client, onDisconnected } = wireAdapter({ client: { destroy } });
+
+    await adapter.disconnect(); // sets tearingDown + DISCONNECTED, then destroys the client
+    client.pupBrowser.emit('disconnected');
+
+    expect(destroy).toHaveBeenCalledTimes(1);
+    expect(onDisconnected).not.toHaveBeenCalled();
+  });
+});
+
+describe('WhatsAppWebJsAdapter.probeLiveness (session watchdog probe)', () => {
+  const adapterWith = (client: unknown, status: EngineStatus = EngineStatus.READY): WhatsAppWebJsAdapter => {
+    const adapter = new WhatsAppWebJsAdapter({ sessionId: 's', sessionDataPath: './data/sessions', puppeteer: {} });
+    (adapter as unknown as { status: EngineStatus }).status = status;
+    (adapter as unknown as { client: unknown }).client = client;
+    return adapter;
+  };
+
+  it('resolves true when getState() reports CONNECTED', async () => {
+    const adapter = adapterWith({ getState: jest.fn().mockResolvedValue(WAState.CONNECTED) });
+
+    await expect(adapter.probeLiveness()).resolves.toBe(true);
+  });
+
+  it('resolves false when getState() rejects (page already gone)', async () => {
+    const adapter = adapterWith({ getState: jest.fn().mockRejectedValue(new Error('Target closed')) });
+
+    await expect(adapter.probeLiveness()).resolves.toBe(false);
+  });
+
+  it('resolves false when getState() reports a non-CONNECTED state', async () => {
+    const adapter = adapterWith({ getState: jest.fn().mockResolvedValue(WAState.OPENING) });
+
+    await expect(adapter.probeLiveness()).resolves.toBe(false);
+  });
+
+  it('resolves false without touching the client when the adapter is not READY', async () => {
+    const getState = jest.fn();
+    const adapter = adapterWith({ getState }, EngineStatus.AUTHENTICATING);
+
+    await expect(adapter.probeLiveness()).resolves.toBe(false);
+    expect(getState).not.toHaveBeenCalled();
+  });
+
+  it('resolves false when there is no client', async () => {
+    await expect(adapterWith(null).probeLiveness()).resolves.toBe(false);
+  });
+
+  it('resolves false when getState() hangs past the 10s timeout, leaving no dangling timer', async () => {
+    jest.useFakeTimers();
+    try {
+      const adapter = adapterWith({ getState: jest.fn().mockReturnValue(new Promise<never>(() => {})) });
+
+      const probe = adapter.probeLiveness();
+      const assertion = expect(probe).resolves.toBe(false);
+      await jest.advanceTimersByTimeAsync(10_000);
+
+      await assertion;
+      expect(jest.getTimerCount()).toBe(0);
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+});
+
+describe('WhatsAppWebJsAdapter stale Singleton cleanup (pre-launch)', () => {
+  const SESSION_ID = 'sess-singleton';
+  const newAdapter = (): WhatsAppWebJsAdapter =>
+    new WhatsAppWebJsAdapter({ sessionId: SESSION_ID, sessionDataPath: './data/sessions', puppeteer: {} });
+
+  let rmSpy: jest.SpyInstance;
+  let clientInitSpy: jest.SpyInstance;
+  let savedWebVersion: string | undefined;
+
+  beforeEach(() => {
+    // Keep initialize() offline: 'off' skips the wa-version registry fetch in resolveWebVersionPin.
+    savedWebVersion = process.env.WWEBJS_WEB_VERSION;
+    process.env.WWEBJS_WEB_VERSION = 'off';
+    rmSpy = jest.spyOn(fs.promises, 'rm').mockResolvedValue(undefined);
+    // Stub Client.prototype.initialize so the real wwebjs Client is built but no browser launches.
+    // (Structural cast: the wwebjs Client typings don't resolve under the lint project.)
+    clientInitSpy = jest
+      .spyOn(Client.prototype as unknown as { initialize: () => Promise<void> }, 'initialize')
+      .mockResolvedValue(undefined);
+  });
+
+  afterEach(() => {
+    rmSpy.mockRestore();
+    clientInitSpy.mockRestore();
+    if (savedWebVersion === undefined) {
+      delete process.env.WWEBJS_WEB_VERSION;
+    } else {
+      process.env.WWEBJS_WEB_VERSION = savedWebVersion;
+    }
+  });
+
+  it('removes the three Singleton files from the LocalAuth profile dir right before client.initialize()', async () => {
+    const order: string[] = [];
+    rmSpy.mockImplementation(() => {
+      order.push('rm');
+      return Promise.resolve(undefined);
+    });
+    clientInitSpy.mockImplementation(() => {
+      order.push('client.initialize');
+      return Promise.resolve(undefined);
+    });
+
+    await newAdapter().initialize({});
+
+    // Same dir LocalAuth uses as userDataDir: <resolved dataPath>/session-<clientId>.
+    const profileDir = path.join(path.resolve('./data/sessions'), `session-${SESSION_ID}`);
+    expect(rmSpy).toHaveBeenCalledTimes(3);
+    expect(rmSpy).toHaveBeenCalledWith(path.join(profileDir, 'SingletonLock'), { force: true });
+    expect(rmSpy).toHaveBeenCalledWith(path.join(profileDir, 'SingletonSocket'), { force: true });
+    expect(rmSpy).toHaveBeenCalledWith(path.join(profileDir, 'SingletonCookie'), { force: true });
+    expect(clientInitSpy).toHaveBeenCalledTimes(1);
+    expect(order).toEqual(['rm', 'rm', 'rm', 'client.initialize']);
+  });
+
+  it('still initializes when the Singleton files cannot be removed (best-effort, never fails the start)', async () => {
+    rmSpy.mockRejectedValue(new Error('EPERM: operation not permitted'));
+
+    await expect(newAdapter().initialize({})).resolves.toBeUndefined();
+
+    expect(rmSpy).toHaveBeenCalledTimes(3); // all three attempted even though each failed
+    expect(clientInitSpy).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('WhatsAppWebJsAdapter orphaned Chromium sweep (pre-launch)', () => {
+  const SESSION_ID = 'sess-orphan';
+  const newAdapter = (): WhatsAppWebJsAdapter =>
+    new WhatsAppWebJsAdapter({ sessionId: SESSION_ID, sessionDataPath: './data/sessions', puppeteer: {} });
+
+  type ExecFileCallback = (error: Error | null, stdout: string, stderr: string) => void;
+
+  let execFileSpy: jest.SpyInstance;
+  let killSpy: jest.SpyInstance;
+  let rmSpy: jest.SpyInstance;
+  let clientInitSpy: jest.SpyInstance;
+  let savedWebVersion: string | undefined;
+
+  // execFile is overloaded, so spy through a structural shape like the Client.prototype spies above.
+  // The adapter invokes it as execFile('ps', args, opts, callback); the callback is always last.
+  const mockPsResult = (result: { stdout?: string; error?: Error }): void => {
+    execFileSpy.mockImplementation((...args: unknown[]) => {
+      const cb = args[args.length - 1] as ExecFileCallback;
+      cb(result.error ?? null, result.stdout ?? '', '');
+    });
+  };
+  // `ps -eo pid=,args=` rows: leading whitespace, pid, then the full command line.
+  const psTable = (rows: [number, string][]): string => rows.map(([pid, args]) => `  ${pid} ${args}`).join('\n') + '\n';
+  const loggerLogSpy = (adapter: WhatsAppWebJsAdapter): jest.SpyInstance => {
+    const logger = (adapter as unknown as { logger: { log: (message: string, context?: unknown) => void } }).logger;
+    return jest.spyOn(logger, 'log').mockImplementation(() => undefined);
+  };
+
+  beforeEach(() => {
+    // Keep initialize() offline: 'off' skips the wa-version registry fetch in resolveWebVersionPin.
+    savedWebVersion = process.env.WWEBJS_WEB_VERSION;
+    process.env.WWEBJS_WEB_VERSION = 'off';
+    // Default: an empty process table (nothing to sweep); tests override via mockPsResult.
+    execFileSpy = jest
+      .spyOn(childProcess as unknown as { execFile: (...args: unknown[]) => void }, 'execFile')
+      .mockImplementation((...args: unknown[]) => {
+        (args[args.length - 1] as ExecFileCallback)(null, '', '');
+      });
+    // Never let a test signal a real process.
+    killSpy = jest.spyOn(process, 'kill').mockImplementation(() => true);
+    rmSpy = jest.spyOn(fs.promises, 'rm').mockResolvedValue(undefined);
+    // Stub Client.prototype.initialize so the real wwebjs Client is built but no browser launches.
+    clientInitSpy = jest
+      .spyOn(Client.prototype as unknown as { initialize: () => Promise<void> }, 'initialize')
+      .mockResolvedValue(undefined);
+  });
+
+  afterEach(() => {
+    execFileSpy.mockRestore();
+    killSpy.mockRestore();
+    rmSpy.mockRestore();
+    clientInitSpy.mockRestore();
+    if (savedWebVersion === undefined) {
+      delete process.env.WWEBJS_WEB_VERSION;
+    } else {
+      process.env.WWEBJS_WEB_VERSION = savedWebVersion;
+    }
+  });
+
+  it('appends the --openwa-session marker to the puppeteer args handed to the Client', async () => {
+    const adapter = newAdapter();
+
+    await adapter.initialize({});
+
+    const client = (adapter as unknown as { client: { options: { puppeteer?: { args?: string[] } } } }).client;
+    expect(client.options.puppeteer?.args).toContain(`--openwa-session=${SESSION_ID}`);
+  });
+
+  it('SIGKILLs a Chromium process carrying this session marker and logs the sweep', async () => {
+    mockPsResult({
+      stdout: psTable([
+        [
+          1501,
+          `/Applications/Google Chrome.app/Contents/MacOS/Google Chrome --headless --openwa-session=${SESSION_ID}`,
+        ],
+        [1502, '/usr/bin/node dist/main.js'],
+      ]),
+    });
+    const adapter = newAdapter();
+    const logSpy = loggerLogSpy(adapter);
+
+    await adapter.initialize({});
+
+    expect(execFileSpy).toHaveBeenCalledTimes(1);
+    // No shell: ps is exec'd directly with an argv array, an options object, and a callback.
+    expect(execFileSpy).toHaveBeenCalledWith('ps', ['-eo', 'pid=,args='], expect.any(Object), expect.any(Function));
+    expect(killSpy).toHaveBeenCalledTimes(1);
+    expect(killSpy).toHaveBeenCalledWith(1501, 'SIGKILL');
+    expect(logSpy).toHaveBeenCalledWith(
+      'Killed 1 orphaned Chromium process(es) left over from a previous process lifetime',
+      {
+        sessionId: SESSION_ID,
+        pids: [1501],
+      },
+    );
+  });
+
+  it('does NOT kill a non-browser process that merely carries the marker string', async () => {
+    mockPsResult({
+      stdout: psTable([
+        [1601, `/bin/grep --openwa-session=${SESSION_ID}`],
+        [1602, `/usr/bin/node scan-sessions.js --openwa-session=${SESSION_ID}`],
+      ]),
+    });
+
+    await newAdapter().initialize({});
+
+    expect(killSpy).not.toHaveBeenCalled();
+  });
+
+  it('does NOT kill a Chromium process belonging to a different session', async () => {
+    mockPsResult({
+      stdout: psTable([[1701, '/usr/lib/chromium/chromium --headless --no-sandbox --openwa-session=session-lain']]),
+    });
+
+    await newAdapter().initialize({});
+
+    expect(killSpy).not.toHaveBeenCalled();
+  });
+
+  it('skips the sweep on platforms other than darwin/linux (no ps, no kill)', async () => {
+    const platform = Object.getOwnPropertyDescriptor(process, 'platform') as PropertyDescriptor;
+    Object.defineProperty(process, 'platform', { value: 'win32' });
+    try {
+      await newAdapter().initialize({});
+    } finally {
+      Object.defineProperty(process, 'platform', platform);
+    }
+
+    expect(execFileSpy).not.toHaveBeenCalled();
+    expect(killSpy).not.toHaveBeenCalled();
+  });
+
+  it('still initializes when ps fails (best-effort, never fails the start)', async () => {
+    mockPsResult({ error: new Error('spawn ps ENOENT') });
+
+    await expect(newAdapter().initialize({})).resolves.toBeUndefined();
+
+    expect(killSpy).not.toHaveBeenCalled();
+    expect(clientInitSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it('runs the orphan sweep before the Singleton cleanup and client.initialize()', async () => {
+    const order: string[] = [];
+    execFileSpy.mockImplementation((...args: unknown[]) => {
+      order.push('ps');
+      (args[args.length - 1] as ExecFileCallback)(
+        null,
+        psTable([[1801, `/usr/bin/chromium --headless --openwa-session=${SESSION_ID}`]]),
+        '',
+      );
+    });
+    killSpy.mockImplementation(() => {
+      order.push('kill');
+      return true;
+    });
+    rmSpy.mockImplementation(() => {
+      order.push('rm');
+      return Promise.resolve(undefined);
+    });
+    clientInitSpy.mockImplementation(() => {
+      order.push('client.initialize');
+      return Promise.resolve(undefined);
+    });
+
+    await newAdapter().initialize({});
+
+    expect(order).toEqual(['ps', 'kill', 'rm', 'rm', 'rm', 'client.initialize']);
+  });
+});
+
+describe('WhatsAppWebJsAdapter page transport error detection (wedged page fast-path, wwebjs #5728)', () => {
+  const readyAdapter = (client: unknown): { adapter: WhatsAppWebJsAdapter; onDisconnected: jest.Mock } => {
+    const adapter = new WhatsAppWebJsAdapter({ sessionId: 's', sessionDataPath: './data/sessions', puppeteer: {} });
+    (adapter as unknown as { status: EngineStatus }).status = EngineStatus.READY;
+    (adapter as unknown as { client: unknown }).client = client;
+    const onDisconnected = jest.fn();
+    (adapter as unknown as { callbacks: unknown }).callbacks = { onDisconnected };
+    return { adapter, onDisconnected };
+  };
+
+  // A wedged page fires no events while still reporting CONNECTED, so a failed operation carrying a
+  // transport-death signature is the earliest signal — it must route through the disconnect path.
+  it.each([
+    'Protocol error: Target closed',
+    'Protocol error (Runtime.callFunctionOn): Target closed.',
+    'TargetClosedError: page closed',
+    'Attempted to use detached Frame',
+    'Session closed',
+    'Connection closed',
+  ])('reports a failed send carrying "%s" as a disconnect', async message => {
+    const sendMessage = jest.fn().mockRejectedValue(new Error(message));
+    const { adapter, onDisconnected } = readyAdapter({ sendMessage });
+
+    await expect(adapter.sendTextMessage('628111@c.us', 'hi')).rejects.toThrow(message);
+
+    expect(onDisconnected).toHaveBeenCalledTimes(1);
+    expect(onDisconnected).toHaveBeenCalledWith('Page transport error during sendMessage');
+    expect(adapter.getStatus()).toBe(EngineStatus.DISCONNECTED);
+  });
+
+  // Ordinary operation failures must NOT trip the death path — the error only propagates to the caller.
+  it.each(['WhatsApp rate limit', 'Evaluation failed: TypeError: x is not a function'])(
+    'does not report an ordinary send failure (%s) as a disconnect',
+    async message => {
+      const sendMessage = jest.fn().mockRejectedValue(new Error(message));
+      const { adapter, onDisconnected } = readyAdapter({ sendMessage });
+
+      await expect(adapter.sendTextMessage('628111@c.us', 'hi')).rejects.toThrow(message);
+
+      expect(onDisconnected).not.toHaveBeenCalled();
+      expect(adapter.getStatus()).toBe(EngineStatus.READY);
+    },
+  );
+
+  it('detects a transport error from a getter too (getContacts)', async () => {
+    const getContacts = jest.fn().mockRejectedValue(new Error('Protocol error: Target closed'));
+    const { adapter, onDisconnected } = readyAdapter({ getContacts });
+
+    await expect(adapter.getContacts()).rejects.toThrow('Protocol error: Target closed');
+
+    expect(onDisconnected).toHaveBeenCalledTimes(1);
+    expect(onDisconnected).toHaveBeenCalledWith('Page transport error during getContacts');
+    expect(adapter.getStatus()).toBe(EngineStatus.DISCONNECTED);
+  });
+
+  it('reports nothing when the failure happens during an intentional teardown', async () => {
+    const sendMessage = jest.fn().mockRejectedValue(new Error('Protocol error: Target closed'));
+    const { adapter, onDisconnected } = readyAdapter({ sendMessage });
+    (adapter as unknown as { tearingDown: boolean }).tearingDown = true;
+
+    await expect(adapter.sendTextMessage('628111@c.us', 'hi')).rejects.toThrow('Protocol error: Target closed');
+
+    expect(onDisconnected).not.toHaveBeenCalled();
+    expect(adapter.getStatus()).toBe(EngineStatus.READY);
   });
 });

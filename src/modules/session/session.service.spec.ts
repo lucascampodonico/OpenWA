@@ -3,9 +3,14 @@ import { getRepositoryToken, getDataSourceToken } from '@nestjs/typeorm';
 import { Repository, DataSource, In } from 'typeorm';
 import { NotFoundException, ConflictException, BadRequestException, HttpException, HttpStatus } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { SessionService, ACK_RECONCILE_DELAY_MS } from './session.service';
+import {
+  SessionService,
+  ACK_RECONCILE_DELAY_MS,
+  SESSION_WATCHDOG_INTERVAL_MS,
+  SESSION_WATCHDOG_PROBE_TIMEOUT_MS,
+} from './session.service';
 import { Session, SessionStatus } from './entities/session.entity';
-import { Message, MessageStatus } from '../message/entities/message.entity';
+import { Message, MessageDirection, MessageStatus } from '../message/entities/message.entity';
 import { MessageBatch } from '../message/entities/message-batch.entity';
 import { Webhook } from '../webhook/entities/webhook.entity';
 import { Template } from '../template/entities/template.entity';
@@ -17,6 +22,10 @@ import { WebhookService } from '../webhook/webhook.service';
 import { HookManager } from '../../core/hooks';
 import { IncomingMessage, EngineEventCallbacks, EngineStatus } from '../../engine/interfaces/whatsapp-engine.interface';
 import { BaileysSessionStore } from '../../engine/adapters/baileys-session-store';
+import {
+  getSessionReconnectAttemptsTotal,
+  getSessionReconnectLoopAlertsTotal,
+} from '../../common/metrics/session-reconnect-metrics';
 
 function createMockSession(overrides: Partial<Session> = {}): Session {
   return {
@@ -119,6 +128,7 @@ describe('SessionService', () => {
       emitMessageAck: jest.fn(),
       emitMessageRevoked: jest.fn(),
       emitMessageReaction: jest.fn(),
+      emitMessageEdited: jest.fn(),
       emitQRCode: jest.fn(),
     };
 
@@ -795,6 +805,232 @@ describe('SessionService', () => {
     });
   });
 
+  describe('scheduleReconnect (reconnect policy)', () => {
+    type PolicyInternals = {
+      reconnectStates: Map<
+        string,
+        {
+          attempts: number;
+          timer: NodeJS.Timeout | null;
+          maxAttempts: number;
+          baseDelay: number;
+          lastAttemptAt?: number;
+        }
+      >;
+      sessionErrors: Map<string, string>;
+      scheduleReconnect: (id: string, session: Session) => void;
+      executeReconnect: (...args: unknown[]) => Promise<void>;
+    };
+    const internals = (): PolicyInternals => service as unknown as PolicyInternals;
+
+    it('keeps scheduling past the old 5-attempt budget by default (unlimited), the backoff parking at the 1h cap', () => {
+      jest.useFakeTimers();
+      try {
+        const i = internals();
+        // What start() seeds when session.config sets no maxReconnectAttempts.
+        const state = { attempts: 0, timer: null, maxAttempts: Number.POSITIVE_INFINITY, baseDelay: 5000 };
+        i.reconnectStates.set('sess-uuid-1', state);
+        const exec = jest.spyOn(i, 'executeReconnect').mockResolvedValue(undefined);
+
+        // Twelve consecutive disconnects — the pre-fix default (5) would have wedged FAILED at the
+        // 6th; with the unlimited default every one schedules another attempt.
+        for (let k = 0; k < 12; k++) {
+          i.scheduleReconnect('sess-uuid-1', createMockSession());
+        }
+
+        expect(state.attempts).toBe(12);
+        expect(i.sessionErrors.has('sess-uuid-1')).toBe(false); // never terminally FAILED
+        expect(jest.getTimerCount()).toBe(1); // still exactly one pending timer
+
+        // The 12th schedule computed its delay with attempts=11: 5000*2^11 ≈ 10.24M ms, clamped to
+        // the 1h cap — the timer fires exactly at the cap, not earlier.
+        jest.advanceTimersByTime(3_599_999);
+        expect(exec).not.toHaveBeenCalled();
+        jest.advanceTimersByTime(1);
+        expect(exec).toHaveBeenCalledTimes(1);
+      } finally {
+        jest.clearAllTimers();
+        jest.useRealTimers();
+      }
+    });
+
+    it('resets the attempt budget after a 5-minute stable stretch (transient drops must not accrue)', () => {
+      jest.useFakeTimers();
+      try {
+        const i = internals();
+        const state = {
+          attempts: 4,
+          timer: null,
+          maxAttempts: Number.POSITIVE_INFINITY,
+          baseDelay: 5000,
+          lastAttemptAt: Date.now(),
+        };
+        i.reconnectStates.set('sess-uuid-1', state);
+        const exec = jest.spyOn(i, 'executeReconnect').mockResolvedValue(undefined);
+
+        // A drop 299s after the last attempt is still the same bad stretch: the budget keeps accruing.
+        jest.advanceTimersByTime(299_999);
+        i.scheduleReconnect('sess-uuid-1', createMockSession());
+        expect(state.attempts).toBe(5); // 4 -> 5, no reset
+
+        // ≥5 min since the last attempt means the session demonstrably stayed up — the budget
+        // restarts at 0 (the first schedule's 80s timer fires during this advance; irrelevant here).
+        jest.advanceTimersByTime(300_000);
+        i.scheduleReconnect('sess-uuid-1', createMockSession());
+        expect(state.attempts).toBe(1);
+
+        // ...so the backoff restarts at the base delay (~5s), not 2^4 × base (80s).
+        const callsBefore = exec.mock.calls.length;
+        jest.advanceTimersByTime(4_999);
+        expect(exec.mock.calls.length).toBe(callsBefore);
+        jest.advanceTimersByTime(1_001);
+        expect(exec.mock.calls.length).toBe(callsBefore + 1);
+      } finally {
+        jest.clearAllTimers();
+        jest.useRealTimers();
+      }
+    });
+
+    it('still wedges FAILED once an EXPLICIT cap is exhausted', () => {
+      jest.useFakeTimers();
+      try {
+        const i = internals();
+        (repository.update as jest.Mock).mockResolvedValue({ affected: 1 });
+        const state = { attempts: 2, timer: null, maxAttempts: 3, baseDelay: 5000 };
+        i.reconnectStates.set('sess-uuid-1', state);
+
+        i.scheduleReconnect('sess-uuid-1', createMockSession()); // attempt 3/3 still schedules
+        expect(state.attempts).toBe(3);
+        expect(i.sessionErrors.has('sess-uuid-1')).toBe(false);
+
+        i.scheduleReconnect('sess-uuid-1', createMockSession()); // budget exhausted → terminal FAILED
+        expect(state.attempts).toBe(3); // no further attempt consumed
+        expect(i.sessionErrors.get('sess-uuid-1')).toMatch(/Reconnection failed after 3 attempts/);
+        expect(repository.update).toHaveBeenCalledWith('sess-uuid-1', { status: SessionStatus.FAILED });
+      } finally {
+        jest.clearAllTimers();
+        jest.useRealTimers();
+      }
+    });
+  });
+
+  describe('scheduleReconnect (reconnect-loop observability)', () => {
+    type LoopInternals = {
+      reconnectStates: Map<
+        string,
+        {
+          attempts: number;
+          timer: NodeJS.Timeout | null;
+          maxAttempts: number;
+          baseDelay: number;
+          lastAttemptAt?: number;
+        }
+      >;
+      scheduleReconnect: (id: string, session: Session) => void;
+    };
+    const internals = (): LoopInternals => service as unknown as LoopInternals;
+    const loopDispatches = (): unknown[][] =>
+      ((webhookService.dispatch as jest.Mock).mock.calls as unknown[][]).filter(c => c[1] === 'session.reconnect_loop');
+
+    it('counts every scheduled attempt but emits no loop alert on attempts 1..4', () => {
+      jest.useFakeTimers();
+      try {
+        const i = internals();
+        const state = { attempts: 0, timer: null, maxAttempts: Number.POSITIVE_INFINITY, baseDelay: 5000 };
+        i.reconnectStates.set('sess-uuid-1', state);
+
+        const attemptsBefore = getSessionReconnectAttemptsTotal();
+        const alertsBefore = getSessionReconnectLoopAlertsTotal();
+
+        for (let k = 0; k < 4; k++) {
+          i.scheduleReconnect('sess-uuid-1', createMockSession());
+        }
+
+        expect(state.attempts).toBe(4);
+        // One counter tick per scheduled attempt.
+        expect(getSessionReconnectAttemptsTotal()).toBe(attemptsBefore + 4);
+        // ...but the loop alert only arms at attempt 5 — no dispatch, no alert tick before that.
+        expect(loopDispatches()).toHaveLength(0);
+        expect(getSessionReconnectLoopAlertsTotal()).toBe(alertsBefore);
+      } finally {
+        jest.clearAllTimers();
+        jest.useRealTimers();
+      }
+    });
+
+    it('alerts on attempts 5 and 10 with the loop payload (one signal per 5 consecutive attempts)', () => {
+      jest.useFakeTimers();
+      try {
+        const i = internals();
+        const state = { attempts: 0, timer: null, maxAttempts: Number.POSITIVE_INFINITY, baseDelay: 5000 };
+        i.reconnectStates.set('sess-uuid-1', state);
+
+        const attemptsBefore = getSessionReconnectAttemptsTotal();
+        const alertsBefore = getSessionReconnectLoopAlertsTotal();
+
+        for (let k = 0; k < 10; k++) {
+          i.scheduleReconnect('sess-uuid-1', createMockSession());
+        }
+
+        expect(getSessionReconnectAttemptsTotal()).toBe(attemptsBefore + 10);
+        expect(getSessionReconnectLoopAlertsTotal()).toBe(alertsBefore + 2);
+
+        const calls = loopDispatches();
+        expect(calls).toHaveLength(2);
+        // Attempt 5: the delay was computed with attempts=4 → 5000*2^4 = 80s (+ <1s jitter).
+        expect(calls[0][0]).toBe('sess-uuid-1');
+        expect(calls[0][2]).toMatchObject({ sessionId: 'sess-uuid-1', attempts: 5 });
+        expect((calls[0][2] as { nextDelayMs: number }).nextDelayMs).toBeGreaterThanOrEqual(80_000);
+        expect((calls[0][2] as { nextDelayMs: number }).nextDelayMs).toBeLessThan(81_000);
+        // Attempt 10: computed with attempts=9 → 5000*2^9 = 2560s (+ <1s jitter).
+        expect(calls[1][2]).toMatchObject({ sessionId: 'sess-uuid-1', attempts: 10 });
+        expect((calls[1][2] as { nextDelayMs: number }).nextDelayMs).toBeGreaterThanOrEqual(2_560_000);
+        expect((calls[1][2] as { nextDelayMs: number }).nextDelayMs).toBeLessThan(2_561_000);
+      } finally {
+        jest.clearAllTimers();
+        jest.useRealTimers();
+      }
+    });
+
+    it('re-arms the alert after a stability reset: the next alert waits 5 fresh attempts', () => {
+      jest.useFakeTimers();
+      try {
+        const i = internals();
+        // Four attempts already consumed, then the session stayed up ≥5 min — the budget resets.
+        const state = {
+          attempts: 4,
+          timer: null,
+          maxAttempts: Number.POSITIVE_INFINITY,
+          baseDelay: 5000,
+          lastAttemptAt: Date.now(),
+        };
+        i.reconnectStates.set('sess-uuid-1', state);
+
+        const alertsBefore = getSessionReconnectLoopAlertsTotal();
+
+        jest.advanceTimersByTime(300_000); // stability window elapses (no timer pending yet)
+        for (let k = 0; k < 4; k++) {
+          i.scheduleReconnect('sess-uuid-1', createMockSession());
+        }
+        // Without the reset the very first of these would have been attempt 5 and alerted; instead the
+        // streak restarted at 0, so 4 fresh schedules reach only attempt 4 — still no alert.
+        expect(state.attempts).toBe(4);
+        expect(loopDispatches()).toHaveLength(0);
+        expect(getSessionReconnectLoopAlertsTotal()).toBe(alertsBefore);
+
+        i.scheduleReconnect('sess-uuid-1', createMockSession()); // fresh attempt 5 → alert again
+        expect(state.attempts).toBe(5);
+        const calls = loopDispatches();
+        expect(calls).toHaveLength(1);
+        expect(calls[0][2]).toMatchObject({ sessionId: 'sess-uuid-1', attempts: 5 });
+        expect(getSessionReconnectLoopAlertsTotal()).toBe(alertsBefore + 1);
+      } finally {
+        jest.clearAllTimers();
+        jest.useRealTimers();
+      }
+    });
+  });
+
   describe('start() stale reconnect timer', () => {
     it('cancels a pending reconnect timer before recreating the engine', async () => {
       const i = service as unknown as {
@@ -985,6 +1221,181 @@ describe('SessionService', () => {
         expect(i.reconnectStates.get('sess-uuid-2')!.attempts).toBe(1); // an attempt was scheduled
         jest.advanceTimersByTime(120000);
         expect(exec).toHaveBeenCalled();
+      } finally {
+        jest.clearAllTimers();
+        jest.useRealTimers();
+      }
+    });
+  });
+
+  describe('liveness watchdog', () => {
+    type WatchdogInternals = {
+      engines: Map<string, unknown>;
+      reconnectStates: Map<
+        string,
+        { attempts: number; timer: NodeJS.Timeout | null; maxAttempts: number; baseDelay: number }
+      >;
+      livenessFailures: Map<string, number>;
+      watchdogTimer: NodeJS.Timeout | null;
+      scheduleReconnect: (id: string, session: Session) => void;
+    };
+    const internals = (): WatchdogInternals => service as unknown as WatchdogInternals;
+
+    // Auto-start is OFF in these tests — the watchdog must start regardless.
+    const originalFlag = process.env.AUTO_START_SESSIONS;
+    beforeEach(() => {
+      delete process.env.AUTO_START_SESSIONS;
+    });
+    afterEach(() => {
+      if (originalFlag === undefined) delete process.env.AUTO_START_SESSIONS;
+      else process.env.AUTO_START_SESSIONS = originalFlag;
+    });
+
+    const seedReadySession = (engine: unknown): void => {
+      internals().engines.set('sess-uuid-1', engine);
+      internals().reconnectStates.set('sess-uuid-1', {
+        attempts: 0,
+        timer: null,
+        maxAttempts: Number.POSITIVE_INFINITY,
+        baseDelay: 5000,
+      });
+      (repository.findOne as jest.Mock).mockResolvedValue(createMockSession());
+      (repository.update as jest.Mock).mockResolvedValue({ affected: 1 });
+    };
+
+    it('treats a READY engine failing the probe twice in a row as a disconnect (webhook + WS + DISCONNECTED + reconnect)', async () => {
+      jest.useFakeTimers();
+      try {
+        const engine = {
+          getStatus: jest.fn().mockReturnValue(EngineStatus.READY),
+          probeLiveness: jest.fn().mockResolvedValue(false),
+        };
+        seedReadySession(engine);
+        const scheduleSpy = jest.spyOn(internals(), 'scheduleReconnect');
+
+        await service.onApplicationBootstrap();
+
+        // Tick 1: the first failure stays below the 2-consecutive-failures threshold — nothing happens.
+        await jest.advanceTimersByTimeAsync(SESSION_WATCHDOG_INTERVAL_MS);
+        expect(scheduleSpy).not.toHaveBeenCalled();
+        expect(repository.update).not.toHaveBeenCalledWith('sess-uuid-1', {
+          status: SessionStatus.DISCONNECTED,
+        });
+
+        // Tick 2: the second CONSECUTIVE failure routes through the exact engine-disconnect path.
+        await jest.advanceTimersByTimeAsync(SESSION_WATCHDOG_INTERVAL_MS);
+        expect(scheduleSpy).toHaveBeenCalledWith('sess-uuid-1', expect.objectContaining({ id: 'sess-uuid-1' }));
+        expect(repository.update).toHaveBeenCalledWith('sess-uuid-1', { status: SessionStatus.DISCONNECTED });
+        expect(webhookService.dispatch).toHaveBeenCalledWith(
+          'sess-uuid-1',
+          'session.disconnected',
+          expect.objectContaining({ reason: 'liveness probe failed (watchdog)' }),
+        );
+        expect(eventsGateway.emitSessionDisconnected).toHaveBeenCalledWith('sess-uuid-1', {
+          reason: 'liveness probe failed (watchdog)',
+        });
+      } finally {
+        jest.clearAllTimers();
+        jest.useRealTimers();
+      }
+    });
+
+    it('resets the failure counter after a successful probe (no disconnect from non-consecutive failures)', async () => {
+      jest.useFakeTimers();
+      try {
+        const engine = {
+          getStatus: jest.fn().mockReturnValue(EngineStatus.READY),
+          // fail → succeed → fail: never two IN A ROW, so the session must survive all three ticks.
+          probeLiveness: jest
+            .fn()
+            .mockResolvedValueOnce(false)
+            .mockResolvedValueOnce(true)
+            .mockResolvedValueOnce(false),
+        };
+        seedReadySession(engine);
+        const scheduleSpy = jest.spyOn(internals(), 'scheduleReconnect');
+
+        await service.onApplicationBootstrap();
+        await jest.advanceTimersByTimeAsync(SESSION_WATCHDOG_INTERVAL_MS * 3);
+
+        expect(engine.probeLiveness).toHaveBeenCalledTimes(3);
+        expect(scheduleSpy).not.toHaveBeenCalled();
+        expect(webhookService.dispatch).not.toHaveBeenCalledWith(
+          'sess-uuid-1',
+          'session.disconnected',
+          expect.anything(),
+        );
+      } finally {
+        jest.clearAllTimers();
+        jest.useRealTimers();
+      }
+    });
+
+    it('skips engines that are not READY and engines that do not implement probeLiveness', async () => {
+      jest.useFakeTimers();
+      try {
+        const notReady = {
+          getStatus: jest.fn().mockReturnValue(EngineStatus.INITIALIZING),
+          probeLiveness: jest.fn().mockResolvedValue(false),
+        };
+        // READY but no probe method: the watchdog must feature-detect and leave it to engine events.
+        const noProbe = { getStatus: jest.fn().mockReturnValue(EngineStatus.READY) };
+        internals().engines.set('sess-not-ready', notReady);
+        internals().engines.set('sess-no-probe', noProbe);
+
+        await service.onApplicationBootstrap();
+        await jest.advanceTimersByTimeAsync(SESSION_WATCHDOG_INTERVAL_MS * 2);
+
+        expect(notReady.probeLiveness).not.toHaveBeenCalled();
+        expect(webhookService.dispatch).not.toHaveBeenCalledWith(
+          expect.anything(),
+          'session.disconnected',
+          expect.anything(),
+        );
+      } finally {
+        jest.clearAllTimers();
+        jest.useRealTimers();
+      }
+    });
+
+    it('counts a hung probe (timeout) as a failure and clears it on the next successful probe', async () => {
+      jest.useFakeTimers();
+      try {
+        const engine = {
+          getStatus: jest.fn().mockReturnValue(EngineStatus.READY),
+          probeLiveness: jest
+            .fn()
+            .mockImplementationOnce(() => new Promise<boolean>(() => undefined)) // hangs → probe timeout
+            .mockResolvedValueOnce(true),
+        };
+        seedReadySession(engine);
+
+        await service.onApplicationBootstrap();
+        await jest.advanceTimersByTimeAsync(SESSION_WATCHDOG_INTERVAL_MS); // tick 1: probe hangs
+        expect(internals().livenessFailures.get('sess-uuid-1')).toBeUndefined(); // not counted yet
+        await jest.advanceTimersByTimeAsync(SESSION_WATCHDOG_PROBE_TIMEOUT_MS); // 15s → timeout failure
+        expect(internals().livenessFailures.get('sess-uuid-1')).toBe(1);
+
+        await jest.advanceTimersByTimeAsync(SESSION_WATCHDOG_INTERVAL_MS); // tick 2: success
+        expect(internals().livenessFailures.get('sess-uuid-1')).toBeUndefined(); // counter reset
+      } finally {
+        jest.clearAllTimers();
+        jest.useRealTimers();
+      }
+    });
+
+    it('clears the watchdog timer in onModuleDestroy (idempotent, no open handle)', async () => {
+      jest.useFakeTimers();
+      try {
+        await service.onApplicationBootstrap();
+        expect(internals().watchdogTimer).not.toBeNull();
+        expect(jest.getTimerCount()).toBe(1); // the interval itself
+
+        await service.onModuleDestroy();
+        expect(internals().watchdogTimer).toBeNull();
+        expect(jest.getTimerCount()).toBe(0);
+
+        await expect(service.onModuleDestroy()).resolves.toBeUndefined(); // safe to call twice
       } finally {
         jest.clearAllTimers();
         jest.useRealTimers();
@@ -1225,19 +1636,129 @@ describe('SessionService', () => {
       expect(sent[0][0]).toBe('sess-uuid-1');
     });
 
-    it('does NOT persist an outgoing (message_create) self-message to the messages table', async () => {
-      // Contract lock: message_create also fires for API sends (already persisted by the REST send
-      // path), so a naive save here would double-persist. Phone-composed sends are therefore
-      // webhooked/emitted but not mirrored to local history; safe persistence (unique index + dedup)
-      // is a separate enhancement. This guards against the omission silently changing.
+    it('persists an outgoing (message_create) self-message so phone-composed sends reach local history', async () => {
+      // message_create is the ONLY event a phone-composed send produces; persist it best-effort. The
+      // UNIQUE(sessionId, waMessageId) index dedups against the REST send path, which persists
+      // API-originated sends itself (see the unique-race test below).
       const callbacks = await startAndCaptureCallbacks();
+      // Pass the message through the hook chain untouched (the default mock replaces data with {}).
+      (hookManager.execute as jest.Mock).mockImplementation((_e: string, data: unknown) =>
+        Promise.resolve({ continue: true, data }),
+      );
+      (messageRepository.insert as jest.Mock).mockClear();
 
       callbacks.onMessageCreate!(makeMessage({ id: 'wa-out-2', from: 'me@c.us', to: 'peer@c.us', fromMe: true }));
       await flush();
 
-      expect(dispatchedEvents('message.sent')).toHaveLength(1); // it IS webhooked/emitted
-      expect(messageRepository.create).not.toHaveBeenCalled(); // but NOT persisted
-      expect(messageRepository.save).not.toHaveBeenCalled();
+      expect(dispatchedEvents('message.sent')).toHaveLength(1); // webhook/WS contract unchanged
+      expect(messageRepository.insert).toHaveBeenCalledTimes(1);
+      // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access
+      const row = (messageRepository.create as jest.Mock).mock.calls[0][0] as Partial<Message>;
+      expect(row).toMatchObject({
+        sessionId: 'sess-uuid-1',
+        waMessageId: 'wa-out-2',
+        direction: MessageDirection.OUTGOING,
+        status: MessageStatus.SENT,
+      });
+      // A winning insert also feeds plugin providers (search etc.) like any other persisted message.
+      const persistedCalls = (hookManager.execute as jest.Mock).mock.calls.filter(
+        ([ev]: unknown[]) => ev === 'message:persisted',
+      );
+      expect(persistedCalls).toHaveLength(1);
+    });
+
+    it('still dispatches (but does not double-persist) when the REST send path won the dedup race', async () => {
+      // API-originated sends fire message_create too; the REST path persists them. A UNIQUE violation
+      // here is the dedup oracle working — not an error: skip the insert + message:persisted quietly,
+      // but the webhook/WS dispatch MUST still happen (today's contract).
+      const callbacks = await startAndCaptureCallbacks();
+      (messageRepository.insert as jest.Mock).mockRejectedValueOnce(
+        new Error('UNIQUE constraint failed: messages.sessionId, messages.waMessageId'),
+      );
+
+      callbacks.onMessageCreate!(makeMessage({ id: 'wa-out-dup', from: 'me@c.us', to: 'peer@c.us', fromMe: true }));
+      await flush();
+
+      expect(dispatchedEvents('message.sent')).toHaveLength(1);
+      const persistedCalls = (hookManager.execute as jest.Mock).mock.calls.filter(
+        ([ev]: unknown[]) => ev === 'message:persisted',
+      );
+      expect(persistedCalls).toHaveLength(0);
+    });
+
+    it('fails open on a transient insert error: message.sent still dispatches', async () => {
+      const callbacks = await startAndCaptureCallbacks();
+      (messageRepository.insert as jest.Mock).mockRejectedValueOnce(new Error('SQLITE_BUSY: database is locked'));
+
+      callbacks.onMessageCreate!(makeMessage({ id: 'wa-out-busy', from: 'me@c.us', to: 'peer@c.us', fromMe: true }));
+      await flush();
+
+      expect(webhookService.dispatch).toHaveBeenCalledWith('sess-uuid-1', 'message.sent', expect.anything());
+    });
+
+    it('gates persist (but NOT dispatch) on STORE_EPHEMERAL_MESSAGES=false for ephemeral echoes', async () => {
+      // Unlike onMessage (which skips persist AND dispatch for ephemeral), the own-send path's dispatch
+      // is today's contract and stays; only storage honors the opt-out.
+      process.env.STORE_EPHEMERAL_MESSAGES = 'false';
+      const callbacks = await startAndCaptureCallbacks();
+      (hookManager.execute as jest.Mock).mockImplementation((_e: string, data: unknown) =>
+        Promise.resolve({ continue: true, data }),
+      );
+      (messageRepository.insert as jest.Mock).mockClear();
+
+      callbacks.onMessageCreate!(
+        makeMessage({ id: 'wa-out-eph', from: 'me@c.us', to: 'peer@c.us', fromMe: true, ephemeralDuration: 86400 }),
+      );
+      await flush();
+
+      expect(messageRepository.insert).not.toHaveBeenCalled();
+      expect(dispatchedEvents('message.sent')).toHaveLength(1);
+      delete process.env.STORE_EPHEMERAL_MESSAGES;
+    });
+
+    it('synthesizes the omitted media marker for a media echo carrying no media (wwjs shape)', async () => {
+      // wwjs' buildIncomingMessageBase never attaches media to the own-send echo; without the marker
+      // the dashboard renders an empty bubble and the by-type stats filter would skip the row.
+      const callbacks = await startAndCaptureCallbacks();
+      (hookManager.execute as jest.Mock).mockImplementation((_e: string, data: unknown) =>
+        Promise.resolve({ continue: true, data }),
+      );
+      (messageRepository.create as jest.Mock).mockClear();
+
+      callbacks.onMessageCreate!(
+        makeMessage({ id: 'wa-out-img', from: 'me@c.us', to: 'peer@c.us', fromMe: true, type: 'image', body: '' }),
+      );
+      await flush();
+
+      // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access
+      const row = (messageRepository.create as jest.Mock).mock.calls[0][0] as Partial<Message>;
+      expect(row.metadata).toEqual({ media: { mimetype: '', omitted: true } });
+    });
+
+    it('passes a Baileys-style omitted marker through unchanged', async () => {
+      const callbacks = await startAndCaptureCallbacks();
+      (hookManager.execute as jest.Mock).mockImplementation((_e: string, data: unknown) =>
+        Promise.resolve({ continue: true, data }),
+      );
+      (messageRepository.create as jest.Mock).mockClear();
+      const marker = { mimetype: 'image/png', omitted: true, sizeBytes: 1234 };
+
+      callbacks.onMessageCreate!(
+        makeMessage({
+          id: 'wa-out-img2',
+          from: 'me@c.us',
+          to: 'peer@c.us',
+          fromMe: true,
+          type: 'image',
+          body: '',
+          media: marker,
+        }),
+      );
+      await flush();
+
+      // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access
+      const row = (messageRepository.create as jest.Mock).mock.calls[0][0] as Partial<Message>;
+      expect(row.metadata).toEqual({ media: marker });
     });
 
     it('scopes the ack status UPDATE by sessionId, not just waMessageId', async () => {
@@ -1533,7 +2054,7 @@ describe('SessionService', () => {
 
       for (let i = 0; i < 3; i++) await flush();
 
-      const chains = (service as unknown as { reactionChains: Map<string, unknown> }).reactionChains;
+      const chains = (service as unknown as { messageMutationChains: Map<string, unknown> }).messageMutationChains;
       expect(chains.size).toBe(0);
     });
 
@@ -2085,6 +2606,42 @@ describe('SessionService', () => {
         expect(execute).toHaveBeenCalled();
         expect(messageRepository.save).not.toHaveBeenCalled(); // no longer the throwing path
       });
+
+      it('synthesizes the omitted media marker for media-free history rows (no empty bubbles)', async () => {
+        // History sync maps messages media-free (footprint). A media row persisted WITHOUT the marker
+        // renders as an empty bubble in the dashboard (the DB copy wins the merge over the engine
+        // placeholder) and is skipped by the by-type stats filter.
+        const callbacks = await startAndCaptureCallbacks();
+        const execute = jest.fn().mockResolvedValue({ identifiers: [] });
+        const qb = {
+          insert: jest.fn().mockReturnThis(),
+          values: jest.fn().mockReturnThis(),
+          orIgnore: jest.fn().mockReturnThis(),
+          execute,
+        };
+        (messageRepository.createQueryBuilder as jest.Mock) = jest.fn().mockReturnValue(qb);
+        (messageRepository.find as jest.Mock).mockResolvedValue([]); // nothing pre-seen
+        (messageRepository.create as jest.Mock).mockImplementation((data: Record<string, unknown>) => ({ ...data }));
+
+        callbacks.onHistoryMessages?.([
+          {
+            id: 'h-img',
+            from: 'me@c.us',
+            to: 'peer@c.us',
+            chatId: 'peer@c.us',
+            body: '',
+            type: 'image',
+            timestamp: 1,
+            fromMe: true,
+            isGroup: false,
+          },
+        ]);
+        await flush();
+
+        // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access
+        const rows = qb.values.mock.calls[0][0] as Array<Record<string, unknown>>;
+        expect(rows[0].metadata).toEqual({ media: { mimetype: '', omitted: true } });
+      });
     });
 
     // ── persistHistoryMessages STORE_EPHEMERAL_MESSAGES guard ────────
@@ -2593,6 +3150,127 @@ describe('SessionService', () => {
     });
   });
 
+  // ── onMessageEdited ───────────────────────────────────────────────
+
+  describe('onMessageEdited callback', () => {
+    const startAndCaptureEditCallback = async (): Promise<NonNullable<EngineEventCallbacks['onMessageEdited']>> => {
+      const session = createMockSession();
+      (repository.findOne as jest.Mock).mockResolvedValue(session);
+      (repository.update as jest.Mock).mockResolvedValue({ affected: 1 });
+      await service.start('sess-uuid-1');
+      const initializeCall = mockEngine.initialize.mock.calls[0] as unknown[];
+      const callbacks = initializeCall[0] as EngineEventCallbacks;
+      return callbacks.onMessageEdited!;
+    };
+
+    const edited = (body = 'New edited text') => ({
+      messageId: 'WA_MSG_EDIT_1',
+      chatId: '123@c.us',
+      body,
+      senderId: '123@c.us',
+      from: '123@c.us',
+      to: '456@c.us',
+      fromMe: false,
+      isGroup: false,
+      type: 'text' as const,
+      hasMedia: false,
+      timestamp: 1700000005,
+    });
+
+    it('persists the body before emitting the WebSocket and webhook event', async () => {
+      let releaseUpdate!: () => void;
+      (messageRepository.update as jest.Mock).mockImplementationOnce(
+        () =>
+          new Promise(resolve => {
+            releaseUpdate = () => resolve({ affected: 1 });
+          }),
+      );
+      const onMessageEdited = await startAndCaptureEditCallback();
+
+      onMessageEdited(edited());
+      await new Promise(resolve => setImmediate(resolve));
+
+      expect(messageRepository.update).toHaveBeenCalledWith(
+        { sessionId: 'sess-uuid-1', waMessageId: 'WA_MSG_EDIT_1' },
+        { body: 'New edited text' },
+      );
+      expect(eventsGateway.emitMessageEdited).not.toHaveBeenCalled();
+      expect(webhookService.dispatch).not.toHaveBeenCalledWith('sess-uuid-1', 'message.edited', expect.anything());
+
+      releaseUpdate();
+      await new Promise(resolve => setImmediate(resolve));
+
+      expect(webhookService.dispatch).toHaveBeenCalledWith(
+        'sess-uuid-1',
+        'message.edited',
+        expect.objectContaining({
+          messageId: 'WA_MSG_EDIT_1',
+          body: 'New edited text',
+        }),
+      );
+
+      expect(eventsGateway.emitMessageEdited).toHaveBeenCalledWith(
+        'sess-uuid-1',
+        expect.objectContaining({
+          messageId: 'WA_MSG_EDIT_1',
+          body: 'New edited text',
+        }),
+      );
+    });
+
+    it('serializes rapid edits so the latest body cannot be overwritten by an older slow update', async () => {
+      const releases: Array<() => void> = [];
+      (messageRepository.update as jest.Mock).mockImplementation(
+        () =>
+          new Promise(resolve => {
+            releases.push(() => resolve({ affected: 1 }));
+          }),
+      );
+      const onMessageEdited = await startAndCaptureEditCallback();
+
+      onMessageEdited(edited('first edit'));
+      onMessageEdited(edited('second edit'));
+      await new Promise(resolve => setImmediate(resolve));
+
+      expect(messageRepository.update).toHaveBeenCalledTimes(1);
+      expect(eventsGateway.emitMessageEdited).not.toHaveBeenCalled();
+
+      releases[0]();
+      await new Promise(resolve => setImmediate(resolve));
+      expect(messageRepository.update).toHaveBeenCalledTimes(2);
+      expect(eventsGateway.emitMessageEdited).toHaveBeenCalledTimes(1);
+
+      releases[1]();
+      await new Promise(resolve => setImmediate(resolve));
+      const payloads = (eventsGateway.emitMessageEdited as jest.Mock).mock.calls.map(
+        call => (call as [string, { body: string }])[1].body,
+      );
+      expect(payloads).toEqual(['first edit', 'second edit']);
+    });
+
+    it('drops an edit with no target id before any persistence or notification', async () => {
+      const onMessageEdited = await startAndCaptureEditCallback();
+
+      onMessageEdited({ ...edited(), messageId: '' });
+      await new Promise(resolve => setImmediate(resolve));
+
+      expect(messageRepository.update).not.toHaveBeenCalled();
+      expect(eventsGateway.emitMessageEdited).not.toHaveBeenCalled();
+      expect(webhookService.dispatch).not.toHaveBeenCalledWith('sess-uuid-1', 'message.edited', expect.anything());
+    });
+
+    it('still reports a real edit occurrence when the best-effort database update fails', async () => {
+      (messageRepository.update as jest.Mock).mockRejectedValueOnce(new Error('database unavailable'));
+      const onMessageEdited = await startAndCaptureEditCallback();
+
+      onMessageEdited(edited());
+      await new Promise(resolve => setImmediate(resolve));
+
+      expect(eventsGateway.emitMessageEdited).toHaveBeenCalledTimes(1);
+      expect(webhookService.dispatch).toHaveBeenCalledWith('sess-uuid-1', 'message.edited', edited());
+    });
+  });
+
   // ── getActiveCount / isActive ─────────────────────────────────────
 
   describe('getActiveCount', () => {
@@ -2661,9 +3339,12 @@ describe('SessionService', () => {
   describe('onApplicationBootstrap', () => {
     const originalFlag = process.env.AUTO_START_SESSIONS;
 
-    afterEach(() => {
+    afterEach(async () => {
       if (originalFlag === undefined) delete process.env.AUTO_START_SESSIONS;
       else process.env.AUTO_START_SESSIONS = originalFlag;
+      // Bootstrap always starts the (unref'd) liveness watchdog interval now — clear it so no
+      // timer outlives the test.
+      await service.onModuleDestroy();
     });
 
     it('does nothing when AUTO_START_SESSIONS is not enabled', async () => {

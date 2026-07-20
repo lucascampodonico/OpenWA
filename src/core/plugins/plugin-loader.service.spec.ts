@@ -115,7 +115,7 @@ describe('dispatchConversationMedia', () => {
 
 import * as fs from 'fs';
 import * as os from 'os';
-import { PluginLoaderService } from './plugin-loader.service';
+import { PluginLoaderService, seedConfigDefaults } from './plugin-loader.service';
 import { ConfigService } from '@nestjs/config';
 import { ModuleRef } from '@nestjs/core';
 import { HookManager } from '../hooks';
@@ -410,6 +410,145 @@ describe('PluginLoaderService — skips dot-prefixed directories on load (crash-
   });
 });
 
+describe('PluginLoaderService — prunes registry ghosts of removed built-ins', () => {
+  let tmpDir: string;
+  let pluginsDir: string;
+  let loader: PluginLoaderService;
+  let storage: PluginStorageService;
+
+  beforeEach(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'owa-ghosts-'));
+    pluginsDir = path.join(tmpDir, 'plugins');
+    fs.mkdirSync(pluginsDir, { recursive: true });
+    const config = {
+      get: (k: string) => (k === 'plugins.dir' ? pluginsDir : k === 'dataDir' ? tmpDir : undefined),
+    } as unknown as ConfigService;
+    storage = new PluginStorageService(config);
+    loader = new PluginLoaderService(config, new HookManager(), storage, {} as unknown as ModuleRef);
+  });
+  afterEach(() => fs.rmSync(tmpDir, { recursive: true, force: true }));
+
+  const seedGhost = (id: string): void => {
+    // A leftover directory with no manifest (code deleted) + a stale registry entry still claiming
+    // the plugin is installed — the ghost state upgrades from <=0.6 are in.
+    fs.mkdirSync(path.join(pluginsDir, id), { recursive: true });
+    storage.setPluginEntry({
+      id,
+      type: 'extension',
+      name: id,
+      version: '1.0.0',
+      status: 'installed',
+      config: {},
+      builtIn: true,
+      installedAt: new Date(),
+      updatedAt: new Date(),
+    } as never);
+  };
+
+  it('prunes registry entries of legacy removed built-ins (auto-reply, translation) with no manifest', () => {
+    seedGhost('auto-reply');
+    seedGhost('translation');
+
+    loader.onModuleInit();
+
+    expect(storage.getPluginEntry('auto-reply')).toBeUndefined();
+    expect(storage.getPluginEntry('translation')).toBeUndefined();
+  });
+
+  it('keeps a manifest-less NON-legacy plugin entry (config survives an unreadable dir)', () => {
+    seedGhost('some-other-plugin');
+
+    loader.onModuleInit();
+
+    expect(storage.getPluginEntry('some-other-plugin')).toBeDefined();
+  });
+});
+
+describe('PluginLoaderService — loadPlugin seeds configSchema defaults', () => {
+  let tmpDir: string;
+  let pluginsDir: string;
+  let loader: PluginLoaderService;
+  let storage: PluginStorageService;
+
+  beforeEach(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'owa-seed-'));
+    pluginsDir = path.join(tmpDir, 'plugins');
+    fs.mkdirSync(pluginsDir, { recursive: true });
+    const config = {
+      get: (k: string) => (k === 'plugins.dir' ? pluginsDir : k === 'dataDir' ? tmpDir : undefined),
+    } as unknown as ConfigService;
+    storage = new PluginStorageService(config);
+    loader = new PluginLoaderService(config, new HookManager(), storage, {} as unknown as ModuleRef);
+  });
+  afterEach(() => fs.rmSync(tmpDir, { recursive: true, force: true }));
+
+  it('seeds defaults into the runtime instance and the persisted registry entry at load', () => {
+    const dir = path.join(pluginsDir, 'seeded-plg');
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(
+      path.join(dir, 'manifest.json'),
+      JSON.stringify({
+        id: 'seeded-plg',
+        name: 'seeded-plg',
+        version: '1.0.0',
+        type: 'extension',
+        main: 'index.js',
+        configSchema: {
+          type: 'object',
+          properties: { timezone: { type: 'string', default: 'UTC' } },
+        },
+      }),
+    );
+    fs.writeFileSync(path.join(dir, 'index.js'), 'module.exports = class {};');
+
+    loader.onModuleInit();
+
+    expect(loader.getPlugin('seeded-plg')?.config).toEqual({ timezone: 'UTC' });
+    expect(storage.getPluginEntry('seeded-plg')?.config).toEqual({ timezone: 'UTC' });
+  });
+});
+
+describe('seedConfigDefaults', () => {
+  const schema = {
+    type: 'object' as const,
+    properties: {
+      timezone: { type: 'string' as const, default: 'UTC' },
+      cooldownSec: { type: 'number' as const, default: 3600 },
+      schedule: { type: 'object' as const, required: true }, // no default — must stay absent
+      rules: { type: 'array' as const, default: [{ q: 'hi', a: 'hello' }] },
+    },
+  };
+
+  it('seeds schema defaults for absent keys only', () => {
+    const out = seedConfigDefaults(schema, { timezone: 'Asia/Jakarta' });
+    expect(out).toEqual({
+      timezone: 'Asia/Jakarta', // explicit value wins
+      cooldownSec: 3600,
+      rules: [{ q: 'hi', a: 'hello' }],
+    });
+    expect(out).not.toHaveProperty('schedule'); // required-without-default is never invented
+  });
+
+  it('returns the input unchanged when nothing is missing (and no schema)', () => {
+    const config = { timezone: 'UTC', cooldownSec: 1, rules: [] };
+    expect(seedConfigDefaults(schema, config)).toBe(config);
+    expect(seedConfigDefaults(undefined, config)).toBe(config);
+  });
+
+  it('deep-clones object/array defaults so runtime and persisted copies cannot share references', () => {
+    const out = seedConfigDefaults(schema, {});
+    const again = seedConfigDefaults(schema, {});
+    expect(out.rules).toEqual(again.rules);
+    expect(out.rules).not.toBe(again.rules);
+    expect((out.rules as unknown[])[0]).not.toBe((again.rules as unknown[])[0]);
+  });
+
+  it('null is an explicit value and is not overwritten by the default', () => {
+    const out = seedConfigDefaults(schema, { timezone: null });
+    expect(out.timezone).toBeNull();
+  });
+});
+
 describe('PluginLoaderService — enable concurrency', () => {
   let tmpDir: string;
   let loader: PluginLoaderService;
@@ -552,7 +691,11 @@ describe('PluginLoaderService.dispatchWebhookForInstance config delivery', () =>
       sandboxHosts: Map<string, { dispatchWebhook: jest.Mock }>;
     };
     internals.plugins.set('chatwoot-adapter', {
-      manifest: { id: 'chatwoot-adapter', sessionScoped: true },
+      manifest: {
+        id: 'chatwoot-adapter',
+        sessionScoped: true,
+        ingress: [{ route: 'chatwoot', signature: { scheme: 'none' } }],
+      },
       config: { baseUrl: 'base', accountId: 1 },
       sessionConfig: { 'sess-1': { baseUrl: 'https://tenant1' } },
     });
@@ -563,6 +706,7 @@ describe('PluginLoaderService.dispatchWebhookForInstance config delivery', () =>
       pluginId: 'chatwoot-adapter',
       instanceId: 'acct1',
       route: 'chatwoot',
+      method: 'PATCH',
       deliveryId: 'd1',
       sessionId: 'sess-1',
       payload: { headers: {}, query: {}, body: '', rawBody: '' },
@@ -572,7 +716,11 @@ describe('PluginLoaderService.dispatchWebhookForInstance config delivery', () =>
     expect(dispatchWebhook).toHaveBeenCalledTimes(1);
     // Session override (tenant1) merged over the base — this is what makes an instance multi-tenant.
     expect(dispatchWebhook).toHaveBeenCalledWith(
-      expect.objectContaining({ config: { baseUrl: 'https://tenant1', accountId: 1 } }),
+      expect.objectContaining({
+        config: { baseUrl: 'https://tenant1', accountId: 1 },
+        method: 'PATCH',
+        verified: false,
+      }),
     );
   });
 });
