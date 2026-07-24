@@ -2240,6 +2240,7 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
                     timestamp: Number(msg.timestamp || Date.now()),
                     fromMe: Boolean(msg.fromMe),
                     isGroup: String(msg.from || '').endsWith('@g.us'),
+                    kind: chatKind(chatIdStr),
                   };
                   // Try to resolve group participant ids (@lid) into contact ids (@c.us).
                   try {
