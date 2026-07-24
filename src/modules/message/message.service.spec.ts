@@ -29,6 +29,7 @@ function createMockEngine() {
     reactToMessage: jest.fn().mockResolvedValue(undefined),
     getMessageReactions: jest.fn().mockResolvedValue([]),
     deleteMessage: jest.fn().mockResolvedValue(undefined),
+    editMessage: jest.fn().mockResolvedValue(mockEngineResult),
     getChatHistory: jest.fn().mockResolvedValue([]),
     sendChatState: jest.fn().mockResolvedValue(undefined),
   };
@@ -68,6 +69,7 @@ describe('MessageService', () => {
     sessionService = {
       getEngine: jest.fn().mockReturnValue(mockEngine),
       findOne: jest.fn().mockResolvedValue({ id: 'sess-1', phone: '628123456789' }),
+      recordOutboundMessageEdit: jest.fn().mockResolvedValue(undefined),
     };
 
     hookManager = {
@@ -992,6 +994,78 @@ describe('MessageService', () => {
       });
 
       expect(mockEngine.deleteMessage).toHaveBeenCalledWith('test@c.us', 'wa-msg-1', false);
+    });
+  });
+
+  describe('editMessage', () => {
+    it('edits via the engine, delegates the stored-row update, and returns the engine result', async () => {
+      const res = await service.editMessage('sess-1', { chatId: 'test@c.us', messageId: 'wa-msg-1', body: 'edited' });
+
+      expect(mockEngine.editMessage).toHaveBeenCalledWith('test@c.us', 'wa-msg-1', 'edited');
+      // Persistence is delegated to the session's per-message mutation queue (serialized with the
+      // inbound edit path) — the service no longer writes the row directly.
+      expect(sessionService.recordOutboundMessageEdit).toHaveBeenCalledWith('sess-1', 'wa-msg-1', 'edited');
+      expect(repository.update).not.toHaveBeenCalled();
+      expect(res).toEqual({ messageId: 'wa-msg-1', timestamp: 1706868000 });
+    });
+
+    it('still succeeds when the delegated stored-row update is a no-op (the engine edit already happened)', async () => {
+      // recordOutboundMessageEdit is best-effort by contract (never rejects); a missing row or a
+      // failed write is logged inside the session service, not surfaced here.
+      const res = await service.editMessage('sess-1', { chatId: 'test@c.us', messageId: 'wa-msg-1', body: 'edited' });
+
+      expect(res).toEqual({ messageId: 'wa-msg-1', timestamp: 1706868000 });
+    });
+
+    it('propagates the engine not-found error as-is (MessageNotFoundError → 404)', async () => {
+      mockEngine.editMessage.mockRejectedValueOnce(new NotFoundException('Message wa-msg-1 not found'));
+      await expect(
+        service.editMessage('sess-1', { chatId: 'test@c.us', messageId: 'wa-msg-1', body: 'edited' }),
+      ).rejects.toBeInstanceOf(NotFoundException);
+      expect(sessionService.recordOutboundMessageEdit).not.toHaveBeenCalled();
+    });
+
+    it('throws BadRequestException when the session is not started', async () => {
+      (sessionService.getEngine as jest.Mock).mockReturnValue(undefined);
+      await expect(
+        service.editMessage('sess-1', { chatId: 'test@c.us', messageId: 'wa-msg-1', body: 'edited' }),
+      ).rejects.toBeInstanceOf(BadRequestException);
+      expect(mockEngine.editMessage).not.toHaveBeenCalled();
+    });
+
+    // An edit replaces the text the recipient sees, so it belongs to the same moderation
+    // chokepoint as every other sender rather than going out unseen by plugins.
+    it('runs the message:sending gate tagged as an edit', async () => {
+      await service.editMessage('sess-1', { chatId: 'test@c.us', messageId: 'wa-msg-1', body: 'edited' });
+
+      expect(hookManager.execute).toHaveBeenCalledWith(
+        'message:sending',
+        expect.objectContaining({ type: 'edit' }),
+        expect.any(Object),
+      );
+    });
+
+    it('lets a plugin block an edit before the engine is called', async () => {
+      (hookManager.execute as jest.Mock).mockResolvedValueOnce({ continue: false, data: {} });
+
+      await expect(
+        service.editMessage('sess-1', { chatId: 'test@c.us', messageId: 'wa-msg-1', body: 'edited' }),
+      ).rejects.toThrow('Message sending blocked by plugin');
+
+      expect(mockEngine.editMessage).not.toHaveBeenCalled();
+      expect(sessionService.recordOutboundMessageEdit).not.toHaveBeenCalled();
+    });
+
+    it('threads a plugin-rewritten edit body through to the engine and the stored row', async () => {
+      (hookManager.execute as jest.Mock).mockResolvedValueOnce({
+        continue: true,
+        data: { input: { chatId: 'test@c.us', messageId: 'wa-msg-1', body: 'redacted' } },
+      });
+
+      await service.editMessage('sess-1', { chatId: 'test@c.us', messageId: 'wa-msg-1', body: 'secret' });
+
+      expect(mockEngine.editMessage).toHaveBeenCalledWith('test@c.us', 'wa-msg-1', 'redacted');
+      expect(sessionService.recordOutboundMessageEdit).toHaveBeenCalledWith('sess-1', 'wa-msg-1', 'redacted');
     });
   });
 

@@ -84,6 +84,7 @@
     "loadingChats": "చాట్‌లను లోడ్ చేస్తోంది...",
     "empty": "చాట్‌లు లేవు",
     "noMessageYet": "ఇంకా సందేశాలు లేవు",
+    "unreadBadge": "{{count}} చదవని సందేశాలు",
     "loadingMessages": "సందేశాలను లోడ్ చేస్తోంది...",
     "noMessagesInChat": "ఇంకా సందేశాలు లేవు. ప్రారంభించడానికి మొదటి సందేశాన్ని పంపండి!",
     "downloadDocument": "డాక్యుమెంట్‌ను డౌన్‌లోడ్ చేయి",
@@ -110,6 +111,27 @@
     "deleteConfirm": "ఈ సందేశాన్ని అందరి కోసం తొలగించాలా?",
     "messageDeleted": "🚫 ఈ సందేశం తొలగించబడింది",
     "messageMasked": "🔒 లింక్ చేసిన పరికరాల్లో WhatsApp దీన్ని దాచింది — మీ ప్రధాన ఫోన్‌లో చూడండి",
+    "kind": {
+      "group": "సమూహం",
+      "channel": "ఛానెల్",
+      "status": "స్థితి",
+      "broadcast": "ప్రసారం"
+    },
+    "tab": {
+      "chats": "చాట్‌లు",
+      "channels": "ఛానెల్‌లు",
+      "status": "స్థితి"
+    },
+    "status": {
+      "placeholderTitle": "స్థితి",
+      "placeholderDesc": "Per-contact status updates arrive in a future update."
+    },
+    "channels": {
+      "notSupported": "Channels are not supported on the Baileys engine.",
+      "empty": "You are not subscribed to any channels yet.",
+      "notReady": "సెషన్ ఇంకా సిద్ధంగా లేదు.",
+      "subscribers": "{{count}} సబ్‌స్క్రైబర్‌లు"
+    },
     "errors": {
       "loadSessions": "సెషన్లను లోడ్ చేయడం విఫలమైంది",
       "loadChats": "చాట్‌లను లోడ్ చేయడం విఫలమైంది",
@@ -154,7 +176,8 @@
       "sessionId": "సెషన్ ID",
       "phone": "ఫోన్ నంబర్",
       "status": "స్థితి",
-      "lastActive": "చివరిసారి యాక్టివ్"
+      "lastActive": "చివరిసారి యాక్టివ్",
+      "actions": "చర్యలు"
     },
     "noSessions": "ఎలాంటి సెషన్లు కనుగొనబడలేదు. ప్రారంభించడానికి ఒకదాన్ని సృష్టించండి.",
     "view": "చూడు",
@@ -764,7 +787,11 @@
       "installed": "ప్లగిన్ ఇన్‌స్టాల్ చేయబడింది",
       "installFailed": "ఇన్‌స్టాల్ విఫలమైంది",
       "uninstalled": "ప్లగిన్ అన్‌ఇన్‌స్టాల్ చేయబడింది",
-      "uninstallFailed": "అన్‌ఇన్‌స్టాల్ విఫలమైంది"
+      "uninstallFailed": "అన్‌ఇన్‌స్టాల్ విఫలమైంది",
+      "enableFailedTitle": "ప్రారంభించడం విఫలమైంది",
+      "disableFailedTitle": "నిలిపివేయడం విఫలమైంది",
+      "configRequiredTitle": "కాన్ఫిగరేషన్ అవసరం",
+      "configRequiredDesc": "ప్రారంభించే ముందు అవసరమైన ఫీల్డ్‌లను పూరించండి: {{fields}}"
     },
     "sessions": {
       "activationTitle": "దీని కోసం రన్ చేయండి",

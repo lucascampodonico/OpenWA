@@ -65,6 +65,41 @@
   box-shadow: 0 0 0 3px rgba(34, 197, 94, 0.1);
 }
 
+/* Chats / Channels / Status segmented control */
+.chats-page .chats-tabs {
+  display: flex;
+  gap: 4px;
+  padding: 4px;
+  background: var(--bg-light);
+  border: 1px solid var(--border);
+  border-radius: var(--radius, 8px);
+}
+
+.chats-page .chats-tab {
+  flex: 1;
+  padding: 6px 8px;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+  font-size: 0.8125rem;
+  transition:
+    background 0.15s ease,
+    color 0.15s ease;
+}
+
+.chats-page .chats-tab:hover {
+  color: var(--text-primary);
+}
+
+.chats-page .chats-tab.active {
+  background: var(--bg-card);
+  color: var(--text-primary);
+  font-weight: 600;
+  box-shadow: var(--shadow-sm, 0 1px 2px 0 rgba(0, 0, 0, 0.05));
+}
+
 .chats-page .chat-search-input {
   display: flex;
   align-items: center;
@@ -181,8 +216,9 @@
 
 .chats-page .chat-item-top {
   display: flex;
-  justify-content: space-between;
+  justify-content: flex-start;
   align-items: baseline;
+  gap: 6px;
 }
 
 .chats-page .chat-item-name {
@@ -198,6 +234,7 @@
   font-size: 0.75rem;
   color: var(--text-muted);
   flex-shrink: 0;
+  margin-inline-start: auto;
 }
 
 .chats-page .chat-item-bottom {
@@ -221,15 +258,29 @@
 }
 
 .chats-page .chat-unread-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  box-sizing: border-box;
+  height: 20px;
+  min-width: 20px;
+  padding: 0 6px;
   background: var(--primary);
   color: white;
   font-size: 0.75rem;
   font-weight: 700;
-  padding: 0.125rem 0.375rem;
-  border-radius: 10px;
-  min-width: 14px;
-  text-align: center;
+  line-height: 1;
+  border-radius: 999px;
   box-shadow: 0 2px 4px rgba(34, 197, 94, 0.3);
+}
+
+.chats-page .chat-kind-badge {
+  font-size: 0.7rem;
+  padding: 0 6px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  color: var(--text-secondary);
+  white-space: nowrap;
 }
 
 /* =============================================================================
@@ -1143,4 +1194,58 @@
 /* Clickable photo cue. */
 .chats-page .chat-image-media {
   cursor: zoom-in;
+}
+
+/* =============================================================================
+   CHANNELS: read-only post pane
+   ============================================================================= */
+.chats-page .channel-room {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+}
+
+.chats-page .chats-room-header {
+  height: 70px;
+  background: var(--bg-white);
+  border-bottom: 1px solid var(--border);
+  padding: 0 1.5rem;
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  box-sizing: border-box;
+  color: var(--text-secondary);
+}
+
+.chats-page .chats-room-header h2 {
+  font-size: 1rem;
+  font-weight: 600;
+  color: var(--text-primary);
+  text-transform: none;
+  letter-spacing: normal;
+  margin: 0;
+}
+
+.chats-page .messages-list {
+  flex: 1;
+  padding: 1.5rem;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+  align-items: flex-start;
+}
+
+.chats-page .messages-list .message-bubble {
+  max-width: 480px;
+}
+
+.chats-page .channel-media {
+  max-width: 100%;
+  max-height: 320px;
+  border-radius: 8px;
+  display: block;
+  margin-bottom: 0.5rem;
+  object-fit: cover;
 }

@@ -1,6 +1,15 @@
 import { EventEmitter } from 'events';
 import { InternalServerErrorException } from '@nestjs/common';
-import { Client, LocalAuth, MessageMedia, MessageTypes, WAState, type Message } from 'whatsapp-web.js';
+import {
+  Client,
+  LocalAuth,
+  MessageMedia,
+  MessageTypes,
+  WAState,
+  type Call,
+  type GroupNotification,
+  type Message,
+} from 'whatsapp-web.js';
 import * as qrcode from 'qrcode';
 import * as path from 'path';
 import * as fs from 'fs';
@@ -36,15 +45,21 @@ import {
   RevokedMessage,
   EditedMessage,
   ReactionEvent,
+  GroupEvent,
+  IncomingCallEvent,
 } from '../interfaces/whatsapp-engine.interface';
 import { resolveWebVersionPin } from '../wa-web-version';
-import { isChannelJid, userPart } from '../identity/wa-id';
+import { chatKind, isChannelJid, userPart } from '../identity/wa-id';
 import { LidMappingStore } from '../identity/lid-mapping-store.service';
 import { ChatLabelsUnsupportedError } from '../../common/errors/chat-labels-unsupported.error';
 import { createLogger } from '../../common/services/logger.service';
 import { EngineNotReadyError } from '../../common/errors/engine-not-ready.error';
 import { EngineNotSupportedError } from '../../common/errors/engine-not-supported.error';
 import { MessageNotFoundError } from '../../common/errors/message-not-found.error';
+import { CallNotFoundError } from '../../common/errors/call-not-found.error';
+import { EngineRefusedError } from '../../common/errors/engine-refused.error';
+import { InvalidInviteCodeError } from '../../common/errors/invalid-invite-code.error';
+import { GroupNotFoundError } from '../../common/errors/group-not-found.error';
 import { ChannelNotFoundError } from '../../common/errors/channel-not-found.error';
 import { ChannelMediaNotSupportedError } from '../../common/errors/channel-media-not-supported.error';
 import { loadRemoteMediaBuffer } from '../../common/media/load-remote-media';
@@ -81,6 +96,66 @@ export function wwebjsAckToDeliveryStatus(ack: number): DeliveryStatus {
   if (ack === 2) return 'delivered';
   if (ack === 1) return 'sent';
   return 'pending';
+}
+
+/**
+ * Interpret the on/off value a group settings notification carries in `body` ('on'/'true' → true,
+ * 'off'/'false' → false). Undefined when the body holds anything else (e.g. a rendered template
+ * string), in which case the caller emits the update without that change rather than guess.
+ */
+function parseWwebjsOnOff(body: string): boolean | undefined {
+  const v = body.trim().toLowerCase();
+  if (v === 'on' || v === 'true') return true;
+  if (v === 'off' || v === 'false') return false;
+  return undefined;
+}
+
+/**
+ * Reduce a `group_update` GroupNotification to the neutral `changes` delta. `subject`/`description`
+ * carry the new value in `body`; `announce`/`restrict` encode the new setting as on/off text (the
+ * latter maps to the neutral `locked`). Anything uninterpretable — a `picture` change, or a WA Web
+ * build that stops putting the value in `body` — yields an empty delta: the occurrence is still
+ * emitted, just without fields we would be guessing at. Compared as strings because the runtime
+ * gp2 subtypes can exceed the GroupNotificationTypes enum (e.g. a 'locked' rename of 'restrict').
+ */
+export function wwebjsGroupUpdateChanges(notification: GroupNotification): NonNullable<GroupEvent['changes']> {
+  const body = typeof notification.body === 'string' ? notification.body : '';
+  switch (String(notification.type)) {
+    case 'subject':
+      return { subject: body };
+    case 'description':
+      return { description: body };
+    case 'announce': {
+      const on = parseWwebjsOnOff(body);
+      return on === undefined ? {} : { announce: on };
+    }
+    case 'restrict':
+    case 'locked': {
+      const on = parseWwebjsOnOff(body);
+      return on === undefined ? {} : { locked: on };
+    }
+    default:
+      return {};
+  }
+}
+
+/**
+ * A GroupNotification's `recipientIds` are assigned straight through from the wire
+ * (`this.recipientIds = data.recipients`), outside upstream's id normalization — so on a WA Web
+ * build that renamed `_serialized` to `$1` (#747) an entry can arrive as a raw id object instead
+ * of a string. Coerce both shapes to the neutral (already @c.us/@g.us) string form; entries that
+ * resolve to nothing are dropped rather than forwarded as "undefined".
+ */
+export function wwebjsGroupRecipientIds(notification: GroupNotification): string[] {
+  const raw = notification.recipientIds as unknown;
+  if (!Array.isArray(raw)) return [];
+  return raw
+    .map(entry => {
+      if (typeof entry === 'string') return entry;
+      const wid = entry as SerializedWid | undefined;
+      return wid?._serialized ?? wid?.$1 ?? '';
+    })
+    .filter(id => id.length > 0);
 }
 
 /**
@@ -268,6 +343,12 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
   private readyReconcileTimer: ReturnType<typeof setTimeout> | null = null;
   private readyReconcileStartedAt = 0;
   private readyReconcileProbeInFlight = false;
+  /** How long a received call's handle stays rejectable. Calls ring for roughly a minute, so
+   *  two minutes covers the ringing window with margin without pinning dead calls for long. */
+  private static readonly LIVE_CALL_TTL_MS = 2 * 60_000;
+  /** Live incoming calls by call id. The wwebjs `Call` object is only usable while the call is
+   *  live, so it must be cached at event time for a later rejectCall() to act on. */
+  private readonly liveCalls = new Map<string, { call: Call; expiresAt: number }>();
   // Guards the stuck-auth self-heal so it runs at most once per engine: a re-paired session that still
   // can't reach readiness fails terminally instead of looping QR -> timeout -> clear forever.
   private stuckAuthRecoveryAttempted = false;
@@ -392,15 +473,17 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
 
     try {
       // Build puppeteer args, including proxy if configured
-      const puppeteerArgs = this.config.puppeteer?.args || [
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
-        '--disable-dev-shm-usage',
-        '--disable-accelerated-2d-canvas',
-        '--no-first-run',
-        '--no-zygote',
-        '--disable-gpu',
-      ];
+      const puppeteerArgs = this.config.puppeteer?.args
+        ? [...this.config.puppeteer.args]
+        : [
+            '--no-sandbox',
+            '--disable-setuid-sandbox',
+            '--disable-dev-shm-usage',
+            '--disable-accelerated-2d-canvas',
+            '--no-first-run',
+            '--no-zygote',
+            '--disable-gpu',
+          ];
 
       // Add proxy configuration if provided — but only when the URL parses to a supported scheme, so
       // a malformed/stored proxy value can't break the Chromium launch or smuggle a non-proxy scheme.
@@ -807,6 +890,12 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
       }
     });
 
+    this.client.on('group_join', notification => this.handleGroupNotification('join', notification));
+    this.client.on('group_leave', notification => this.handleGroupNotification('leave', notification));
+    this.client.on('group_update', notification => this.handleGroupNotification('update', notification));
+
+    this.client.on('call', call => this.handleIncomingCall(call));
+
     this.client.on('disconnected', reason => {
       this.clearReadyReconcile();
       this.setStatus(EngineStatus.DISCONNECTED);
@@ -821,6 +910,118 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
       // through onError (FAILED, no reconnect) rather than onDisconnected (reconnect).
       this.callbacks.onError?.(message ? `Authentication failed: ${message}` : 'Authentication failed');
     });
+  }
+
+  /**
+   * Map a whatsapp-web.js GroupNotification (`group_join` / `group_leave` / `group_update`) to the
+   * neutral GroupEvent and forward it. wwebjs ids are already in the neutral dialect (@c.us/@g.us),
+   * so no jid translation is needed here. The try/catch mirrors message_edit: a malformed
+   * notification is logged and dropped, never thrown back into the client's emitter.
+   */
+  private handleGroupNotification(kind: GroupEvent['kind'], notification: GroupNotification): void {
+    try {
+      // A notification without a chat id carries no usable target — drop it before payload building.
+      if (!notification.chatId) {
+        return;
+      }
+      const payload: GroupEvent = {
+        kind,
+        groupId: notification.chatId,
+        actorId: notification.author || undefined,
+        participantIds: wwebjsGroupRecipientIds(notification),
+        // The notification's own timestamp IS the occurrence time (unlike message_edit, where
+        // wwebjs keeps the original creation time). Fall back to receipt time when absent.
+        timestamp:
+          typeof notification.timestamp === 'number' && notification.timestamp > 0
+            ? Math.floor(notification.timestamp)
+            : Math.floor(Date.now() / 1000),
+      };
+      if (kind === 'update') {
+        // Join/leave carry no metadata delta. An update whose subtype/body cannot be interpreted
+        // still emits with empty changes rather than being dropped silently.
+        payload.changes = wwebjsGroupUpdateChanges(notification);
+      }
+      this.callbacks.onGroupEvent?.(payload);
+    } catch (error) {
+      this.logger.error(`Error processing group_${kind} notification`, String(error));
+    }
+  }
+
+  /**
+   * Map a whatsapp-web.js `Call` (client `call` event) to the neutral IncomingCallEvent and cache
+   * the live Call so rejectCall() can act on it later — the Call object is only usable while the
+   * call is live. Own-account calls (fromMe) are skipped: they are outgoing, not incoming. wwebjs
+   * ids are already neutral (@c.us), so no jid translation is needed. The try/catch mirrors
+   * message_edit: a malformed call is logged and dropped, never thrown back into the emitter.
+   */
+  private handleIncomingCall(call: Call): void {
+    try {
+      // Symmetry with the other client-event handlers (qr/authenticated): a call landing during or
+      // after teardown is dropped. A malformed call without the id/from rejectCall() later depends
+      // on is dropped too — never cached, never emitted.
+      if (this.tearingDown || !call?.id || !call.from) {
+        return;
+      }
+      if (call.fromMe) {
+        return;
+      }
+      // whatsapp-web.js fires this handler from a patched `internalCallMap.set()`, which runs on
+      // every write to that map — including updates to a call already ringing — so the same call id
+      // can arrive more than once. Cache first and emit only for an id not already live, otherwise
+      // one call surfaces as several `call.received` events.
+      if (!this.cacheLiveCall(call.id, call)) {
+        return;
+      }
+      const payload: IncomingCallEvent = {
+        callId: call.id,
+        from: call.from ?? '',
+        isVideo: call.isVideo === true,
+        isGroup: call.isGroup === true,
+        timestamp:
+          typeof call.timestamp === 'number' && call.timestamp > 0
+            ? Math.floor(call.timestamp)
+            : Math.floor(Date.now() / 1000),
+      };
+      this.callbacks.onCall?.(payload);
+    } catch (error) {
+      this.logger.error('Error processing call event', String(error));
+    }
+  }
+
+  /**
+   * Cache a live call for a later rejectCall(). Lazy expiry: inserting a new call drops
+   * already-expired entries, so a session that receives calls but never rejects them can't grow
+   * the map without bound; an entry that never sees another call is tiny and is dropped on
+   * teardown (beginClientTeardown) or at the next call. No per-entry timer to clean up.
+   *
+   * Returns true when `callId` was not already ringing, which is what makes `call.received` fire
+   * once per call rather than once per upstream map write. A repeat write still refreshes the
+   * entry, so a long-ringing call stays rejectable for a full TTL from the most recent signal.
+   */
+  private cacheLiveCall(callId: string, call: Call): boolean {
+    const now = Date.now();
+    for (const [id, entry] of this.liveCalls) {
+      if (entry.expiresAt <= now) {
+        this.liveCalls.delete(id);
+      }
+    }
+    const isNewCall = !this.liveCalls.has(callId);
+    this.liveCalls.set(callId, { call, expiresAt: now + WhatsAppWebJsAdapter.LIVE_CALL_TTL_MS });
+    return isNewCall;
+  }
+
+  /**
+   * Reject a currently-ringing call. The entry is evicted on ANY attempt (a rejected/ended call
+   * will not become rejectable again); an unknown id or an expired entry maps to CallNotFoundError
+   * (HTTP 404). A failure of the library's reject() itself propagates as-is.
+   */
+  async rejectCall(callId: string): Promise<void> {
+    const entry = this.liveCalls.get(callId);
+    this.liveCalls.delete(callId);
+    if (!entry || entry.expiresAt <= Date.now()) {
+      throw new CallNotFoundError(callId);
+    }
+    await entry.call.reject();
   }
 
   /**
@@ -1089,6 +1290,9 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
 
   private beginClientTeardown(): Client | null {
     this.tearingDown = true;
+    // Any cached call handle is dead once the client goes away — drop them all so a later
+    // rejectCall() reports not-found instead of acting on a destroyed page.
+    this.liveCalls.clear();
     const client = this.client;
     if (!client) return null;
 
@@ -1308,6 +1512,13 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
       if (fresh === to) {
         throw err;
       }
+      // The first send threw, but wwjs can throw after the message is already on the wire — so this
+      // retry may produce a duplicate. Log it: without this the second copy is invisible.
+      this.logger.warn('Send retried against a re-resolved id after "No LID for user"; may duplicate', {
+        chatId,
+        staleId: to,
+        freshId: fresh,
+      });
       return send(fresh);
     }
   }
@@ -1346,22 +1557,8 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
     this.ensureReady();
     this.ensureNotChannelRecipient(chatId);
 
-    let messageMedia: MessageMedia;
-
-    if (typeof media.data === 'string') {
-      if (isHttpUrl(media.data)) {
-        // URL
-        messageMedia = await loadRemoteMedia(media.data);
-      } else {
-        // Base64
-        messageMedia = new MessageMedia(media.mimetype, media.data, media.filename);
-      }
-    } else {
-      // Buffer
-      messageMedia = new MessageMedia(media.mimetype, media.data.toString('base64'), media.filename);
-    }
-
     // Build the media once (a remote URL is fetched here); sendResolved may retry the send itself.
+    const messageMedia = await this.toMessageMedia(media);
     const msg = await this.sendResolved(chatId, to =>
       this.client!.sendMessage(to, messageMedia, {
         caption: media.caption,
@@ -1653,6 +1850,9 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
         participants,
         isReadOnly: Boolean(groupChat.isReadOnly),
         isAnnounce: Boolean(groupChat.isAnnounce),
+        announce: groupChat.groupMetadata?.announce,
+        locked: groupChat.groupMetadata?.restrict,
+        ephemeralSeconds: groupChat.groupMetadata?.ephemeralDuration,
         linkedParentJID: extractLinkedParentJID(groupChat.groupMetadata),
       };
     } catch (error) {
@@ -2284,11 +2484,12 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
       // enrichment as live incoming messages (#223). The mapper defaults chatId to
       // msg.from, which is wrong here (history includes fromMe messages whose `from`
       // is our own number), so override it to the requested chat and recompute the
-      // chatId-derived flags (isGroup, isStatusBroadcast) from the real chat.
+      // chatId-derived flags (isGroup, isStatusBroadcast, kind) from the real chat.
       const out = buildIncomingMessageBase(msg);
       out.chatId = chatId;
       out.isGroup = chatId.endsWith('@g.us');
       out.isStatusBroadcast = chatId === 'status@broadcast';
+      out.kind = chatKind(chatId);
       const call = extractWwebjsCall(msg);
       if (call) out.call = call;
       // Mirror the live handler's location + quoted-message enrichment so history renders identically —
@@ -2340,6 +2541,36 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
     this.logger.log(`Deleted message ${messageId} from chat ${chatId} (forEveryone: ${forEveryone})`);
   }
 
+  // Edit Message
+  async editMessage(chatId: string, messageId: string, body: string): Promise<MessageResult> {
+    this.ensureReady();
+    // Same lookup window as react/delete: fetchMessages sees only the 100 most recent messages.
+    // NOTE: do NOT resolve chatId to @lid here — edit operates on the found message's own key, not
+    // this chatId, so LID-resolving the lookup would miss a message stored under the pre-migration
+    // @c.us chat (#583 R1 review).
+    const chat = await this.client!.getChatById(chatId);
+    // getChatById RESOLVES undefined for an unknown chat (wwebjs does not throw) — that is the same
+    // client-facing outcome as a message outside the fetch window, not a TypeError (-> 500).
+    if (!chat) {
+      throw new MessageNotFoundError(messageId, chatId);
+    }
+    const messages = await chat.fetchMessages({ limit: 100 });
+    const message = messages.find(m => m.id._serialized === messageId || m.id.id === messageId);
+    if (!message) {
+      throw new MessageNotFoundError(messageId, chatId);
+    }
+    const edited = await message.edit(body);
+    if (!edited) {
+      // wwebjs RESOLVES null (instead of throwing) when the page-side edit is refused — only the
+      // account's own text messages are editable; surface the refusal, not a phantom success.
+      throw new EngineRefusedError(
+        `the edit of message ${messageId} was rejected — only the account's own text messages can be edited`,
+      );
+    }
+    this.logger.log(`Edited message ${messageId} in chat ${chatId}`);
+    return this.toMessageResult(edited);
+  }
+
   // Get Profile Picture
   async getProfilePicture(contactId: string): Promise<string | null> {
     this.ensureReady();
@@ -2369,6 +2600,35 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
     this.logger.log(`Unblocked contact ${contactId}`);
   }
 
+  // ========== Profile (own account) ==========
+
+  async setProfileName(name: string): Promise<void> {
+    this.ensureReady();
+    // setDisplayName resolves false (rather than throwing) when WhatsApp refuses the rename.
+    const ok = await this.client!.setDisplayName(name);
+    if (!ok) {
+      throw new EngineRefusedError('the engine rejected the profile name change');
+    }
+    this.logger.log('Updated profile name');
+  }
+
+  async setProfileStatus(status: string): Promise<void> {
+    this.ensureReady();
+    await this.client!.setStatus(status);
+    this.logger.log('Updated profile status');
+  }
+
+  async setProfilePicture(media: MediaInput): Promise<void> {
+    this.ensureReady();
+    const messageMedia = await this.toMessageMedia(media);
+    // setProfilePicture resolves false (rather than throwing) when the upload is refused.
+    const ok = await this.client!.setProfilePicture(messageMedia);
+    if (!ok) {
+      throw new EngineRefusedError('the engine rejected the profile picture change');
+    }
+    this.logger.log('Updated profile picture');
+  }
+
   // Get Group Invite Code
   async getGroupInviteCode(groupId: string): Promise<string> {
     this.ensureReady();
@@ -2391,6 +2651,75 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
     const newCode = await (chat as unknown as GroupChat).revokeInvite();
     this.logger.log(`Revoked invite code for group ${groupId}, new code generated`);
     return String(newCode);
+  }
+
+  // Join Group via Invite Code
+  async joinGroupViaInviteCode(inviteCode: string): Promise<string> {
+    this.ensureReady();
+    // acceptInvite throws a page-side evaluation error when the invite is refused (invalid/expired/
+    // revoked); otherwise it resolves the joined group's id (`res.gid._serialized || res.gid.$1`,
+    // Client.js:1836-1845) — already the neutral `<id>@g.us` dialect. A gid-less result is the same
+    // client-facing outcome as a thrown refusal: no such invite (400, not a 500).
+    let groupId: string | undefined;
+    try {
+      groupId = await this.client!.acceptInvite(inviteCode);
+    } catch (error) {
+      // A refused invite and a broken page both land here, and only the first is the caller's
+      // fault. Surface the transport case to the liveness path and keep the original error in the
+      // log: without it an upstream rename turns every join into an unexplained 400.
+      this.reportIfPageTransportError(error, 'joinGroupViaInviteCode');
+      this.logger.warn(`Failed to accept group invite: ${String(error)}`);
+      groupId = undefined;
+    }
+    if (!groupId) {
+      throw new InvalidInviteCodeError();
+    }
+    this.logger.log(`Joined group ${groupId} via invite code`);
+    return groupId;
+  }
+
+  /** Resolve a group chat or throw — the shared preamble of the group settings writes. */
+  private async requireGroupChat(groupId: string): Promise<GroupChat> {
+    this.ensureReady();
+    const chat = await this.client!.getChatById(groupId);
+    // getChatById RESOLVES undefined for an unknown id (wwebjs does not throw): unknown id and a
+    // non-group id are the same client-facing outcome — there is no such group (404, not a 500).
+    if (!chat?.isGroup) {
+      throw new GroupNotFoundError(groupId);
+    }
+    return chat as unknown as GroupChat;
+  }
+
+  // Set "only admins can send messages" (announce)
+  async setGroupMessagesAdminsOnly(groupId: string, adminsOnly: boolean): Promise<void> {
+    const groupChat = await this.requireGroupChat(groupId);
+    // Resolves false instead of throwing when the account lacks admin rights (GroupChat.js:503) —
+    // surface that as an error rather than a silent no-op.
+    const ok = await groupChat.setMessagesAdminsOnly(adminsOnly);
+    if (!ok) {
+      throw new EngineRefusedError(
+        `Failed to update the messages-admins-only setting for group ${groupId} — admin rights required`,
+      );
+    }
+  }
+
+  // Set "only admins can edit group info" (locked/restrict)
+  async setGroupInfoAdminsOnly(groupId: string, adminsOnly: boolean): Promise<void> {
+    const groupChat = await this.requireGroupChat(groupId);
+    const ok = await groupChat.setInfoAdminsOnly(adminsOnly);
+    if (!ok) {
+      throw new EngineRefusedError(
+        `Failed to update the info-admins-only setting for group ${groupId} — admin rights required`,
+      );
+    }
+  }
+
+  // whatsapp-web.js 1.34.7 exposes no disappearing-messages setter (no Client/GroupChat symbol in
+  // index.d.ts; only a create-time messageTimer option, Client.js:2371) — an honest 501, not a no-op.
+  // eslint-disable-next-line @typescript-eslint/require-await, @typescript-eslint/no-unused-vars
+  async setGroupEphemeral(_groupId: string, _durationSec: number): Promise<void> {
+    this.ensureReady();
+    throw new EngineNotSupportedError('setGroupEphemeral');
   }
 
   // ========== Status/Stories (Phase 3) ==========
@@ -2480,7 +2809,7 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
   private async postMediaStatus(media: MediaInput, options: StatusPostOptions): Promise<StatusResult> {
     this.ensureReady();
     this.warnStatusRecipientsOnce(options);
-    const messageMedia = await this.toStatusMessageMedia(media);
+    const messageMedia = await this.toMessageMedia(media);
     const msg = await this.client!.sendMessage('status@broadcast', messageMedia, {
       ...(options.caption !== undefined ? { caption: options.caption } : {}),
     });
@@ -2488,7 +2817,7 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
   }
 
   /** Build a MessageMedia from a MediaInput (URL → fetched, base64/Buffer → wrapped). */
-  private async toStatusMessageMedia(media: MediaInput): Promise<MessageMedia> {
+  private async toMessageMedia(media: MediaInput): Promise<MessageMedia> {
     if (typeof media.data === 'string') {
       if (isHttpUrl(media.data)) return loadRemoteMedia(media.data);
       return new MessageMedia(media.mimetype, media.data, media.filename);
@@ -2630,6 +2959,7 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
         id,
         name: chat.name || id,
         isGroup: Boolean(chat.isGroup),
+        kind: chatKind(id),
         unreadCount: chat.unreadCount || 0,
         timestamp: chat.timestamp || 0,
         // A location message's body is the base64 map thumbnail; don't surface it as the chat preview.

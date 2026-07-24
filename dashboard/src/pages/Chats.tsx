@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useRef, useMemo, useLayoutEffect } from 'react';
-import { useQueryClient } from '@tanstack/react-query';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { Trans, useTranslation } from 'react-i18next';
 import { nextReconnectState } from '../utils/reconnectState';
 import {
@@ -9,6 +9,8 @@ import {
   Loader2,
   User,
   Users,
+  Megaphone,
+  CircleDashed,
   AlertCircle,
   MessageSquare,
   Paperclip,
@@ -28,6 +30,8 @@ import {
   asMessageType,
   type Session,
   type Chat,
+  type ChatKind,
+  type Channel,
   type MessageType,
   type SearchHit,
 } from '../services/api';
@@ -45,7 +49,9 @@ import { useToast } from '../components/Toast';
 import { PageHeader } from '../components/PageHeader';
 import { GlobalSearch } from '../components/GlobalSearch';
 import { useChatMessages, useChatMessagesActions, messagesQueryKey } from '../hooks/useChatMessages';
+import { useChannelMessages } from '../hooks/useChannelMessages';
 import { useChatScrollPosition } from '../hooks/useChatScrollPosition';
+import { useCurrentEngineQuery } from '../hooks/queries';
 import MessageBody from '../components/chats/MessageBody';
 import MediaLightbox, { type LightboxItem } from '../components/chats/MediaLightbox';
 import './Chats.css';
@@ -70,6 +76,7 @@ interface IncomingWsMessage {
   // folded into `metadata` on the persisted/history path), so declare it here to carry it through.
   call?: { video: boolean; missed: boolean };
   metadata?: ChatMessageView['metadata'];
+  kind?: ChatKind;
 }
 
 // Map an attachment MIME type to the neutral MessageType for the optimistic outgoing bubble, so the
@@ -92,7 +99,14 @@ const getMediaSrc = (media?: MessageMedia): string => {
 // Chat list avatar. Renders from the sidebar's ONE batch request (useProfilePictures) — firing a
 // query per row burst the per-IP throttle into 429s. The generic icon stays while the batch loads
 // or when the contact hides their picture.
-function ChatAvatar({ pictureUrl, isGroup }: { pictureUrl?: string | null; isGroup: boolean }) {
+function KindIcon({ kind }: { kind: ChatKind }) {
+  if (kind === 'group' || kind === 'broadcast') return <Users size={20} />;
+  if (kind === 'channel') return <Megaphone size={20} />;
+  if (kind === 'status') return <CircleDashed size={20} />;
+  return <User size={20} />;
+}
+
+function ChatAvatar({ pictureUrl, kind }: { pictureUrl?: string | null; kind: ChatKind }) {
   if (pictureUrl) {
     return (
       <div className="chat-avatar">
@@ -100,7 +114,11 @@ function ChatAvatar({ pictureUrl, isGroup }: { pictureUrl?: string | null; isGro
       </div>
     );
   }
-  return <div className="chat-avatar">{isGroup ? <Users size={20} /> : <User size={20} />}</div>;
+  return (
+    <div className="chat-avatar">
+      <KindIcon kind={kind} />
+    </div>
+  );
 }
 
 export function Chats() {
@@ -121,6 +139,37 @@ export function Chats() {
 
   // Selected chat & message history
   const [activeChat, setActiveChat] = useState<Chat | null>(null);
+  const [activeChannel, setActiveChannel] = useState<Channel | null>(null);
+
+  // Chats/Channels/Status tab selection. Switching tabs closes whatever conversation is open so a
+  // press on another tab doesn't leave a Chats-tab room rendered underneath a Channels/Status list.
+  const [activeTab, setActiveTab] = useState<'chats' | 'channels' | 'status'>('chats');
+  const switchTab = useCallback((tab: 'chats' | 'channels' | 'status') => {
+    setActiveTab(tab);
+    setActiveChat(null);
+    setActiveChannel(null);
+  }, []);
+
+  // Channels tab: only whatsapp-web.js implements channel listing/reading — Baileys throws 501 for
+  // both, so the query is gated off entirely (never fired) rather than left to fail per-request.
+  const currentEngine = useCurrentEngineQuery();
+  const channelsSupported = currentEngine.data?.engineType === 'whatsapp-web.js';
+  const channelsQuery = useQuery({
+    queryKey: ['channels', selectedSessionId],
+    queryFn: () => sessionApi.getSubscribedChannels(selectedSessionId!),
+    enabled: Boolean(selectedSessionId) && channelsSupported && activeTab === 'channels',
+  });
+  const channelMessages = useChannelMessages(selectedSessionId, activeChannel?.id ?? null);
+
+  // A channel feed opens at its newest post, mirroring the chat room's initial scroll. The pane is
+  // also keyed by channel id, so switching channels remounts the feed instead of reusing the DOM
+  // (and its stale scroll offset) of the previous channel.
+  const channelFeedRef = useRef<HTMLDivElement | null>(null);
+  useEffect(() => {
+    const el = channelFeedRef.current;
+    if (el) el.scrollTop = el.scrollHeight;
+  }, [activeChannel?.id, channelMessages.data]);
+
   const {
     data: messages = [],
     isLoading: loadingMessages,
@@ -173,7 +222,7 @@ export function Chats() {
   // (notably @lid privacy ids, which are NOT phones and must never be formatted as one) resolve
   // the real number through the engine — cached a day, and only fired when local formatting failed.
   const activePhoneDisplay = activeChat ? formatPhoneForDisplay(activeChat.id) : null;
-  const needsPhoneResolution = Boolean(activeChat && !activeChat.isGroup && !activePhoneDisplay);
+  const needsPhoneResolution = Boolean(activeChat && activeChat.kind === 'individual' && !activePhoneDisplay);
   const resolvedPhoneQ = useResolvedPhone(
     needsPhoneResolution ? selectedSessionId || undefined : undefined,
     needsPhoneResolution ? activeChat?.id : undefined,
@@ -275,6 +324,7 @@ export function Chats() {
     if (selectedSessionId) {
       void loadChats(selectedSessionId);
       setActiveChat(null);
+      setActiveChannel(null);
       setAttachment(null);
       setPreviewUrl(null);
     }
@@ -322,6 +372,7 @@ export function Chats() {
           quotedMessage: newMsg.quotedMessage,
           call: newMsg.call,
         },
+        kind: newMsg.kind,
       };
 
       // Always write to the React Query cache for this message's session — keeps non-active chats
@@ -616,11 +667,27 @@ export function Chats() {
         setSelectedSessionId(hit.sessionId);
       } else {
         const chat = chats.find(c => c.id === hit.chatId);
-        if (chat) setActiveChat(chat);
-        else pendingHitRef.current = null;
+        if (chat) {
+          if (chat.kind === 'channel') {
+            // Channels render their own read-only list on the Channels tab, not via activeChat — the
+            // hit's message-highlight is intentionally dropped here since that pane has no per-message scroll target.
+            switchTab('channels');
+            pendingHitRef.current = null;
+          } else if (chat.kind === 'status') {
+            setActiveTab('status');
+            setActiveChat(chat);
+            setActiveChannel(null);
+          } else {
+            setActiveTab('chats');
+            setActiveChat(chat);
+            setActiveChannel(null);
+          }
+        } else {
+          pendingHitRef.current = null;
+        }
       }
     },
-    [selectedSessionId, chats],
+    [selectedSessionId, chats, switchTab],
   );
 
   // After a session switch the chats list reloads — pick up the pending chat once it appears.
@@ -628,8 +695,21 @@ export function Chats() {
     const pending = pendingHitRef.current;
     if (!pending || activeChat?.id === pending.chatId) return;
     const chat = chats.find(c => c.id === pending.chatId);
-    if (chat) setActiveChat(chat);
-  }, [chats, activeChat]);
+    if (chat) {
+      if (chat.kind === 'channel') {
+        switchTab('channels');
+        pendingHitRef.current = null;
+      } else if (chat.kind === 'status') {
+        setActiveTab('status');
+        setActiveChat(chat);
+        setActiveChannel(null);
+      } else {
+        setActiveTab('chats');
+        setActiveChat(chat);
+        setActiveChannel(null);
+      }
+    }
+  }, [chats, activeChat, switchTab]);
 
   // Best-effort scroll to the hit message. Runs as a layout effect (after useChatScrollPosition's
   // own restore on the same commit) so it overrides the bottom/saved jump with no visible flash.
@@ -836,11 +916,62 @@ export function Chats() {
     [t],
   );
 
-  const filteredChats = chats.filter(
-    c =>
-      c.name?.toLowerCase().includes(searchQuery.toLowerCase()) ||
-      c.id.toLowerCase().includes(searchQuery.toLowerCase()),
+  const searchMatch = (c: Chat) =>
+    c.name?.toLowerCase().includes(searchQuery.toLowerCase()) || c.id.toLowerCase().includes(searchQuery.toLowerCase());
+
+  // Chats tab: real conversations. Channel/status-kind rows are hidden here and surfaced on their
+  // own tabs instead.
+  const filteredChats = chats.filter(c => c.kind !== 'channel' && c.kind !== 'status' && searchMatch(c));
+  // Status tab: the wwjs aggregate status@broadcast row, if getChats returned one.
+  const statusChats = chats.filter(c => c.kind === 'status' && searchMatch(c));
+
+  // Channels tab: same search box, filtered client-side like the other two tabs. The zero-state
+  // ("not subscribed to any channels") stays keyed on the unfiltered list below, so a non-matching
+  // search just renders an empty list instead of claiming there are no subscriptions at all.
+  const searchQueryLower = searchQuery.toLowerCase();
+  const filteredChannels = (channelsQuery.data ?? []).filter(
+    ch => ch.name.toLowerCase().includes(searchQueryLower) || ch.id.toLowerCase().includes(searchQueryLower),
   );
+
+  // Shared row markup for the Chats and Status lists — a plain function (not memoized) since it
+  // closes over render-scoped state (activeChat, listPics) that already changes every render.
+  const renderChatRow = (chat: Chat) => {
+    const isActive = activeChat?.id === chat.id;
+    return (
+      <div key={chat.id} className={`chat-item-card ${isActive ? 'active' : ''}`} onClick={() => setActiveChat(chat)}>
+        <ChatAvatar pictureUrl={listPics.data?.[chat.id]} kind={chat.kind} />
+
+        <div className="chat-item-info">
+          <div className="chat-item-top">
+            <span className="chat-item-name" title={chat.name || chat.id}>
+              {chat.name || chat.id.split('@')[0]}
+            </span>
+            {chat.kind !== 'individual' && chat.kind !== 'unknown' && (
+              <span className={`chat-kind-badge kind-${chat.kind}`}>{t(`chats.kind.${chat.kind}`)}</span>
+            )}
+            {/* Ternary, not `&&`: a chat with no messages carries timestamp 0, and React
+                renders the number 0 as text — so `0 && <span/>` painted a literal "0"
+                where the time belongs, on every such row. */}
+            {chat.timestamp ? <span className="chat-item-time">{formatChatTime(chat.timestamp)}</span> : null}
+          </div>
+          <div className="chat-item-bottom">
+            <span className="chat-item-snippet" title={formatLastMessageSnippet(chat)}>
+              {formatLastMessageSnippet(chat) || <span className="no-message">{t('chats.noMessageYet')}</span>}
+            </span>
+            {chat.unreadCount > 0 && (
+              <span
+                className="chat-unread-badge"
+                title={t('chats.unreadBadge', { count: chat.unreadCount })}
+                aria-label={t('chats.unreadBadge', { count: chat.unreadCount })}
+              >
+                {chat.unreadCount > 99 ? '99+' : chat.unreadCount}
+              </span>
+            )}
+          </div>
+        </div>
+      </div>
+    );
+  };
 
   // Image media items for the lightbox, in render order. `getMediaSrc` reconstructs a usable src
   // from either a base64 payload or a URL — the ChatMessageView shape stores both in `data`.
@@ -894,7 +1025,7 @@ export function Chats() {
           </p>
         </div>
       ) : (
-        <div className={`chats-layout ${activeChat ? 'has-active-chat' : ''}`}>
+        <div className={`chats-layout ${activeChat || activeChannel ? 'has-active-chat' : ''}`}>
           {/* LEFT SIDEBAR: session & chat rooms */}
           <aside className="chats-sidebar">
             <div className="sidebar-header-box">
@@ -914,6 +1045,22 @@ export function Chats() {
                 </select>
               </div>
 
+              {/* Chats / Channels / Status tabs */}
+              <div className="chats-tabs" role="tablist">
+                {(['chats', 'channels', 'status'] as const).map(tab => (
+                  <button
+                    key={tab}
+                    type="button"
+                    role="tab"
+                    aria-selected={activeTab === tab}
+                    className={`chats-tab ${activeTab === tab ? 'active' : ''}`}
+                    onClick={() => switchTab(tab)}
+                  >
+                    {t(`chats.tab.${tab}`)}
+                  </button>
+                ))}
+              </div>
+
               {/* Search bar */}
               <div className="chat-search-input">
                 <Search size={18} />
@@ -927,48 +1074,89 @@ export function Chats() {
             </div>
 
             {/* Chat list */}
-            <div className="chats-list">
-              {loadingChats ? (
-                <div className="chats-list-loading">
-                  <Loader2 className="animate-spin" size={24} />
-                  <span>{t('chats.loadingChats')}</span>
-                </div>
-              ) : filteredChats.length === 0 ? (
-                <div className="chats-list-empty">
-                  <span>{t('chats.empty')}</span>
-                </div>
-              ) : (
-                filteredChats.map(chat => {
-                  const isActive = activeChat?.id === chat.id;
-                  return (
-                    <div
-                      key={chat.id}
-                      className={`chat-item-card ${isActive ? 'active' : ''}`}
-                      onClick={() => setActiveChat(chat)}
-                    >
-                      <ChatAvatar pictureUrl={listPics.data?.[chat.id]} isGroup={chat.isGroup} />
+            {activeTab === 'chats' && (
+              <div className="chats-list">
+                {loadingChats ? (
+                  <div className="chats-list-loading">
+                    <Loader2 className="animate-spin" size={24} />
+                    <span>{t('chats.loadingChats')}</span>
+                  </div>
+                ) : filteredChats.length === 0 ? (
+                  <div className="chats-list-empty">
+                    <span>{t('chats.empty')}</span>
+                  </div>
+                ) : (
+                  filteredChats.map(renderChatRow)
+                )}
+              </div>
+            )}
 
+            {/* Channels list — wwjs-only (newsletter/channel API isn't implemented on Baileys, which
+                throws 501 for both listing and reading). channelsQuery is gated off entirely on that
+                engine, so the branch order below never depends on a request having actually run. */}
+            {activeTab === 'channels' && (
+              <div className="chats-list">
+                {currentEngine.isLoading ? (
+                  <div className="chats-list-loading">
+                    <Loader2 className="animate-spin" size={24} />
+                  </div>
+                ) : !channelsSupported ? (
+                  <div className="chats-list-empty">
+                    <span>{t('chats.channels.notSupported')}</span>
+                  </div>
+                ) : channelsQuery.isLoading ? (
+                  <div className="chats-list-loading">
+                    <Loader2 className="animate-spin" size={24} />
+                  </div>
+                ) : channelsQuery.error ? (
+                  <div className="chats-list-empty">
+                    <AlertCircle size={24} className="text-warn" />
+                    <span>{t('chats.channels.notReady')}</span>
+                  </div>
+                ) : (channelsQuery.data?.length ?? 0) === 0 ? (
+                  <div className="chats-list-empty">
+                    <span>{t('chats.channels.empty')}</span>
+                  </div>
+                ) : (
+                  filteredChannels.map(ch => (
+                    <div
+                      key={ch.id}
+                      className={`chat-item-card ${activeChannel?.id === ch.id ? 'active' : ''}`}
+                      onClick={() => setActiveChannel(ch)}
+                    >
+                      <div className="chat-avatar">
+                        <Megaphone size={20} />
+                      </div>
                       <div className="chat-item-info">
                         <div className="chat-item-top">
-                          <span className="chat-item-name" title={chat.name || chat.id}>
-                            {chat.name || chat.id.split('@')[0]}
-                          </span>
-                          {chat.timestamp && <span className="chat-item-time">{formatChatTime(chat.timestamp)}</span>}
+                          <span className="chat-item-name">{ch.name}</span>
                         </div>
-                        <div className="chat-item-bottom">
-                          <span className="chat-item-snippet" title={formatLastMessageSnippet(chat)}>
-                            {formatLastMessageSnippet(chat) || (
-                              <span className="no-message">{t('chats.noMessageYet')}</span>
-                            )}
-                          </span>
-                          {chat.unreadCount > 0 && <span className="chat-unread-badge">{chat.unreadCount}</span>}
-                        </div>
+                        {ch.subscriberCount != null && (
+                          <div className="chat-item-bottom">
+                            <span className="chat-item-snippet">
+                              {t('chats.channels.subscribers', { count: ch.subscriberCount })}
+                            </span>
+                          </div>
+                        )}
                       </div>
                     </div>
-                  );
-                })
-              )}
-            </div>
+                  ))
+                )}
+              </div>
+            )}
+
+            {/* Status list — the wwjs status@broadcast aggregate row, if present. Real per-status
+                (per-contact story) rows are a future capability; this tab starts as a placeholder. */}
+            {activeTab === 'status' && (
+              <div className="chats-list">
+                {statusChats.map(renderChatRow)}
+                <div className="chats-room-placeholder">
+                  <CircleDashed size={40} />
+                  <h2>{t('chats.status.placeholderTitle')}</h2>
+                  <p>{t('chats.status.placeholderDesc')}</p>
+                </div>
+              </div>
+            )}
           </aside>
 
           {/* RIGHT VIEW: active chat room */}
@@ -988,10 +1176,8 @@ export function Chats() {
                         // Signed CDN URLs rotate every few hours; refetch the slice on a stale load.
                         onError={() => activePp.refetch()}
                       />
-                    ) : activeChat.isGroup ? (
-                      <Users size={20} />
                     ) : (
-                      <User size={20} />
+                      <KindIcon kind={activeChat.kind} />
                     )}
                   </div>
                   <div className="room-contact-info">
@@ -1364,6 +1550,48 @@ export function Chats() {
                     </button>
                   </form>
                 </footer>
+              </div>
+            ) : activeChannel ? (
+              // Read-only channel pane: no send footer, reactions, delete, reply, or markChatRead —
+              // subscribed channels are a broadcast feed, not a two-way conversation.
+              <div key={activeChannel.id} className="channel-room">
+                <header className="chats-room-header">
+                  <button
+                    className="room-back"
+                    onClick={() => setActiveChannel(null)}
+                    aria-label={t('common.back')}
+                  >
+                    <ArrowLeft size={20} />
+                  </button>
+                  <Megaphone size={20} />
+                  <h2>{activeChannel.name}</h2>
+                </header>
+                <div className="messages-list" ref={channelFeedRef}>
+                  {channelMessages.isLoading ? (
+                    <div className="messages-loading">
+                      <Loader2 className="animate-spin" size={32} />
+                      <span>{t('chats.loadingMessages')}</span>
+                    </div>
+                  ) : channelMessages.error ? (
+                    <div className="messages-empty">
+                      <MessageSquare size={32} />
+                      <span>{t('chats.loadMessagesError')}</span>
+                    </div>
+                  ) : (channelMessages.data ?? []).length === 0 ? (
+                    <div className="messages-empty">
+                      <MessageSquare size={32} />
+                      <span>{t('chats.noMessagesInChat')}</span>
+                    </div>
+                  ) : (
+                    (channelMessages.data ?? []).map(m => (
+                      <div key={m.id} className="message-bubble incoming">
+                        {m.hasMedia && m.mediaUrl && <img className="channel-media" src={m.mediaUrl} alt="" />}
+                        {m.body && <MessageBody text={m.body} className="message-text" />}
+                        <span className="message-time">{formatChatTime(m.timestamp)}</span>
+                      </div>
+                    ))
+                  )}
+                </div>
               </div>
             ) : (
               <div className="chats-room-placeholder">

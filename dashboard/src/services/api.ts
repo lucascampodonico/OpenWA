@@ -132,11 +132,15 @@ export interface MessageResponse {
   timestamp: number;
 }
 
+// Mirrors the backend engine ChatKind (dashboard cannot import wa-id.ts).
+export type ChatKind = 'individual' | 'group' | 'channel' | 'status' | 'broadcast' | 'unknown';
+
 // Chat summary returned by GET /sessions/:id/chats (mirrors the backend ChatSummary).
 export interface Chat {
   id: string;
   name: string;
   isGroup: boolean;
+  kind: ChatKind;
   unreadCount: number;
   timestamp: number;
   lastMessage?: string;
@@ -172,6 +176,8 @@ export interface ChatMessage {
   id: string;
   waMessageId?: string;
   chatId: string;
+  /** Chat kind of the source conversation (present on live engine/WS payloads). */
+  kind?: ChatKind;
   from: string;
   to: string;
   body: string;
@@ -200,6 +206,23 @@ export interface EngineHistoryMessage {
   timestamp: number;
   fromMe?: boolean;
   media?: { mimetype: string; filename?: string; data?: string };
+}
+
+// Mirrors the backend engine Channel / ChannelMessage (GET /sessions/:id/channels[/:id/messages]).
+export interface Channel {
+  id: string;
+  name: string;
+  subscriberCount?: number;
+  inviteCode?: string;
+  verified?: boolean;
+}
+
+export interface ChannelMessage {
+  id: string;
+  body: string;
+  timestamp: number;
+  hasMedia: boolean;
+  mediaUrl?: string;
 }
 
 export interface SendMediaPayload {
@@ -583,6 +606,9 @@ export const sessionApi = {
         includeMedia ? '&includeMedia=true' : ''
       }`,
     ),
+  getSubscribedChannels: (id: string) => request<Channel[]>(`/sessions/${id}/channels`),
+  getChannelMessages: (id: string, channelId: string, limit = 50) =>
+    request<ChannelMessage[]>(`/sessions/${id}/channels/${encodeURIComponent(channelId)}/messages?limit=${limit}`),
 };
 
 // =============================================================================

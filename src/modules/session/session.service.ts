@@ -13,7 +13,7 @@ import {
 import { ConfigService } from '@nestjs/config';
 import { InjectRepository, InjectDataSource } from '@nestjs/typeorm';
 import { Repository, In, Not, IsNull, DataSource, FindManyOptions } from 'typeorm';
-import { QueryDeepPartialEntity } from 'typeorm/query-builder/QueryPartialEntity';
+import { QueryDeepPartialEntity } from 'typeorm';
 import { Session, SessionStatus } from './entities/session.entity';
 import { Message, MessageDirection, MessageStatus } from '../message/entities/message.entity';
 import { MessageBatch } from '../message/entities/message-batch.entity';
@@ -37,6 +37,8 @@ import {
   IncomingMessage,
   ReactionEvent,
   EditedMessage,
+  GroupEvent,
+  IncomingCallEvent,
 } from '../../engine/interfaces/whatsapp-engine.interface';
 import { createLogger } from '../../common/services/logger.service';
 import { ShutdownService } from '../../common/services/shutdown.service';
@@ -674,7 +676,7 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
       const chunkIds = ids.slice(i, i + CHUNK);
       const existing = await this.messageRepository.find({
         where: { sessionId: id, waMessageId: In(chunkIds) },
-        select: ['waMessageId'],
+        select: { waMessageId: true },
       });
       const seen = new Set(existing.map(r => r.waMessageId));
       const rows = chunkIds
@@ -866,11 +868,23 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
             sessionId: id,
             source: 'Engine',
           })
-          .then(async ({ continue: shouldContinue, data: finalMessage }) => {
-            if (!shouldContinue) {
-              // A plugin handled the event and asked to stop the chain (continue: false).
-              return;
-            }
+          .then(async ({ data: finalMessage }) => {
+            // `continue: false` is deliberately NOT read here. It means "stop the handler chain", which
+            // HookManager has already done — the plugins after the one that returned it never ran. It
+            // does not mean "this message never happened".
+            //
+            // Honouring it here used to skip everything below: the message was never written to the
+            // messages table, never dispatched to webhooks, and never emitted over the websocket. An
+            // auto-reply plugin returning `false` for its ordinary purpose — keeping other bots from
+            // answering the same message — silently erased the customer's message from the operator's
+            // own history, leaving a thread of bot replies answering nothing. Nothing in the hook
+            // contract (`HookResult.continue`, docs/19) or the webhook contract (`message.received`
+            // fires when "an inbound message arrives", docs/06) hinted at that, and a sandboxed
+            // marketplace plugin could swallow a session's entire inbound traffic with no audit trail.
+            //
+            // The message has already arrived at WhatsApp. A plugin can stop other plugins from acting
+            // on it; it cannot make the gateway forget it. Pre-action hooks are where a veto belongs —
+            // `message:sending` blocks a send that has not happened yet (core/hooks/sending-gate.ts).
 
             // Persist the incoming message so the dashboard chats view can render history.
             const incoming: IncomingMessage = finalMessage;
@@ -1017,10 +1031,11 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
             sessionId: id,
             source: 'Engine',
           })
-          .then(async ({ continue: shouldContinue, data: finalMessage }) => {
-            if (!shouldContinue) {
-              return;
-            }
+          .then(async ({ data: finalMessage }) => {
+            // `continue: false` is not read here, for the same reason as the message:received path
+            // above: the send has already happened, so a plugin can stop the handler chain but cannot
+            // un-send it. Skipping the persist below dropped the operator's own outgoing message from
+            // history and from `message.sent` webhooks.
 
             // Persist the outgoing message so local history reflects sends composed on a linked phone
             // (message_create is the ONLY event those produce). It also fires for API-originated sends,
@@ -1278,6 +1293,31 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
           messages: messagesData,
         });
       },
+      onGroupEvent: (event): void => {
+        if (!this.isLiveEngine(id, engine)) return;
+        this.logger.debug(`Group event: ${event.kind} in ${event.groupId}`, {
+          sessionId: id,
+          groupId: event.groupId,
+          kind: event.kind,
+          action: 'group_event',
+        });
+        this.dispatchGroupEvent(id, event);
+      },
+      onCall: (event: IncomingCallEvent): void => {
+        if (!this.isLiveEngine(id, engine)) return;
+        this.logger.log(`Incoming call from ${event.from}`, {
+          sessionId: id,
+          callId: event.callId,
+          isVideo: event.isVideo,
+          isGroup: event.isGroup,
+          action: 'call_received',
+        });
+        const payload: Record<string, unknown> = { ...event };
+        this.eventsGateway.emitCallReceived(id, payload);
+        void this.webhookService.dispatch(id, 'call.received', payload);
+        // Opt-in auto-reject runs AFTER the dispatch so a reject failure can never eat the event.
+        void this.maybeAutoRejectCall(id, engine, event.callId);
+      },
       onDisconnected: (reason: string): void => {
         if (!this.isLiveEngine(id, engine)) return;
         // Shared with the liveness watchdog (see handleEngineDisconnected). The handler re-reads the
@@ -1484,6 +1524,103 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
     const editedPayload = message as unknown as Record<string, unknown>;
     this.eventsGateway.emitMessageEdited(id, editedPayload);
     void this.webhookService.dispatch(id, 'message.edited', editedPayload);
+  }
+
+  /**
+   * Reflect an OUTBOUND edit (REST MessageService.editMessage) in the stored row, routed through the
+   * same per-message mutation queue as the inbound edit/reaction paths so the two writers cannot
+   * interleave (latest-write-wins holds across both directions). Same best-effort semantics as
+   * applyMessageEdit: a missing row or a failed write must not fail the request — the engine edit
+   * already succeeded. Resolves once the queued write has run.
+   */
+  async recordOutboundMessageEdit(sessionId: string, messageId: string, body: string): Promise<void> {
+    await new Promise<void>(resolve => {
+      this.enqueueMessageMutation(sessionId, messageId, async () => {
+        try {
+          await this.messageRepository.update({ sessionId, waMessageId: messageId }, { body });
+        } catch (err) {
+          this.logger.warn(`Failed to update stored body of edited message ${messageId}`, { error: String(err) });
+        } finally {
+          resolve();
+        }
+      });
+    });
+  }
+
+  /**
+   * Fan a neutral engine GroupEvent out to consumers: the WebSocket room and the webhook stream.
+   * The `kind` selects the event name (`group.join` / `group.leave` / `group.update`); the payload
+   * is the same plain camelCase shape on both channels, with `kind` itself carried by the name.
+   * There is no persistence here — group membership/metadata lives in the engine, not the message
+   * store — so unlike message edits there is nothing to apply before notifying.
+   */
+  private dispatchGroupEvent(id: string, event: GroupEvent): void {
+    const payload: Record<string, unknown> = {
+      groupId: event.groupId,
+      participantIds: event.participantIds,
+      timestamp: event.timestamp,
+    };
+    // Optional fields are added only when present so consumers never see explicit `undefined`s.
+    if (event.actorId !== undefined) {
+      payload.actorId = event.actorId;
+    }
+    if (event.changes !== undefined) {
+      payload.changes = event.changes;
+    }
+
+    switch (event.kind) {
+      case 'join':
+        this.eventsGateway.emitGroupJoin(id, payload);
+        void this.webhookService.dispatch(id, 'group.join', payload);
+        break;
+      case 'leave':
+        this.eventsGateway.emitGroupLeave(id, payload);
+        void this.webhookService.dispatch(id, 'group.leave', payload);
+        break;
+      case 'update':
+        this.eventsGateway.emitGroupUpdate(id, payload);
+        void this.webhookService.dispatch(id, 'group.update', payload);
+        break;
+    }
+  }
+
+  /**
+   * Reject a ringing call when the session opted in via `config.autoRejectCalls`. The session row
+   * is re-read here rather than trusting initializeEngine's closure snapshot — a call can arrive
+   * long after start, and the row is the only always-current source (mirrors
+   * handleEngineDisconnected). `config` is an untyped JSON column: only a strict boolean `true`
+   * opts in — truthy strings/numbers are ignored (the coercion discipline of
+   * resolveReconnectConfig). Never throws: a reject failure is logged, and the `call.received`
+   * dispatch already happened before this ran.
+   */
+  private async maybeAutoRejectCall(id: string, engine: IWhatsAppEngine, callId: string): Promise<void> {
+    let session: Session | null;
+    try {
+      session = await this.sessionRepository.findOne({ where: { id } });
+    } catch (err) {
+      this.logger.error('Failed to reload the session for call auto-reject', String(err), {
+        sessionId: id,
+        action: 'call_auto_reject_error',
+      });
+      return;
+    }
+    if (session?.config?.autoRejectCalls !== true) {
+      return;
+    }
+    try {
+      await engine.rejectCall(callId);
+      this.logger.log('Auto-rejected incoming call', {
+        sessionId: id,
+        callId,
+        action: 'call_auto_rejected',
+      });
+    } catch (err) {
+      this.logger.warn('Failed to auto-reject incoming call', {
+        sessionId: id,
+        callId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
   }
 
   /**
