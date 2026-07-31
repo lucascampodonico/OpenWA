@@ -3,6 +3,7 @@ import {
   NotFoundException,
   ConflictException,
   BadRequestException,
+  BadGatewayException,
   HttpException,
   HttpStatus,
   OnModuleDestroy,
@@ -28,6 +29,9 @@ import { userPart } from '../../engine/identity/wa-id';
 import { paginate, ListOptions, resolveListWindow } from '../../common/utils/paginate';
 import { isUniqueConstraintError } from '../../common/utils/unique-constraint.util';
 import { resolveFeatureFlags } from '../../config/feature-flags';
+import { DEFAULT_MEDIA_MAX_BYTES, STATUS_TTL_MS, StatusStoreService } from '../status-store/status-store.service';
+import { buildIncomingStatus } from '../status-store/incoming-status';
+import type { StatusUpdate } from '../status-store/entities/status-update.entity';
 import {
   IWhatsAppEngine,
   EngineStatus,
@@ -60,6 +64,12 @@ import {
 // by-type stats filter skips the row. Sources that lack the payload (wwjs own-send echo, media-free
 // history sync) get the omitted marker synthesized at the persistence chokepoints.
 const MEDIA_MESSAGE_TYPES = new Set(['image', 'video', 'audio', 'voice', 'sticker', 'document']);
+
+// How many recent status-broadcast messages the connect-time seed pulls (each with its media).
+// ponytail: fixed ceiling — the most-recent 50 cover a normal account's 24h of stories; anything
+// posted after connect still lands live via onMessage. Make it configurable only if a flood account
+// proves 50 too few.
+const STATUS_SEED_LIMIT = 50;
 
 interface ReconnectState {
   attempts: number;
@@ -223,6 +233,42 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
   // order when different mutation kinds for the same message arrive together.
   private messageMutationChains: Map<string, Promise<void>> = new Map();
 
+  // Destructive credential-teardown promises (logout rms of the session's on-disk WhatsApp auth
+  // dir), keyed by session NAME — the on-disk auth-dir key (EngineFactory.wwjsAuthDir/baileysAuthDir
+  // and adapter clearLocalAuth all build the path from Session.name), NOT the UUID. A losing
+  // logout() promise keeps running past its deadline race and ends in an fs.rm of that dir — the
+  // same path a later start() under the SAME name re-creates — so start()/delete()/executeReconnect
+  // consult this map and wait (bounded, fail-closed) for settlement before touching that path. After
+  // an old UUID's session is deleted and the name is recreated, a late logout from the old UUID
+  // still targets the new session's dir (same name → same path), so keying by name keeps the fence
+  // attached to the credential path that is actually at risk. Entries self-remove on settlement
+  // (identity-checked); nothing else evicts them (delete()'s finally no longer drops them).
+  private readonly pendingTeardowns = new Map<string, Promise<void>>();
+
+  // The in-flight `updateStatus(INITIALIZING)` write keyed by id, carrying the EXACT engine it
+  // belongs to. initializeEngine registers the engine, then awaits this write before calling
+  // adapter initialize(); a lifecycle control (stop/logout/delete/forceKill) can retire the engine
+  // during that awaited write. To keep the control action the final persisted owner, every retiring
+  // control awaits the captured engine's exact pending promise (looked up by object identity) after
+  // setting the stop mark + cancelling reconnect and BEFORE its teardown / final DISCONNECTED write
+  // / parent-row deletion. Settlement and removal are identity-checked on both {engine, promise} so
+  // a delayed INITIALIZING for engine A can never be awaited as / delete the entry of a replacement
+  // engine B the control action did not capture.
+  private readonly pendingInitialStatuses = new Map<string, { engine: IWhatsAppEngine; promise: Promise<void> }>();
+
+  // The ONE-SHOT budget for an automatic stuck-auth credential reset, hoisted out of the adapter
+  // instance and keyed by session id. recoverFromStuckAuth() (a generation that authenticated but
+  // never reached readiness) claims this synchronously before it wipes LocalAuth; a claim returns true
+  // EXACTLY once per episode. Automatic reconnects build a FRESH adapter, so an instance-local budget
+  // would reset every generation and wipe credentials forever (the QR -> timeout -> clear loop). The
+  // session owns the budget so it survives across reconnect generations within one episode.
+  //
+  // Cleared ONLY on: an accepted top-level start() (after the duplicate/cap/name-fence checks pass,
+  // just before initializeEngine — boot auto-start uses the same method); onReady (recovery proved
+  // successful); and a COMMITTED delete (after the parent transaction). NOT cleared on a rejected
+  // start, executeReconnect, disconnect, QR, auth failure, engine replacement, or a failed/409 delete.
+  private readonly stuckAuthRecoveryUsed = new Set<string>();
+
   constructor(
     @InjectRepository(Session, 'data')
     private readonly sessionRepository: Repository<Session>,
@@ -234,6 +280,7 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
     private readonly eventsGateway: EventsGateway,
     private readonly webhookService: WebhookService,
     private readonly hookManager: HookManager,
+    private readonly statusStore: StatusStoreService,
     @Optional()
     private readonly configService?: ConfigService,
     // Shared lid<->phone table (global). Used to persist an inbound @lid sender's resolved phone so
@@ -257,6 +304,7 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
       SessionStatus.INITIALIZING,
       SessionStatus.QR_READY,
       SessionStatus.AUTHENTICATING,
+      SessionStatus.ACTION_REQUIRED,
     ];
 
     const result = await this.sessionRepository.update(
@@ -338,38 +386,151 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
     this.engines.clear();
   }
 
-  /** Destroy one engine, isolating + time-bounding failures so shutdown can't be stalled or aborted. */
-  private async destroyEngineSafely(sessionId: string, engine: IWhatsAppEngine): Promise<void> {
+  /** Destroy one engine, isolating + time-bounding failures so shutdown can't be stalled or aborted.
+   *  Resolves to whether the destroy actually completed (see teardownEngineSafely). */
+  private async destroyEngineSafely(sessionId: string, engine: IWhatsAppEngine): Promise<boolean> {
     this.logger.log(`Destroying engine for session ${sessionId}`, { sessionId, action: 'shutdown' });
-    await this.teardownEngineSafely(sessionId, engine, e => e.destroy(), 'destroy');
+    return this.teardownEngineSafely(sessionId, engine, e => e.destroy(), 'destroy');
   }
 
   /**
    * Run an engine teardown (destroy/disconnect), isolating + time-bounding failures so a stuck
    * Chromium/socket can neither hang nor abort the caller. Always resolves — the caller is then free
    * to reconcile the engines Map and proceed with DB cleanup regardless of teardown outcome.
+   * Resolves to whether the teardown actually completed: `false` means it threw or hit the 10s
+   * deadline, so the underlying Chromium/socket may still be alive (a caller with an operator-facing
+   * outcome, like stopOrphanEngines, must surface that instead of reporting a clean stop).
+   *
+   * A teardown that loses the deadline race keeps running past the caller's return. For 'logout'
+   * that leftover promise ends in an fs.rm of the session's on-disk profile — the same path a
+   * later start() re-creates — so the raw promise is registered in pendingTeardowns (keyed by the
+   * session NAME, which is the auth-dir key) and start()/delete() wait (bounded, fail-closed) for
+   * it to settle before touching that path.
    */
   private async teardownEngineSafely(
     sessionId: string,
     engine: IWhatsAppEngine,
     teardown: (e: IWhatsAppEngine) => Promise<void>,
-    label: 'destroy' | 'disconnect' | 'force-destroy',
-  ): Promise<void> {
+    label: 'destroy' | 'disconnect' | 'force-destroy' | 'logout',
+    sessionName?: string,
+  ): Promise<boolean> {
+    const raw = teardown(engine);
+    if (label === 'logout' && sessionName) {
+      this.trackPendingCredentialTeardown(sessionName, raw);
+    }
     let timer: ReturnType<typeof setTimeout> | undefined;
     try {
       await Promise.race([
-        teardown(engine),
+        raw,
         new Promise<never>((_, reject) => {
           timer = setTimeout(() => reject(new Error(`engine.${label}() timed out`)), 10_000);
         }),
       ]);
+      return true;
     } catch (err) {
       this.logger.error(`Failed to ${label} engine for session ${sessionId}`, String(err), {
         sessionId,
         action: `engine_${label}_failed`,
       });
+      return false;
     } finally {
       if (timer) clearTimeout(timer);
+    }
+  }
+
+  /**
+   * Track a destructive credential-teardown promise under the session NAME (the on-disk auth-dir
+   * key — NOT the UUID). A logout's `engine.logout()` ends in an `fs.rm` of the same directory a
+   * later start() under the same name re-creates, so start()/delete()/executeReconnect consult this
+   * map and wait (bounded, fail-closed) before touching that path.
+   *
+   * Settlement marker only — never rejects, so it can't drive a caller's deadline race to a false
+   * "completed". A concurrent teardown for the same name CHAINS onto the previous entry instead of
+   * overwriting it (Promise.allSettled), so callers keep waiting until EVERY in-flight teardown for
+   * that name has settled — otherwise a second logout's fast settlement would drop the entry while
+   * the first teardown's profile rm is still pending. Identity-checked on removal is the ONLY path
+   * that evicts the entry, so a newer teardown's entry is never dropped by an older one settling.
+   */
+  private trackPendingCredentialTeardown(sessionName: string, raw: Promise<void>): void {
+    const tracked = raw.catch(() => undefined);
+    const previous = this.pendingTeardowns.get(sessionName);
+    const entry: Promise<void> = previous ? Promise.allSettled([previous, tracked]).then(() => undefined) : tracked;
+    this.pendingTeardowns.set(sessionName, entry);
+    void entry.finally(() => {
+      if (this.pendingTeardowns.get(sessionName) === entry) {
+        this.pendingTeardowns.delete(sessionName);
+      }
+    });
+  }
+
+  /**
+   * Wait (bounded) for a teardown that lost its deadline race to settle. A losing logout() promise
+   * ends in an fs.rm of the on-disk profile — the same deterministic path start() re-creates and
+   * delete() purges — so those paths call this before touching disk. The fence is FAIL CLOSED: a
+   * teardown still wedged past the bound could still land its rm on credentials a (re)created session
+   * under the same name would write, so the operation refuses with a retryable 409
+   * (SESSION_NAME_TEARDOWN_PENDING) instead of proceeding. The entry is NOT dropped on timeout — a
+   * retry after the rm eventually settles will see it gone and proceed.
+   *
+   * Keyed by the session NAME: the auth directories are built from `Session.name`, so two sessions
+   * sharing a name (a deleted UUID recreated under the same name) share the credential path and must
+   * share the fence.
+   */
+  private async awaitPendingTeardown(sessionName: string): Promise<void> {
+    const pending = this.pendingTeardowns.get(sessionName);
+    if (!pending) return;
+
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const settled = await Promise.race([
+      pending.then(() => true),
+      new Promise<boolean>(resolve => {
+        timer = setTimeout(() => resolve(false), 10_000);
+      }),
+    ]);
+    if (timer) clearTimeout(timer);
+    if (!settled) {
+      // Fail closed: do NOT proceed. The stale rm could still hit a fresh profile under this name.
+      // Message is operator-facing and retryable, with no internal path leak.
+      throw new ConflictException({
+        statusCode: HttpStatus.CONFLICT,
+        message:
+          `A credential teardown for session '${sessionName}' is still in flight. Wait for it to ` +
+          'settle and retry.',
+        error: 'Conflict',
+        code: 'SESSION_NAME_TEARDOWN_PENDING',
+      });
+    }
+  }
+
+  /**
+   * Wait for the captured `engine`'s exact in-flight `updateStatus(INITIALIZING)` write to settle.
+   * Called by every retiring lifecycle control (stop/logout/delete/forceKill) AFTER the stop mark is
+   * set and reconnect cancelled, and BEFORE teardown / the final DISCONNECTED write / parent-row
+   * deletion. This keeps the control action the final persisted owner: a delayed INITIALIZING write
+   * always settles first, so it can never land after the DISCONNECTED write or the row removal.
+   *
+   * Identity-checked on the engine object: a control action that captured engine A awaits ONLY A's
+   * pending promise, never a replacement B's entry (and never deletes it). A bounded wait mirrors
+   * awaitPendingTeardown — the INITIALIZING write is a single DB update, but a wedged DB must not
+   * block retirement indefinitely.
+   */
+  private async awaitInitialStatus(id: string, engine: IWhatsAppEngine): Promise<void> {
+    const pending = this.pendingInitialStatuses.get(id);
+    if (!pending || pending.engine !== engine) return;
+
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const settled = await Promise.race([
+      pending.promise.then(() => true),
+      new Promise<boolean>(resolve => {
+        timer = setTimeout(() => resolve(false), 10_000);
+      }),
+    ]);
+    if (timer) clearTimeout(timer);
+    if (!settled) {
+      this.logger.warn(`Proceeding to retire session ${id} while its INITIALIZING status write is still wedged`, {
+        sessionId: id,
+        action: 'pending_initial_status_wait_exhausted',
+      });
     }
   }
 
@@ -453,12 +614,16 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
   }
 
   /**
-   * Populate the transient `lastError` field from the in-memory error map. Only a
-   * FAILED session carries an error; any other status clears it so a recovered
-   * session never shows a stale failure reason.
+   * Populate the transient `lastError` field from the in-memory error map. A FAILED session always
+   * carries its failure reason, and an ACTION_REQUIRED session carries what the operator must do
+   * (e.g. the whatsapp-web.js onboarding-modal fallback, #982); any other status clears it so a
+   * recovered session never shows a stale reason.
    */
   private attachLastError(session: Session): Session {
-    session.lastError = session.status === SessionStatus.FAILED ? this.sessionErrors.get(session.id) : undefined;
+    session.lastError =
+      session.status === SessionStatus.FAILED || session.status === SessionStatus.ACTION_REQUIRED
+        ? this.sessionErrors.get(session.id)
+        : undefined;
     return session;
   }
 
@@ -473,10 +638,24 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
   async delete(id: string): Promise<void> {
     const session = await this.findOne(id);
 
+    // FENCE #1 — fail-fast on an ALREADY-PENDING credential teardown for this session NAME, BEFORE
+    // any lifecycle mutation. A logout teardown that lost its deadline race is still running and ends
+    // in an fs.rm of this session's on-disk auth dir (keyed by name). Releasing the name via the DB
+    // delete below while that rm is live would let a recreated session under the same name race the
+    // stale rm. The fence is keyed by session NAME and fails CLOSED (409). On a 409 NOTHING else runs:
+    // no stop mark, no reconnect cancel, no engine teardown, no state cleanup — delete() simply did
+    // not happen, and the entry stays reserved.
+    await this.awaitPendingTeardown(session.name);
+
     // Mark as tearing down BEFORE cleanup so an in-flight reconnect can't resurrect it.
     this.stoppingSessions.add(id);
     // Cancel any reconnection attempts
     this.cancelReconnect(id);
+
+    // Set only after the transaction actually removes the parent row. lastDispatchedStatus /
+    // sessionErrors (and the recovery budget, Task 8) are cleared ONLY on a committed delete; a
+    // rejected 409 from fence #2 leaves them intact (the session still exists).
+    let parentDeleted = false;
 
     try {
       // Stop engine if running — time-bounded + isolated so a stuck Chromium can't wedge the delete;
@@ -485,8 +664,34 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
       // no session state worth saving, and a wedged Chromium must be reaped, not left to time out.
       const engine = this.engines.get(id);
       if (engine) {
+        // Await THIS engine's in-flight INITIALIZING write before teardown and the parent-row
+        // deletion below, so a delayed pre-initialize status update can never settle after the row
+        // is gone (delete cannot be followed by a late status write). Identity-checked.
+        await this.awaitInitialStatus(id, engine);
         await this.teardownEngineSafely(id, engine, e => e.forceDestroy(), 'force-destroy');
         if (this.isLiveEngine(id, engine)) this.engines.delete(id);
+      }
+
+      // FENCE #2 — immediately after the current engine is evicted, BEFORE the session:deleted hook
+      // and the DB transaction. A logout that started concurrently AFTER fence #1 but captured this
+      // engine before eviction registers its destructive promise synchronously (via the engine's
+      // onCredentialTeardownStarted callback), so this fence sees it and refuses — the row/name stay
+      // reserved and the transaction does not run. After eviction a NEW logout can't create a
+      // destructive promise (no live engine); one that already captured the engine is observed here.
+      //
+      // Unlike fence #1, a refusal HERE leaves the row behind with its engine already destroyed, so
+      // the persisted status would keep reading whatever it was (READY, authenticating, …) for a
+      // session that can no longer answer anything. Reconcile it to DISCONNECTED before propagating
+      // the 409 — the retry the message asks for should not have to look past a status that lies.
+      // Fence #1 needs none of this: nothing has run there yet, so its status is still accurate.
+      // Best-effort: a failed status write must not mask the 409 the caller has to act on.
+      try {
+        await this.awaitPendingTeardown(session.name);
+      } catch (fenceError) {
+        if (engine) {
+          await this.updateStatus(id, SessionStatus.DISCONNECTED).catch(() => undefined);
+        }
+        throw fenceError;
       }
 
       // Execute hook BEFORE delete so plugins can access session data
@@ -520,52 +725,89 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
         await manager.delete(BaileysStoredMessage, { sessionId: id });
         await manager.remove(session);
       });
+      parentDeleted = true;
       this.logger.log(`Session deleted: ${session.name}`, {
         sessionId: id,
         action: 'delete',
       });
 
-      // Purge the engine's persistent on-disk auth/store dir. It's keyed by session NAME and lives
-      // independently of the (now torn-down, and on delete often never-loaded) engine instance, so the
-      // teardown above doesn't touch it. Without this, recreating a session under the same name reloads
-      // a stale store. Best-effort inside the factory — never fails an otherwise-successful delete.
+      // Purge the persistent on-disk auth/store dirs — BOTH engine shapes (see EngineFactory), since
+      // an engine switch may have left a live link for the other engine behind. They're keyed by
+      // session NAME and live independently of the (now torn-down, and on delete often never-loaded)
+      // engine instance, so the teardown above doesn't touch them. Without this, recreating a session
+      // under the same name reloads a stale store. Best-effort inside the factory — never fails an
+      // otherwise-successful delete. By this point both fences passed, so no old remover is live
+      // against this name (the transaction freed the name; the dirs are safe to purge).
       await this.engineFactory.purgeSessionData(session.name);
     } finally {
-      // Always clear the teardown mark so a later recreate/start with this id isn't suppressed.
+      // Always clear the teardown mark so a later recreate/start with this id isn't suppressed. This
+      // stop mark was set after fence #1, so clearing it on a rejected 409 only undoes what THIS
+      // delete added — it does NOT touch reconnect timer / engine / last status / error / recovery
+      // state (those are gated on parentDeleted below).
       this.stoppingSessions.delete(id);
-      this.lastDispatchedStatus.delete(id);
-      // Drop the FAILED-reason entry too: it's keyed by a now-deleted UUID that can never be read
-      // again, so leaving it would grow the map without bound across create/fail/delete churn.
-      this.sessionErrors.delete(id);
+      if (parentDeleted) {
+        this.lastDispatchedStatus.delete(id);
+        // Drop the FAILED-reason entry too: it's keyed by a now-deleted UUID that can never be read
+        // again, so leaving it would grow the map without bound across create/fail/delete churn.
+        this.sessionErrors.delete(id);
+        // The stuck-auth recovery budget is keyed by id; a committed delete frees it (and a recreated
+        // session under the same name gets a fresh UUID + fresh budget). Left only on a committed
+        // delete so a failed/409 delete — the session still exists — keeps the budget intact.
+        this.stuckAuthRecoveryUsed.delete(id);
+      }
+      // NOTE: pendingTeardowns is intentionally NOT cleared here. It is keyed by session NAME and
+      // its entries self-remove on settlement (identity-checked). A delete that refused at either
+      // fence MUST leave the entry in place — the name is still reserved against the live remover —
+      // and a delete that succeeded already saw both fences pass, so no live remover exists.
     }
   }
 
   async start(id: string): Promise<Session> {
-    const session = await this.findOne(id);
-
-    // Reserve the slot SYNCHRONOUSLY (same tick as the has() check) so two near-simultaneous
-    // start() calls can't both pass the check and orphan an engine — the has() -> engines.set()
-    // window spans the awaited hook below. The second caller is rejected; the finally clears the
-    // reservation on success AND failure so a failed start never wedges at "already starting".
-    if (this.engines.has(id)) {
-      throw new BadRequestException('Session is already started');
-    }
+    // Reserve the slot SYNCHRONOUSLY at entry — before even the findOne await. Two near-simultaneous
+    // start() calls must not both pass the check and orphan an engine (the has() -> engines.set()
+    // window spans the awaited hook below), and the infra import pre-flight (getActiveSessionIds)
+    // must see an in-flight start during the findOne round-trip too: registered only after findOne,
+    // a start would be invisible in that window and a stopOrphans import could DELETE the session
+    // row while an engine for it is being created. The finally clears the reservation on success
+    // AND failure so a failed start never wedges at "already starting".
     if (this.initializingSessions.has(id)) {
       throw new BadRequestException('Session is already starting');
-    }
-    const maxConcurrentSessions = resolveMaxConcurrentSessions(this.configService);
-    if (maxConcurrentSessions !== null) {
-      // Count each session once. A session mid-initialization is transiently in BOTH `engines` (set at
-      // the start of initializeEngine) and `initializingSessions` (until start()'s finally), so summing
-      // the two sizes would double-count it and falsely reject new starts at ~half the configured cap.
-      const activeCount = new Set<string>([...this.engines.keys(), ...this.initializingSessions]).size;
-      if (activeCount >= maxConcurrentSessions) {
-        throw new BadRequestException(`Maximum concurrent sessions reached (${maxConcurrentSessions})`);
-      }
     }
     this.initializingSessions.add(id);
 
     try {
+      const session = await this.findOne(id);
+
+      if (this.engines.has(id)) {
+        throw new BadRequestException('Session is already started');
+      }
+      const maxConcurrentSessions = resolveMaxConcurrentSessions(this.configService);
+      if (maxConcurrentSessions !== null) {
+        // Count each OTHER session once. A session mid-initialization is transiently in BOTH
+        // `engines` (set at the start of initializeEngine) and `initializingSessions` (until
+        // start()'s finally), so summing the two sizes would double-count it; and `id` itself is
+        // already reserved in `initializingSessions` (added at entry), so it must not count
+        // against the cap it is being checked against.
+        const activeIds = new Set<string>([...this.engines.keys(), ...this.initializingSessions]);
+        activeIds.delete(id);
+        if (activeIds.size >= maxConcurrentSessions) {
+          throw new BadRequestException(`Maximum concurrent sessions reached (${maxConcurrentSessions})`);
+        }
+      }
+
+      // Credential-teardown fence — runs IMMEDIATELY after the read-only findOne + duplicate/cap
+      // checks and BEFORE any lifecycle mutation (stop-mark clear, hook, reconnect-state, engine
+      // creation, recovery-budget reset) or auth-dir access. A logout teardown that lost its deadline
+      // race is still running and ends in an fs.rm of this session's on-disk profile — the same path
+      // initializeEngine is about to populate. The fence is keyed by session NAME (the auth-dir key)
+      // and FAIL CLOSED: a still-wedged teardown could still rm a fresh profile under this name, so
+      // refuse with a retryable 409 instead of proceeding. On a 409, no lifecycle state is touched
+      // (the stop mark, reconnect timer, engine, last status/error, and recovery budget are left as
+      // they were) — start() simply did not happen. The one transient exception is the
+      // initializingSessions reservation added synchronously at start() entry: its finally removes it
+      // again, so a refused start does not leave a false "already starting" mark behind (briefly held).
+      await this.awaitPendingTeardown(session.name);
+
       // A fresh start intentionally (re-)creates the engine — clear any stale stop/delete mark.
       this.stoppingSessions.delete(id);
 
@@ -589,6 +831,13 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
       // so a poisoned value can't drive a NaN/immediate-relaunch storm or an unbounded loop.
       const { maxAttempts, baseDelay } = resolveReconnectConfig(session.config);
       this.reconnectStates.set(id, { attempts: 0, timer: null, maxAttempts, baseDelay });
+
+      // An accepted top-level start() re-arms the stuck-auth recovery budget: every fence above
+      // (duplicate-start, cap, credential-teardown) passed, so this is a deliberate, operator-initiated
+      // (re)start — not an automatic reconnect. The budget is hoisted to the session so an automatic
+      // reconnect can't reset it per generation; only a fresh top-level episode may spend it again.
+      // Boot auto-start reaches here through this same method, so it re-arms too.
+      this.stuckAuthRecoveryUsed.delete(id);
 
       try {
         await this.initializeEngine(id, session);
@@ -625,6 +874,9 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
           await this.teardownEngineSafely(id, resurrected, e => e.destroy(), 'destroy');
           if (this.isLiveEngine(id, resurrected)) this.engines.delete(id);
         }
+        // A delete() that raced this start purged the on-disk auth dirs BEFORE this init re-created
+        // them — purge again so the window leaves no credential residue behind (no-op for a stop()).
+        await this.purgeAuthDirsIfDeleted(id, session.name);
       }
       return this.findOne(id);
     } finally {
@@ -643,6 +895,108 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
    */
   private isLiveEngine(id: string, engine: IWhatsAppEngine): boolean {
     return this.engines.get(id) === engine;
+  }
+
+  /**
+   * Backfill currently-active statuses from the engine on connect, so the store has today's stories
+   * even for ones posted before this session came online (live posts land via onMessage). Best-effort:
+   * Baileys doesn't support this (throws EngineNotSupportedError) and any other engine error must not
+   * take down the ready path, so every failure is swallowed here. Ingest is idempotent on
+   * `(sessionId, waStatusId)`, so this can never double-count a status onMessage already ingested.
+   */
+  private async seedStatuses(sessionId: string, engine: IWhatsAppEngine): Promise<void> {
+    try {
+      // Read the status-broadcast chat's own recent messages rather than getContactStatuses(): on
+      // whatsapp-web.js the latter reads the StatusV3 collection, which loads asynchronously and is
+      // near-empty right after ready, so a status posted before connect would silently never reach the
+      // store. Fetching the chat's messages (the same on-demand fetch the chat-history endpoint uses)
+      // reliably returns the currently-active statuses with downloadable media/video, and each maps
+      // through the very buildIncomingStatus the live onMessage path uses — so a seeded status is
+      // indistinguishable from one that arrives live. No status.received webhook is dispatched here:
+      // this is a backfill of posts that predate the connection, not a live arrival.
+      // Pre-gate media downloads at the store's own cap: a larger blob would be discarded as
+      // over_cap on ingest anyway, so downloading it is pure waste (heap + bandwidth).
+      const mediaMaxBytes =
+        this.configService?.get<number>('status.mediaMaxBytes', DEFAULT_MEDIA_MAX_BYTES) ?? DEFAULT_MEDIA_MAX_BYTES;
+      const messages = await engine.getChatHistory('status@broadcast', STATUS_SEED_LIMIT, true, mediaMaxBytes);
+      // getChatHistory maps a message's contact from the sync cache only, so status posters (usually
+      // @lid ids) come back nameless. Resolve each unique poster once via getContactById — the same
+      // lookup the contacts API uses, which maps the @lid to the real contact — so a seeded status
+      // carries the poster's name like a live one does. Cached per JID: one lookup per contact, not
+      // one per status.
+      const contactNames = new Map<string, { name?: string; pushName?: string }>();
+      const resolvePoster = async (jid: string): Promise<{ name?: string; pushName?: string }> => {
+        const cached = contactNames.get(jid);
+        if (cached) return cached;
+        let resolved: { name?: string; pushName?: string } = {};
+        try {
+          const contact = await engine.getContactById(jid);
+          if (contact) resolved = { name: contact.name, pushName: contact.pushName };
+        } catch {
+          // Best-effort: a failed lookup just leaves the status nameless.
+        }
+        contactNames.set(jid, resolved);
+        return resolved;
+      };
+      for (const msg of messages) {
+        try {
+          // Mirrors the live path's own-send drop: the broadcast chat's history also contains the
+          // account's OWN active statuses, which must not come back as if a contact had posted them.
+          if (msg.fromMe) continue;
+          // A status whose 24h already ran out is hidden by WhatsApp and would only live until the
+          // next purge sweep — don't backfill it (its media was downloaded by getChatHistory
+          // regardless; this just skips the row).
+          if (msg.timestamp * 1000 + STATUS_TTL_MS <= Date.now()) continue;
+          const status = buildIncomingStatus(msg);
+          if (!status) continue;
+          if (!status.contactName && !status.contactPushName) {
+            const poster = await resolvePoster(status.contactJid);
+            status.contactName = poster.name;
+            status.contactPushName = poster.pushName;
+          }
+          await this.statusStore.ingest(sessionId, status);
+        } catch (itemErr) {
+          // One bad item must not abort the whole backfill.
+          this.logger.warn('Status seed item skipped', {
+            sessionId,
+            error: itemErr instanceof Error ? itemErr.message : String(itemErr),
+          });
+        }
+      }
+    } catch (err) {
+      this.logger.debug('Status seed skipped', {
+        sessionId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
+  /**
+   * Dispatches the opt-in `status.received` webhook once an inbound status row is ingested, and
+   * mirrors it over the websocket so the dashboard's statuses view refreshes live instead of
+   * waiting for a focus refetch. `WebhookService.dispatch` already filters delivery to webhooks
+   * whose `events` array includes `status.received`, so no extra gating is needed here. No media
+   * bytes are included in the payload — consumers fetch media via the status media endpoint.
+   */
+  private dispatchStatusReceived(sessionId: string, row: StatusUpdate): void {
+    const payload = {
+      sessionId,
+      statusId: row.waStatusId,
+      contact: {
+        id: row.contactJid,
+        ...(row.contactName ? { name: row.contactName } : {}),
+        ...(row.contactPushName ? { pushName: row.contactPushName } : {}),
+      },
+      type: row.type,
+      ...(row.caption ? { caption: row.caption } : {}),
+      hasMedia: Boolean(row.mediaPath) && !row.mediaOmitted,
+      mediaOmitted: row.mediaOmitted,
+      ...(row.omitReason ? { omitReason: row.omitReason } : {}),
+      postedAt: row.postedAt,
+      expiresAt: row.expiresAt,
+    };
+    void this.webhookService.dispatch(sessionId, 'status.received', payload);
+    this.eventsGateway.emitStatusReceived(sessionId, payload);
   }
 
   /**
@@ -698,6 +1052,9 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
             sessionId: id,
             waMessageId: m.id,
             chatId: m.chatId,
+            // Group poster for inbound rows only — the account's own backfilled group messages must
+            // not carry author (the column's contract is "null on outgoing echoes").
+            author: m.fromMe ? undefined : m.author,
             from: m.from,
             to: m.to,
             body: m.body,
@@ -755,7 +1112,42 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
     // Mark INITIALIZING before engine.initialize(): the engine drives status forward
     // (QR_READY -> AUTHENTICATING -> READY) through the callbacks below while it
     // initializes, so writing INITIALIZING afterwards would clobber that progress.
-    await this.updateStatus(id, SessionStatus.INITIALIZING);
+    //
+    // The INITIALIZING write is awaited here, and a lifecycle control (stop/logout/delete/forceKill)
+    // can retire this engine during that await. To keep the control action the final persisted owner,
+    // the in-flight write is tracked in pendingInitialStatuses (carrying this exact engine) so each
+    // retiring control can await ITS captured engine's write before its own final mutation. After the
+    // await, ownership is re-validated by object identity + the synchronous stop mark before the
+    // adapter is allowed to initialize — a retired engine must never reach initialize() (which would
+    // re-arm a torn-down adapter and open an untracked socket).
+    const initialStatusPromise = this.updateStatus(id, SessionStatus.INITIALIZING);
+    this.pendingInitialStatuses.set(id, { engine, promise: initialStatusPromise });
+    try {
+      await initialStatusPromise;
+    } finally {
+      // Remove ONLY this engine's entry: a replacement created by a concurrent start()/reconnect
+      // (different engine object) must not have its pending entry evicted by this settlement.
+      const pending = this.pendingInitialStatuses.get(id);
+      if (pending && pending.engine === engine && pending.promise === initialStatusPromise) {
+        this.pendingInitialStatuses.delete(id);
+      }
+    }
+
+    // After the awaited DB write, re-validate ownership before scheduling initialization. The stop
+    // mark is set synchronously by every retiring control BEFORE it awaits this engine's pending
+    // write, so checking it here (no DB read on the healthy path) closes the pre-initialize window
+    // without changing reconnect-when-reload-fails semantics. isLiveEngine guards the stop-mark-less
+    // timeout path and any replacement. There is intentionally NO await between these checks and
+    // engine.initialize() below — an intervening await would re-open the retirement window, and it is
+    // also why ONE isLiveEngine check is enough: the two guards are separated by a synchronous Set
+    // lookup, so nothing can swap the engine between them (a second, identical check used to sit
+    // after the stop mark and could never disagree with this one).
+    if (!this.isLiveEngine(id, engine)) {
+      return;
+    }
+    if (this.stoppingSessions.has(id)) {
+      return;
+    }
 
     const initPromise = engine.initialize({
       onQRCode: (qr: string): void => {
@@ -813,6 +1205,9 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
         // A fresh READY stretch starts the watchdog's failure budget clean too.
         this.livenessFailures.delete(id);
         this.sessionErrors.delete(id);
+        // READY proves any in-flight stuck-auth recovery succeeded (or none was needed), so the
+        // one-shot recovery budget is re-armed for a future episode.
+        this.stuckAuthRecoveryUsed.delete(id);
 
         void this.sessionRepository
           .update(id, {
@@ -828,12 +1223,41 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
               error: err instanceof Error ? err.message : String(err),
             }),
           );
+
+        // Best-effort snapshot of the account's own contacts' currently-active statuses. Live status
+        // posts arrive through onMessage below; this just backfills what was already up before we
+        // connected. Not awaited — onReady must not block on it.
+        void this.seedStatuses(id, engine);
       },
       onMessage: (message): void => {
         if (!this.isLiveEngine(id, engine)) return;
-        // Status/Story posts arrive via the inbound path for some engines; don't persist or webhook them.
-        // Mirrors the isStatusBroadcast guard in onMessageCreate below.
+        // Status/Story posts arrive via the inbound path for some engines; ingest them into the
+        // status store instead of the message pipeline. Mirrors the isStatusBroadcast guard in
+        // onMessageCreate below: an own-send echo (fromMe) stays a plain drop — never ingested,
+        // never dispatched — so a status you posted never re-appears in your own webhooks/API as
+        // if a contact had posted it.
         if (message.isStatusBroadcast) {
+          if (message.fromMe) return;
+          const status = buildIncomingStatus(message);
+          if (status) {
+            void this.statusStore
+              .ingest(id, status)
+              // Dispatch only on a fresh insert: ingest also resolves with the pre-existing row
+              // for a duplicate delivery (or the winner's row after a lost insert race), and the
+              // webhook must fire once per status, not once per (re)delivery.
+              .then(({ row, created }) => {
+                // The ingest awaited; a stop()/delete() can retire this engine mid-flight — don't
+                // dispatch for a session that no longer exists (mirrors message.received's re-check).
+                if (!this.isLiveEngine(id, engine)) return;
+                if (created) this.dispatchStatusReceived(id, row);
+              })
+              .catch(err =>
+                this.logger.warn('Status ingest failed', {
+                  sessionId: id,
+                  error: err instanceof Error ? err.message : String(err),
+                }),
+              );
+          }
           return;
         }
         // Ephemeral/disappearing messages: skip persist + dispatch when the operator opted out.
@@ -920,6 +1344,9 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
               waMessageId: incoming.id || undefined,
               chatId: incoming.chatId,
               chatName,
+              // Group poster (participant JID) — `from` is the group JID, so this is the stable
+              // sender identity the chat view keys attribution runs/colors on. Undefined for 1:1.
+              author: incoming.author,
               from: incoming.from,
               to: incoming.to,
               body: incoming.body,
@@ -1320,10 +1747,12 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
       },
       onDisconnected: (reason: string): void => {
         if (!this.isLiveEngine(id, engine)) return;
-        // Shared with the liveness watchdog (see handleEngineDisconnected). The handler re-reads the
-        // session row itself — this closure's `session` snapshot can be stale by the time a
-        // disconnect lands — so the reconnect always re-initializes from the current row.
-        void this.handleEngineDisconnected(id, reason);
+        // Shared with the liveness watchdog (see handleEngineDisconnected). Pass the captured
+        // engine so the handler can re-check identity across its DB await — this closure's `engine`
+        // (and `session`) snapshots can be stale by the time a disconnect lands, so the handler
+        // re-reads the row itself and fences every side effect on `engine` still being the live
+        // owner. The captured engine is the exact generation token (no numeric counter).
+        void this.handleEngineDisconnected(id, engine, reason);
       },
       onStateChanged: (engineState: EngineStatus): void => {
         if (!this.isLiveEngine(id, engine)) return;
@@ -1333,12 +1762,27 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
           [EngineStatus.QR_READY]: SessionStatus.QR_READY,
           [EngineStatus.AUTHENTICATING]: SessionStatus.AUTHENTICATING,
           [EngineStatus.READY]: SessionStatus.READY,
+          [EngineStatus.ACTION_REQUIRED]: SessionStatus.ACTION_REQUIRED,
           [EngineStatus.FAILED]: SessionStatus.FAILED,
         };
         const newStatus = statusMap[engineState];
         if (newStatus) {
           void this.updateStatus(id, newStatus);
         }
+      },
+      onActionRequired: (reason: string): void => {
+        if (!this.isLiveEngine(id, engine)) return;
+        this.logger.warn(`Session requires operator action: ${reason}`, {
+          sessionId: id,
+          reason,
+          action: 'action_required',
+        });
+        // Record the reason so attachLastError surfaces it while the session is ACTION_REQUIRED,
+        // then updateStatus (via onStateChanged above) has already written the status. Set here too
+        // to be defensive: the callback order is onStateChanged then onActionRequired, but persisting
+        // the reason here means it is available regardless.
+        this.sessionErrors.set(id, reason);
+        void this.hookManager.execute('session:error', { reason }, { sessionId: id, source: 'Engine' });
       },
       onError: (reason: string): void => {
         if (!this.isLiveEngine(id, engine)) return;
@@ -1373,6 +1817,31 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
         // and SIGKILL its process: leaving it in the map would hold a concurrency slot indefinitely and
         // make the next start() reject the session as "already started" instead of re-initializing it.
         this.evictAndForceDestroy(id, engine);
+      },
+      onCredentialTeardownStarted: (operation: Promise<void>): void => {
+        // The adapter fired the moment it began the call that ends in an fs.rm of this session's
+        // on-disk auth dir. Track it under the captured session NAME (the auth-dir key) — NOT the
+        // UUID, and NOT guarded on this engine still being live: a logout that captured this engine
+        // must register its destructive promise even as a concurrent stop()/delete() evicts it,
+        // because the rm targets the session name's dir and would otherwise race a (re)created
+        // session under that same name. `session.name` is the immutable snapshot captured at
+        // initializeEngine entry, so a row delete/recreate under the same name cannot poison the key.
+        this.trackPendingCredentialTeardown(session.name, operation);
+      },
+      claimStuckAuthRecovery: (): boolean => {
+        // SYNCHRONOUS atomic claim for the one-shot automatic credential-reset budget. The adapter
+        // calls this right before it would wipe LocalAuth (recoverFromStuckAuth); a denial makes the
+        // adapter fail terminally WITHOUT touching the auth dir. Two guards, in order:
+        //  1. the captured engine must still be the live owner — a stale generation (superseded by a
+        //     reconnect/restart) must never spend the budget for the current owner;
+        //  2. the session id must not already be in the Set — the budget is one claim per episode.
+        // Synchronous on purpose: the race between the stuck-auth timeout and a concurrent
+        // start()/reconnect is decided within a single event-loop turn (no await between the checks
+        // and the Set mutation).
+        if (!this.isLiveEngine(id, engine)) return false;
+        if (this.stuckAuthRecoveryUsed.has(id)) return false;
+        this.stuckAuthRecoveryUsed.add(id);
+        return true;
       },
     });
 
@@ -1630,8 +2099,41 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
    * watchdog detects death long after the last state change, and even the callback's closure
    * snapshot can be stale — so the reconnect always re-initializes from the current row. Never
    * throws: a DB hiccup must not turn a disconnect into an unhandled rejection.
+   *
+   * Concurrency fence: the caller has already gated entry on `isLiveEngine(id, engine)` against
+   * the synchronous-callback window, but this handler awaits a DB read and (later) schedules work
+   * off a captured `session` snapshot. Between the entry check and the awaits an id can be
+   * reassigned — a stop()/reconnect that replaces the engine mid-flight — so the captured engine
+   * is treated as an object-identity generation token: every observable side effect and the
+   * reconnect scheduling are gated on `engine` STILL being the live owner at the point they run.
+   * A stale disconnect handler must not publish disconnect side effects for a session that now
+   * belongs to a different engine, nor schedule a reconnect whose timer would later destroy the
+   * replacement engine.
    */
-  private async handleEngineDisconnected(id: string, reason: string): Promise<void> {
+  private async handleEngineDisconnected(id: string, engine: IWhatsAppEngine, reason: string): Promise<void> {
+    // Entry fence: the caller already checked liveness, but the gap between that check and this
+    // call site is enough for a stop()/reconnect to swap the engine. Re-verify before doing work.
+    if (!this.isLiveEngine(id, engine)) return;
+
+    let session: Session | null;
+    try {
+      session = await this.sessionRepository.findOne({ where: { id } });
+    } catch (err) {
+      this.logger.error('Failed to reload the session for reconnect scheduling', String(err), {
+        sessionId: id,
+        action: 'reconnect_schedule_error',
+      });
+      return;
+    }
+    // A session deleted just before this ran has nothing left to reconnect; skip it.
+    if (!session) return;
+
+    // Post-await fence: the findOne yield above is the window in which a stop()/reconnect can
+    // replace the engine for this id. Only a STILL-live owner may publish disconnect side effects
+    // or change the persisted status — otherwise a stale disconnect would (e.g.) clobber a
+    // replacement engine that is already READY.
+    if (!this.isLiveEngine(id, engine)) return;
+
     this.logger.warn(`Session disconnected: ${reason}`, {
       sessionId: id,
       reason,
@@ -1653,18 +2155,12 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
 
     void this.updateStatus(id, SessionStatus.DISCONNECTED);
 
-    let session: Session | null;
-    try {
-      session = await this.sessionRepository.findOne({ where: { id } });
-    } catch (err) {
-      this.logger.error('Failed to reload the session for reconnect scheduling', String(err), {
-        sessionId: id,
-        action: 'reconnect_schedule_error',
-      });
-      return;
-    }
-    // A session deleted just before this ran has nothing left to reconnect; skip it.
-    if (!session) return;
+    // Pre-schedule fence: scheduleReconnect's timer eventually calls executeReconnect, which does
+    // a fresh engines.get(id) and destroys whatever engine currently owns the id. If this engine
+    // was superseded since the post-await check above (no await sits between them today, but this
+    // is the load-bearing boundary for the reconnect), that timer would destroy the replacement.
+    // Object-identity is the exact generation token, so check once more immediately before arming.
+    if (!this.isLiveEngine(id, engine)) return;
 
     // Attempt to reconnect
     this.scheduleReconnect(id, session);
@@ -1695,11 +2191,22 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
    * Actively probe one engine. Only READY sessions are expected to answer (anything else is owned by
    * the QR/reconnect flows); engines without `probeLiveness` keep relying on engine events alone.
    * MAX_FAILURES consecutive failures treat the session exactly like an engine-reported disconnect.
+   *
+   * ACTION_REQUIRED is probed too, but OBSERVE-ONLY: the engine is still running and a human has to
+   * act, and clearing that status is theirs to do (stop, then start). Acting on a failed probe would
+   * hand the session to the reconnect path and silently drop the very status that asked for
+   * attention — so the probe result only reaches the log. Without probing at all, a page that dies
+   * while waiting for the operator left no trace anywhere, which is what this closes.
    */
   private async probeSessionLiveness(id: string, engine: IWhatsAppEngine): Promise<void> {
-    if (engine.getStatus() !== EngineStatus.READY) {
+    const status = engine.getStatus();
+    const observeOnly = status === EngineStatus.ACTION_REQUIRED;
+    if (status !== EngineStatus.READY && !observeOnly) {
       // Not expected to answer right now — and any accrued failures belong to a previous READY
-      // stretch, so the next one starts clean.
+      // stretch, so the next one starts clean. This also self-cleans the observe-only counter below:
+      // every path out of ACTION_REQUIRED passes through a status that lands here (or through
+      // onReady, which clears it), so an observe-only count can never be inherited by a READY
+      // stretch and push it over MAX_FAILURES early.
       this.livenessFailures.delete(id);
       return;
     }
@@ -1735,11 +2242,34 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
     }
 
     if (alive) {
+      // Note a recovery on the observe-only path, so the log shows the page came back rather than
+      // leaving the earlier warning as the last word.
+      if (observeOnly && this.livenessFailures.has(id)) {
+        this.logger.log('Liveness probe answering again while the session awaits operator action', {
+          sessionId: id,
+          action: 'watchdog_probe_recovered',
+        });
+      }
       this.livenessFailures.delete(id);
       return;
     }
 
     const failures = (this.livenessFailures.get(id) ?? 0) + 1;
+    if (observeOnly) {
+      this.livenessFailures.set(id, failures);
+      // One warning per unresponsive stretch, not one per tick: a session can sit in
+      // ACTION_REQUIRED until a human gets to it, and at a 60s interval an unbounded log would bury
+      // everything else. The count keeps rising so the recovery branch above can tell it happened.
+      if (failures === 1) {
+        this.logger.warn(
+          'Liveness probe failed while the session awaits operator action; not reconnecting it — ' +
+            'the status is operator-owned. If the page is gone, stop and start the session.',
+          { sessionId: id, action: 'watchdog_probe_failed_observe_only' },
+        );
+      }
+      return;
+    }
+
     if (failures < SESSION_WATCHDOG_MAX_FAILURES) {
       this.livenessFailures.set(id, failures);
       this.logger.warn('Liveness probe failed; will treat the session as dead after repeated failures', {
@@ -1756,7 +2286,7 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
       failures,
       action: 'watchdog_disconnect',
     });
-    await this.handleEngineDisconnected(id, 'liveness probe failed (watchdog)');
+    await this.handleEngineDisconnected(id, engine, 'liveness probe failed (watchdog)');
   }
 
   private scheduleReconnect(id: string, session: Session): void {
@@ -1797,6 +2327,15 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
           : `Reconnection failed after ${state.attempts} attempts — restart the session.`,
       );
       void this.updateStatus(id, SessionStatus.FAILED);
+      // Terminal path — evict the dead engine so it neither holds a concurrency slot nor makes a
+      // subsequent start() reject the session as "already started". This mirrors onError's terminal
+      // path (the same rationale: leaving the engine in the map wedges the session). The engine may
+      // already be gone in the executeReconnect-catch path (it evicts the half-built engine before
+      // scheduling a reconnect), so guard on its presence — evictAndForceDestroy takes a non-null engine.
+      const deadEngine = this.engines.get(id);
+      if (deadEngine) {
+        this.evictAndForceDestroy(id, deadEngine);
+      }
       return;
     }
 
@@ -1864,6 +2403,32 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
     return (await this.sessionRepository.findOne({ where: { id } })) == null;
   }
 
+  /**
+   * Re-purge a retired session's on-disk auth dirs when its row was deleted while a slow
+   * engine.initialize() was still in flight. A start()/(re)connect that lands between delete()'s
+   * engine eviction and its row removal initializes a fresh engine that RE-CREATES the auth dir
+   * purgeSessionData just emptied (both engines mkdir at init); the post-init guard tears the engine
+   * down, but engine teardown never touches the on-disk dirs, so without this second purge the race
+   * leaves live WhatsApp credentials behind — and a later same-name recreate would silently re-link
+   * them. Gated two ways so ONLY the delete race purges: a stop() retirement still has its row (its
+   * credentials must survive), and a row re-created under the SAME name now owns those dirs, so
+   * purging would wipe the fresh session's link. Best-effort: a failure is logged, never thrown —
+   * the retirement path must still surface the deleted session as NotFound.
+   */
+  private async purgeAuthDirsIfDeleted(id: string, name: string): Promise<void> {
+    try {
+      if ((await this.sessionRepository.findOne({ where: { id } })) != null) return;
+      if ((await this.sessionRepository.findOne({ where: { name } })) != null) return;
+      await this.engineFactory.purgeSessionData(name);
+    } catch (error) {
+      this.logger.warn('Failed to re-purge session auth dirs after a start/delete race', {
+        sessionId: id,
+        action: 'engine_repurge_failed',
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
   private async executeReconnect(id: string, session: Session, state: ReconnectState): Promise<void> {
     // The session may have been stopped/deleted before this fired — don't resurrect it.
     if (this.stoppingSessions.has(id)) {
@@ -1879,6 +2444,14 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
         await this.teardownEngineSafely(id, oldEngine, e => e.destroy(), 'destroy');
         if (this.isLiveEngine(id, oldEngine)) this.engines.delete(id);
       }
+
+      // Credential-teardown fence — BEFORE engineFactory.create (inside initializeEngine). A logout
+      // teardown that lost its deadline race is still running and ends in an fs.rm of this session's
+      // on-disk profile — the same path initializeEngine is about to populate. Keyed by session NAME
+      // (the auth-dir key) and FAIL CLOSED: a timeout becomes a failed reconnect attempt that is
+      // rescheduled WITHOUT touching the auth dir (the catch below schedules the next attempt; no
+      // engine was created, so there is nothing to evict and no dir to purge).
+      await this.awaitPendingTeardown(session.name);
 
       // Re-initialize
       await this.initializeEngine(id, session);
@@ -1902,6 +2475,9 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
           await this.teardownEngineSafely(id, resurrected, e => e.destroy(), 'destroy');
           if (this.isLiveEngine(id, resurrected)) this.engines.delete(id);
         }
+        // Same start/delete window as start()'s post-init guard: this re-init re-created auth dirs
+        // delete() had already purged — purge again so no credentials outlive the row.
+        await this.purgeAuthDirsIfDeleted(id, session.name);
         return;
       }
     } catch (error: unknown) {
@@ -1945,6 +2521,10 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
     // behaviour: a later start() clears it; it guards against a late reconnect resurrecting the id.)
     const engine = this.engines.get(id);
     if (engine) {
+      // Await THIS engine's in-flight INITIALIZING write before teardown / the final DISCONNECTED
+      // write so a delayed pre-initialize status update can never settle after the retirement and
+      // become the last persisted status. Identity-checked: only the captured engine's promise.
+      await this.awaitInitialStatus(id, engine);
       await this.teardownEngineSafely(id, engine, e => e.disconnect(), 'disconnect');
       if (this.isLiveEngine(id, engine)) this.engines.delete(id);
     }
@@ -1958,6 +2538,97 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
   }
 
   /**
+   * Log out of WhatsApp — attempts an engine-native unlink of this device, then tears the session
+   * down locally regardless of the unlink outcome.
+   *
+   * Differs from stop() in the one way that matters to a user: logout() asks WhatsApp to remove the
+   * companion device, so a completed unlink eventually makes the entry disappear from the account
+   * holder's Linked Devices list. stop() and delete() only release things locally (delete also
+   * purges the on-disk auth dirs).
+   *
+   * Completion (HTTP 200) means the engine-native unlink operation completed AND the required local
+   * credential cleanup completed — for Baileys, a valid companion identity, an acknowledged
+   * `remove-companion-device` IQ response, and removal of the on-disk auth dir; for whatsapp-web.js,
+   * `Client.logout()` including `LocalAuth.logout()` settled. 200 is NOT an independent observation
+   * that the handset UI no longer shows the linked device — only the linked-device canary observes
+   * that, and the dashboard must not claim otherwise.
+   *
+   * Must run while the engine is still live — logout is a network round-trip to WhatsApp, so it
+   * cannot be performed after destroy()/forceDestroy(). Mirrors stop()'s lifecycle otherwise
+   * (stop-mark + cancel-reconnect + bounded, isolated teardown + Map reconciliation).
+   *
+   * Requires a started session: with no engine loaded there is nothing to send the unlink through,
+   * so the request is rejected with 400 rather than reporting an unlink that never happened. A 400
+   * does NOT change the row. To just release a stopped session locally, use stop()/delete().
+   *
+   * Throws a retryable BadGatewayException (502) carrying a stable `code: 'SESSION_LOGOUT_INCOMPLETE'`
+   * when an accepted engine-backed attempt stopped locally but the unlink operation did NOT complete
+   * — no identity/no send, no IQ acknowledgement, timeout/transport error, OR local credential
+   * cleanup failure. After EVERY engine-backed attempt (200 OR 502) the session is torn down locally
+   * (map reconciled, status DISCONNECTED) and `phone` is cleared so the boot auto-start does not
+   * resurrect the session into an uncertain/invalid credential state. No success audit is written on
+   * the 502 path (the controller audits SESSION_LOGGED_OUT only after the service resolves). The
+   * operator can start the session and retry the logout.
+   */
+  async logout(id: string): Promise<Session> {
+    const session = await this.findOne(id);
+    const engine = this.engines.get(id);
+
+    if (!engine) {
+      throw new BadRequestException('Session is not started. Call POST /sessions/:id/start first.');
+    }
+
+    // Mark as tearing down BEFORE cleanup so an in-flight reconnect can't resurrect it.
+    this.stoppingSessions.add(id);
+    // Cancel any reconnection attempts
+    this.cancelReconnect(id);
+
+    // Await THIS engine's in-flight INITIALIZING write before teardown / the final DISCONNECTED
+    // write so a delayed pre-initialize status update can never settle after the retirement.
+    await this.awaitInitialStatus(id, engine);
+    // The credential fence is keyed by session NAME (the auth-dir key). Captured immutably here so a
+    // raw logout that outlives its deadline race is tracked under the right name even if the row is
+    // later deleted/recreated.
+    const unlinked = await this.teardownEngineSafely(id, engine, e => e.logout(), 'logout', session.name);
+    if (this.isLiveEngine(id, engine)) this.engines.delete(id);
+    await this.updateStatus(id, SessionStatus.DISCONNECTED);
+
+    if (!unlinked) {
+      this.logger.warn(`Session stopped locally but the logout operation did not complete: ${session.name}`, {
+        sessionId: id,
+        action: 'logout_incomplete',
+      });
+      // The local teardown already ran (map reconciled, status DISCONNECTED), but the unlink operation
+      // did not complete. Clear `phone` AFTER the attempt and BEFORE throwing so the boot auto-start
+      // does not resurrect the session into a credential state that can no longer reach READY — the
+      // local credentials were torn down, so re-entering auto-start would only wedge it. The retryable
+      // 502 carries a stable machine code so the dashboard can branch on origin without guessing from
+      // the status/message; no success audit is written on this path.
+      await this.sessionRepository.update(id, { phone: null });
+      throw new BadGatewayException({
+        statusCode: HttpStatus.BAD_GATEWAY,
+        message:
+          'Session was stopped locally, but the logout operation is incomplete — the device may ' +
+          'still be linked. Start the session and retry the logout.',
+        error: 'Bad Gateway',
+        code: 'SESSION_LOGOUT_INCOMPLETE',
+      });
+    }
+
+    // A completed engine-backed unlink wipes the stored credentials, so this session can never
+    // reach READY again without a fresh QR/pairing. Clear `phone` to take it out of the boot
+    // auto-start query (phone IS NOT NULL) instead of resurrecting it into a QR it can never pass
+    // on every restart. onReady rewrites it on the next successful link.
+    await this.sessionRepository.update(id, { phone: null });
+
+    this.logger.log(`Session logged out: ${session.name}`, {
+      sessionId: id,
+      action: 'logout',
+    });
+    return this.findOne(id);
+  }
+
+  /**
    * Force-recover a stuck session: SIGKILL its engine's own resources (a wedged Chromium for the
    * whatsapp-web.js engine) and tear it down, even when a normal stop()/delete() can't because the
    * engine is hung. Mirrors stop()'s lifecycle (stop-mark + cancel-reconnect + bounded, isolated
@@ -1965,16 +2636,25 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
    */
   async forceKill(id: string): Promise<Session> {
     const session = await this.findOne(id);
+    const engine = this.engines.get(id);
+
+    // No live engine means there is nothing to SIGKILL. Resolving would let the controller write a
+    // SESSION_FORCE_KILLED audit row for a kill that never happened — mirror logout()'s not-started
+    // refusal. A wedged engine torn down earlier is reaped by the next start()'s orphan sweep (and
+    // by process exit), not by force-kill.
+    if (!engine) {
+      throw new BadRequestException('Session is not started. Call POST /sessions/:id/start first.');
+    }
 
     // Mark as tearing down BEFORE cleanup so an in-flight reconnect can't resurrect it.
     this.stoppingSessions.add(id);
     this.cancelReconnect(id);
 
-    const engine = this.engines.get(id);
-    if (engine) {
-      await this.teardownEngineSafely(id, engine, e => e.forceDestroy(), 'force-destroy');
-      if (this.isLiveEngine(id, engine)) this.engines.delete(id);
-    }
+    // Await THIS engine's in-flight INITIALIZING write before teardown / the final DISCONNECTED
+    // write so a delayed pre-initialize status update can never settle after the retirement.
+    await this.awaitInitialStatus(id, engine);
+    await this.teardownEngineSafely(id, engine, e => e.forceDestroy(), 'force-destroy');
+    if (this.isLiveEngine(id, engine)) this.engines.delete(id);
 
     this.logger.warn(`Session force-killed: ${session.name}`, {
       sessionId: id,
@@ -2223,6 +2903,82 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
    */
   isActive(id: string): boolean {
     return this.engines.has(id);
+  }
+
+  /**
+   * Ids of every session with a live engine — including ones mid-initialization (their engine is not
+   * in `engines` yet but will register when start() completes). The infra import pre-flight uses this
+   * to refuse a full-replace restore that would orphan a running engine.
+   */
+  getActiveSessionIds(): string[] {
+    return [...new Set([...this.engines.keys(), ...this.initializingSessions])];
+  }
+
+  /**
+   * Stop the engines for the given session ids WITHOUT touching the sessions DB row (the caller,
+   * the infra import path, is about to DELETE that row as part of a full replace). This is the one
+   * stop path that bypasses findOne()/stop()/delete() — every other path keys through the row, so an
+   * engine orphaned by a restore was previously unstoppable until process restart.
+   *
+   * Each id is handled in isolation and time-bounded: a stuck Chromium/socket on one orphan can
+   * neither stall nor abort the others, and the whole call is bounded by teardownEngineSafely's
+   * per-engine 10s deadline. The mark + reconnect-cancel happen first so an in-flight reconnect
+   * cannot resurrect the id while teardown runs. Engines that are mid-initialization (no entry in
+   * `engines` yet) are marked but cannot be torn down here — their start() will see the stop mark
+   * via its existing guard and self-abort; the caller learns about them in `notRunning`.
+   *
+   * Always resolves. Best-effort: a `failed` entry means teardown threw or timed out, and the engine
+   * is removed from the Map regardless so it stops holding a concurrency slot.
+   */
+  async stopOrphanEngines(
+    sessionIds: string[],
+  ): Promise<{ stopped: string[]; notRunning: string[]; failed: string[] }> {
+    const stopped: string[] = [];
+    const notRunning: string[] = [];
+    const failed: string[] = [];
+
+    if (sessionIds.length === 0) return { stopped, notRunning, failed };
+
+    await Promise.allSettled(
+      sessionIds.map(async id => {
+        // Mark + cancel BEFORE teardown so a late reconnect cannot resurrect the id mid-teardown.
+        this.stoppingSessions.add(id);
+        this.cancelReconnect(id);
+
+        const engine = this.engines.get(id);
+        if (!engine) {
+          // Either never started, or still inside initializeEngine (no Map entry yet). The stop mark
+          // above is what aborts the initializing case via start()'s existing guard.
+          notRunning.push(id);
+          return;
+        }
+        try {
+          const tornDown = await this.destroyEngineSafely(id, engine);
+          // The engine leaves the Map regardless of teardown outcome so it stops holding a
+          // concurrency slot — but only a completed teardown counts as `stopped`. A throw/timeout
+          // means the Chromium/socket may still be alive and writing, so the id lands in `failed`
+          // and the caller (the infra import) can flag restartRequired instead of reporting a
+          // clean stop for a wedged engine.
+          if (this.isLiveEngine(id, engine)) this.engines.delete(id);
+          if (tornDown) {
+            stopped.push(id);
+          } else {
+            failed.push(id);
+          }
+        } catch (err) {
+          // destroyEngineSafely never throws today (it isolates via teardownEngineSafely), but defend
+          // against a future change so a single orphan cannot abort the batch.
+          this.logger.error(`Failed to stop orphan engine for session ${id}`, String(err), {
+            sessionId: id,
+            action: 'stop_orphan_failed',
+          });
+          if (this.isLiveEngine(id, engine)) this.engines.delete(id);
+          failed.push(id);
+        }
+      }),
+    );
+
+    return { stopped, notRunning, failed };
   }
 
   private delay(ms: number): Promise<void> {

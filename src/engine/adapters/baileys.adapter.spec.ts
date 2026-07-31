@@ -22,13 +22,20 @@ class FakeSock extends EventEmitter {
   public requestPairingCode = jest.fn().mockResolvedValue('ABCD-EFGH');
   public end = jest.fn();
   public logout = jest.fn().mockResolvedValue(undefined);
+  // IQ query surface used by logout(): sends a BinaryNode and resolves the tagged response.
+  // Default returns a truthy IQ result (a successful acknowledgement) so tests that don't care can
+  // just await logout(); individual tests override the implementation to simulate failure.
+  public query = jest.fn().mockResolvedValue({ tag: 'iq', attrs: { type: 'result' } });
+  public generateMessageTag = jest.fn().mockReturnValue('TAG-1');
   public sendMessage = jest.fn();
   public onWhatsApp = jest.fn();
   public sendPresenceUpdate = jest.fn().mockResolvedValue(undefined);
   public groupFetchAllParticipating = jest.fn();
   public groupMetadata = jest.fn();
   public groupCreate = jest.fn();
-  public groupParticipantsUpdate = jest.fn().mockResolvedValue(undefined);
+  public groupParticipantsUpdate = jest
+    .fn()
+    .mockResolvedValue([{ status: '200', jid: '628111@s.whatsapp.net', content: {} }]);
   public groupLeave = jest.fn().mockResolvedValue(undefined);
   public groupUpdateSubject = jest.fn().mockResolvedValue(undefined);
   public groupUpdateDescription = jest.fn().mockResolvedValue(undefined);
@@ -86,6 +93,8 @@ jest.mock('@whiskeysockets/baileys', () => ({
   ),
   // Identity passthrough by default; individual tests may override to simulate unwrapping.
   normalizeMessageContent: jest.fn((c: unknown) => c),
+  // The pinned protocol node targets this JID; exported from the real module's WABinary surface.
+  S_WHATSAPP_NET: '@s.whatsapp.net',
   DisconnectReason: { loggedOut: 401, forbidden: 403, restartRequired: 515, connectionReplaced: 440 },
   proto: {
     Message: {
@@ -96,7 +105,9 @@ jest.mock('@whiskeysockets/baileys', () => ({
   },
 }));
 
-import { BaileysAdapter } from './baileys.adapter';
+import { HttpsProxyAgent } from 'https-proxy-agent';
+import { SocksProxyAgent } from 'socks-proxy-agent';
+import { BaileysAdapter, createProxyAgent } from './baileys.adapter';
 import {
   EditedMessage,
   EngineStatus,
@@ -111,6 +122,7 @@ import { CallNotFoundError } from '../../common/errors/call-not-found.error';
 import { EngineRefusedError } from '../../common/errors/engine-refused.error';
 import { InvalidInviteCodeError } from '../../common/errors/invalid-invite-code.error';
 import { ChannelNotFoundError } from '../../common/errors/channel-not-found.error';
+import { BadRequestException } from '@nestjs/common';
 import { loadRemoteMediaBuffer } from '../../common/media/load-remote-media';
 
 const fakeStore = {
@@ -191,19 +203,27 @@ describe('BaileysAdapter lifecycle & status', () => {
   });
 
   it('on a logged-out close: DISCONNECTED, onDisconnected, and NO reconnect', async () => {
-    const onDisconnected = jest.fn();
-    const adapter = newAdapter();
-    await adapter.initialize(noopCallbacks({ onDisconnected }));
-    // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access
-    const makeWASocket = jest.requireMock('@whiskeysockets/baileys').default as jest.Mock;
-    makeWASocket.mockClear();
-    fakeSock.fire('connection.update', {
-      connection: 'close',
-      lastDisconnect: { error: { output: { statusCode: 401 } } },
-    });
-    expect(adapter.getStatus()).toBe(EngineStatus.DISCONNECTED);
-    expect(onDisconnected).toHaveBeenCalled();
-    expect(makeWASocket).not.toHaveBeenCalled(); // no reconnect
+    const rmSpy = jest.spyOn(fs.promises, 'rm').mockResolvedValue(undefined);
+    try {
+      const onDisconnected = jest.fn();
+      const adapter = newAdapter();
+      await adapter.initialize(noopCallbacks({ onDisconnected }));
+      // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access
+      const makeWASocket = jest.requireMock('@whiskeysockets/baileys').default as jest.Mock;
+      makeWASocket.mockClear();
+      fakeSock.fire('connection.update', {
+        connection: 'close',
+        lastDisconnect: { error: { output: { statusCode: 401 } } },
+      });
+      // The status/socket teardown is synchronous; onDisconnected fires only after the deferred auth
+      // removal settles (see handleRemoteLoggedOut).
+      expect(adapter.getStatus()).toBe(EngineStatus.DISCONNECTED);
+      await new Promise(r => setImmediate(r));
+      expect(onDisconnected).toHaveBeenCalledWith('logged out');
+      expect(makeWASocket).not.toHaveBeenCalled(); // no reconnect
+    } finally {
+      rmSpy.mockRestore();
+    }
   });
 
   it('on a logged-out close: clears the on-disk auth dir so a fresh connect shows a new QR', async () => {
@@ -228,16 +248,252 @@ describe('BaileysAdapter lifecycle & status', () => {
     }
   });
 
-  it('logout() clears the on-disk auth dir (stale creds would otherwise block re-linking)', async () => {
-    const rmSpy = jest.spyOn(fs.promises, 'rm').mockResolvedValue(undefined);
+  it('on a logged-out close: moves DISCONNECTED synchronously, registers the teardown, fires onDisconnected only after the rm resolves', async () => {
+    // The WhatsApp-originated cleanup runs as an awaited async helper. The status/socket/live-call
+    // teardown must land SYNCHRONOUSLY before any await so the watchdog never processes a READY socket
+    // that is already dead; onCredentialTeardownStarted must register the cleanup promise; and
+    // onDisconnected fires only after the strict auth removal succeeds.
+    let releaseRm!: () => void;
+    const rmPromise = new Promise<void>(res => {
+      releaseRm = res;
+    });
+    const rmSpy = jest.spyOn(fs.promises, 'rm').mockReturnValue(rmPromise);
+    const onCredentialTeardownStarted = jest.fn((op: Promise<void>) => {
+      void op.catch(() => undefined);
+    });
+    const onDisconnected = jest.fn();
+    const onError = jest.fn();
     try {
       const adapter = newAdapter();
-      await adapter.initialize(noopCallbacks({}));
-      await adapter.logout();
+      // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access
+      const makeWASocket = jest.requireMock('@whiskeysockets/baileys').default as jest.Mock;
+      await adapter.initialize(noopCallbacks({ onCredentialTeardownStarted, onDisconnected, onError }));
+      makeWASocket.mockClear(); // only count makeWASocket calls originating from the logged-out path
+
+      fakeSock.fire('connection.update', {
+        connection: 'close',
+        lastDisconnect: { error: { output: { statusCode: 401 } } },
+      });
+
+      // SYNCHRONOUSLY (before the deferred rm settles): DISCONNECTED, socket nulled, live calls clear.
+      expect(adapter.getStatus()).toBe(EngineStatus.DISCONNECTED);
+      expect((adapter as unknown as { sock: unknown }).sock).toBeNull();
+      expect(onCredentialTeardownStarted).toHaveBeenCalledTimes(1);
+      // The registered argument is the same promise the adapter is about to await.
+      const registeredOp = onCredentialTeardownStarted.mock.calls[0][0];
+      expect(typeof registeredOp.then).toBe('function');
+      expect(makeWASocket).not.toHaveBeenCalled(); // no reconnect scheduled
+      // onDisconnected has NOT fired yet — the rm is still pending.
+      expect(onDisconnected).not.toHaveBeenCalled();
+      expect(onError).not.toHaveBeenCalled();
+
+      releaseRm();
+      await new Promise(r => setImmediate(r)); // let the awaited helper settle
+
       expect(rmSpy).toHaveBeenCalledWith(
         path.join('./data/baileys', 'sess-1'),
         expect.objectContaining({ recursive: true, force: true }),
       );
+      expect(onDisconnected).toHaveBeenCalledWith('logged out');
+      expect(adapter.getStatus()).toBe(EngineStatus.DISCONNECTED); // still DISCONNECTED on success
+      expect(onError).not.toHaveBeenCalled();
+    } finally {
+      rmSpy.mockRestore();
+    }
+  });
+
+  it('on a logged-out close: a failed auth removal becomes terminal FAILED + onError (NOT disconnected/reconnect)', async () => {
+    // A clearAuthState() that rethrows must surface as a terminal error so the operator learns the
+    // credentials did not actually get wiped. It must not look like a clean disconnect or schedule a
+    // reconnect with known-invalid auth.
+    const rmSpy = jest.spyOn(fs.promises, 'rm').mockRejectedValueOnce(new Error('disk error'));
+    const onDisconnected = jest.fn();
+    const onError = jest.fn();
+    try {
+      const adapter = newAdapter();
+      // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access
+      const makeWASocket = jest.requireMock('@whiskeysockets/baileys').default as jest.Mock;
+      await adapter.initialize(noopCallbacks({ onDisconnected, onError }));
+      makeWASocket.mockClear(); // only count makeWASocket calls originating from the logged-out path
+
+      fakeSock.fire('connection.update', {
+        connection: 'close',
+        lastDisconnect: { error: { output: { statusCode: 401 } } },
+      });
+      await new Promise(r => setImmediate(r)); // let the awaited helper settle on the rejection
+
+      expect(adapter.getStatus()).toBe(EngineStatus.FAILED);
+      expect(onError).toHaveBeenCalledTimes(1);
+      expect(onError).toHaveBeenCalledWith(expect.stringContaining('disk error'));
+      expect(onDisconnected).not.toHaveBeenCalled(); // success path did not run
+      expect(makeWASocket).not.toHaveBeenCalled(); // no reconnect
+    } finally {
+      rmSpy.mockRestore();
+    }
+  });
+
+  it('logout() clears the on-disk auth dir only AFTER an IQ result acknowledges the unlink', async () => {
+    // 200 = engine-native unlink completed AND required local credential cleanup completed. The auth
+    // dir must be removed only after a valid IQ response; removing it earlier would leave the device
+    // linked server-side with no local credentials to retry with.
+    const rmSpy = jest.spyOn(fs.promises, 'rm').mockResolvedValue(undefined);
+    try {
+      const adapter = newAdapter();
+      await adapter.initialize(noopCallbacks({}));
+      fakeSock.user = { id: '628999:12@s.whatsapp.net', name: 'Me' };
+
+      await adapter.logout();
+
+      // remove-companion-device IQ went out through query() with the pinned protocol node and the
+      // 8s acknowledgement timeout. Auth dir removal happened only after the truthy IQ result.
+      expect(fakeSock.query).toHaveBeenCalledTimes(1);
+      const [node, timeoutMs] = fakeSock.query.mock.calls[0] as [
+        {
+          tag: string;
+          attrs: { to: string; type: string; id: string; xmlns: string };
+          content: Array<{ tag: string; attrs: { jid: string; reason: string } }>;
+        },
+        number,
+      ];
+      expect(node.tag).toBe('iq');
+      expect(node.attrs).toEqual({
+        to: '@s.whatsapp.net',
+        type: 'set',
+        id: 'TAG-1',
+        xmlns: 'md',
+      });
+      expect(node.content).toEqual([
+        { tag: 'remove-companion-device', attrs: { jid: '628999:12@s.whatsapp.net', reason: 'user_initiated' } },
+      ]);
+      expect(timeoutMs).toBe(8_000);
+      expect(rmSpy).toHaveBeenCalledWith(
+        path.join('./data/baileys', 'sess-1'),
+        expect.objectContaining({ recursive: true, force: true }),
+      );
+    } finally {
+      rmSpy.mockRestore();
+    }
+  });
+
+  it('logout() never calls sock.logout() — the IQ query is the unlink contract', async () => {
+    // Baileys sock.logout() resolves on WebSocket write flush (NOT an IQ ack) and transmits nothing
+    // when creds.me is unset, so it is intentionally NOT used.
+    const rmSpy = jest.spyOn(fs.promises, 'rm').mockResolvedValue(undefined);
+    try {
+      const adapter = newAdapter();
+      await adapter.initialize(noopCallbacks({}));
+      fakeSock.user = { id: '628999:12@s.whatsapp.net', name: 'Me' };
+
+      await adapter.logout();
+
+      expect(fakeSock.logout).not.toHaveBeenCalled();
+    } finally {
+      rmSpy.mockRestore();
+    }
+  });
+
+  it('logout() with missing companion identity rejects, sends nothing, preserves auth, and stops locally', async () => {
+    // No creds.me.id → the unlink cannot be addressed. The promise must reject, query()/rm() must NOT
+    // run, and the live socket must be torn down locally so no engine orphan remains.
+    const rmSpy = jest.spyOn(fs.promises, 'rm').mockResolvedValue(undefined);
+    try {
+      const adapter = newAdapter();
+      await adapter.initialize(noopCallbacks({}));
+      fakeSock.user = undefined; // no linked companion identity
+      (adapter as unknown as { sock: unknown }).sock = fakeSock;
+
+      await expect(adapter.logout()).rejects.toThrow(/no linked companion identity/i);
+
+      expect(fakeSock.query).not.toHaveBeenCalled();
+      expect(rmSpy).not.toHaveBeenCalled();
+      // Failure still stops the socket locally: end() called, status DISCONNECTED, socket nulled.
+      expect(fakeSock.end).toHaveBeenCalled();
+      expect(adapter.getStatus()).toBe(EngineStatus.DISCONNECTED);
+      expect((adapter as unknown as { sock: unknown }).sock).toBeNull();
+    } finally {
+      rmSpy.mockRestore();
+    }
+  });
+
+  it('logout() with an undefined IQ response rejects, preserves auth, and stops locally', async () => {
+    // WhatsApp returned no result for the unlink request — completion requires a truthy response, so
+    // this is an incomplete operation (502 at the service). Auth survives; the socket still dies.
+    const rmSpy = jest.spyOn(fs.promises, 'rm').mockResolvedValue(undefined);
+    try {
+      const adapter = newAdapter();
+      await adapter.initialize(noopCallbacks({}));
+      fakeSock.user = { id: '628999:12@s.whatsapp.net', name: 'Me' };
+      fakeSock.query.mockResolvedValueOnce(undefined);
+
+      await expect(adapter.logout()).rejects.toThrow(/did not acknowledge the unlink/i);
+
+      expect(fakeSock.query).toHaveBeenCalledTimes(1);
+      expect(rmSpy).not.toHaveBeenCalled();
+      expect(fakeSock.end).toHaveBeenCalled();
+      expect(adapter.getStatus()).toBe(EngineStatus.DISCONNECTED);
+      expect((adapter as unknown as { sock: unknown }).sock).toBeNull();
+    } finally {
+      rmSpy.mockRestore();
+    }
+  });
+
+  it('logout() with a query rejection/timeout rejects, preserves auth, and stops locally', async () => {
+    // A transport error or 8s timeout from query() is an incomplete operation. Auth must NOT be
+    // removed (the link may still be valid server-side); the socket still ends locally.
+    const rmSpy = jest.spyOn(fs.promises, 'rm').mockResolvedValue(undefined);
+    try {
+      const adapter = newAdapter();
+      await adapter.initialize(noopCallbacks({}));
+      fakeSock.user = { id: '628999:12@s.whatsapp.net', name: 'Me' };
+      fakeSock.query.mockRejectedValueOnce(new Error('Timed Out'));
+
+      await expect(adapter.logout()).rejects.toThrow('Timed Out');
+
+      expect(fakeSock.query).toHaveBeenCalledTimes(1);
+      expect(rmSpy).not.toHaveBeenCalled();
+      expect(fakeSock.end).toHaveBeenCalled();
+      expect(adapter.getStatus()).toBe(EngineStatus.DISCONNECTED);
+      expect((adapter as unknown as { sock: unknown }).sock).toBeNull();
+    } finally {
+      rmSpy.mockRestore();
+    }
+  });
+
+  it('logout() with an acknowledged IQ but fs.rm failure STILL rejects', async () => {
+    // Completion requires auth dir removal too. Even after a valid IQ result, a failed credential
+    // removal propagates (the operation is incomplete), so 200 is never reported.
+    const rmSpy = jest.spyOn(fs.promises, 'rm').mockRejectedValueOnce(new Error('disk full'));
+    try {
+      const adapter = newAdapter();
+      await adapter.initialize(noopCallbacks({}));
+      fakeSock.user = { id: '628999:12@s.whatsapp.net', name: 'Me' };
+
+      await expect(adapter.logout()).rejects.toThrow('disk full');
+
+      expect(fakeSock.query).toHaveBeenCalledTimes(1);
+      expect(rmSpy).toHaveBeenCalledWith(
+        path.join('./data/baileys', 'sess-1'),
+        expect.objectContaining({ recursive: true, force: true }),
+      );
+    } finally {
+      rmSpy.mockRestore();
+    }
+  });
+
+  // With no socket the unlink cannot be sent, and an optional-chained call would resolve as though it
+  // had been — reporting a confirmed unlink, writing the audit row, and wiping the credentials, all
+  // while the device stayed linked server-side with nothing left to retry with. Reachable whenever the
+  // socket is gone but the engine is still registered, e.g. inside a reconnect backoff.
+  it('logout() rejects and keeps the on-disk auth dir when there is no socket at all', async () => {
+    const rmSpy = jest.spyOn(fs.promises, 'rm').mockResolvedValue(undefined);
+    try {
+      const adapter = newAdapter();
+      await adapter.initialize(noopCallbacks({}));
+      (adapter as unknown as { sock: unknown }).sock = null;
+
+      await expect(adapter.logout()).rejects.toThrow(/no live whatsapp socket/i);
+      expect(fakeSock.query).not.toHaveBeenCalled();
+      expect(rmSpy).not.toHaveBeenCalled();
     } finally {
       rmSpy.mockRestore();
     }
@@ -339,6 +595,46 @@ describe('BaileysAdapter lifecycle & status', () => {
     await expect(adapter.initialize(noopCallbacks({ onError }))).rejects.toThrow('network error');
     expect(adapter.getStatus()).toBe(EngineStatus.FAILED);
     expect(onError).toHaveBeenCalledWith('network error');
+  });
+
+  // Teardown-before-initialize: the adapter is single-use once torn down. The intentionalClose latch
+  // is set by disconnect()/destroy()/forceDestroy()/logout() and must NEVER be re-armed by a later
+  // initialize() — otherwise a retired adapter opens a fresh socket no caller is tracking.
+  describe('teardown-before-initialize (single-use adapter)', () => {
+    const makeWASocket = (): jest.Mock =>
+      // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access
+      jest.requireMock('@whiskeysockets/baileys').default as jest.Mock;
+
+    it.each([{ method: 'disconnect' as const }, { method: 'destroy' as const }, { method: 'forceDestroy' as const }])(
+      '%s() before initialize() does not create a socket, and a later initialize() still does not',
+      async ({ method }) => {
+        makeWASocket().mockClear();
+        const adapter = newAdapter();
+        // A brand-new adapter has never connected: tearing it down must not touch the socket factory.
+        await adapter[method]();
+        expect(makeWASocket()).not.toHaveBeenCalled();
+        expect(adapter.getStatus()).toBe(EngineStatus.DISCONNECTED);
+
+        // The teardown latch must NOT be re-armed by initialize(): a retired adapter stays retired.
+        makeWASocket().mockClear();
+        await adapter.initialize(noopCallbacks({}));
+        expect(makeWASocket()).not.toHaveBeenCalled();
+      },
+    );
+
+    it('logout() before initialize() rejects (no socket) and a subsequent initialize() still does not make a socket', async () => {
+      makeWASocket().mockClear();
+      const adapter = newAdapter();
+      // No socket was ever created, so the unlink cannot be sent.
+      await expect(adapter.logout()).rejects.toThrow(/no live whatsapp socket/i);
+      expect(makeWASocket()).not.toHaveBeenCalled();
+
+      // The teardown latch set by logout() must hold: initialize() must not open a fresh socket on a
+      // retired adapter.
+      makeWASocket().mockClear();
+      await adapter.initialize(noopCallbacks({}));
+      expect(makeWASocket()).not.toHaveBeenCalled();
+    });
   });
 });
 
@@ -658,6 +954,104 @@ describe('BaileysAdapter reconnect socket teardown (no leak)', () => {
   });
 });
 
+describe('BaileysAdapter status honesty across the reconnect backoff', () => {
+  // eslint-disable-next-line @typescript-eslint/no-unnecessary-type-assertion
+  const baileys = () => jest.requireMock('@whiskeysockets/baileys') as { default: jest.Mock };
+
+  const fireRecoverableClose = (): void => {
+    fakeSock.fire('connection.update', {
+      connection: 'close',
+      lastDisconnect: { error: { output: { statusCode: 515 } } },
+    });
+  };
+
+  const initReady = async (over: Partial<EngineEventCallbacks> = {}): Promise<BaileysAdapter> => {
+    fakeSock.user = undefined;
+    fakeSock.resetEmitter();
+    jest.clearAllMocks();
+    const adapter = newAdapter();
+    await adapter.initialize(noopCallbacks(over));
+    fakeSock.fire('connection.update', { connection: 'open' });
+    return adapter;
+  };
+
+  afterEach(() => {
+    jest.useRealTimers();
+    jest.restoreAllMocks();
+  });
+
+  it('a transient close drops the session to INITIALIZING immediately — no READY across the backoff', async () => {
+    const states: EngineStatus[] = [];
+    const adapter = await initReady({ onStateChanged: s => states.push(s) });
+    expect(adapter.getStatus()).toBe(EngineStatus.READY);
+    states.length = 0; // count only the transitions from READY onward
+
+    jest.useFakeTimers();
+    fireRecoverableClose();
+
+    // The reconnect timer is still pending (first attempt is ~1 s out, later ones up to 60 s) and
+    // the socket is already dead — the session must NOT read READY in this window.
+    expect(adapter.getStatus()).toBe(EngineStatus.INITIALIZING);
+    await expect(adapter.probeLiveness()).resolves.toBe(false);
+    expect(states).toEqual([EngineStatus.INITIALIZING]);
+  });
+
+  it('stays INITIALIZING until the reconnected socket actually opens, then reports READY again', async () => {
+    const adapter = await initReady({});
+    baileys().default.mockClear();
+    jest.useFakeTimers();
+    jest.spyOn(Math, 'random').mockReturnValue(0); // deterministic 1 s first-attempt delay
+
+    fireRecoverableClose();
+    expect(adapter.getStatus()).toBe(EngineStatus.INITIALIZING);
+
+    await jest.advanceTimersByTimeAsync(1_000); // attempt 1 runs → new socket created
+    expect(baileys().default).toHaveBeenCalledTimes(1);
+    // The new socket exists but has not opened yet — still not READY.
+    expect(adapter.getStatus()).toBe(EngineStatus.INITIALIZING);
+
+    fakeSock.fire('connection.update', { connection: 'open' });
+    expect(adapter.getStatus()).toBe(EngineStatus.READY);
+    await expect(adapter.probeLiveness()).resolves.toBe(true);
+  });
+
+  it('back-to-back transient closes do not flap onStateChanged', async () => {
+    const states: EngineStatus[] = [];
+    await initReady({ onStateChanged: s => states.push(s) });
+    states.length = 0; // count only the transitions from READY onward
+
+    jest.useFakeTimers();
+    fireRecoverableClose();
+    fireRecoverableClose(); // duplicate for the same drop — ignored, no extra transition
+    expect(states).toEqual([EngineStatus.INITIALIZING]);
+
+    await jest.advanceTimersByTimeAsync(2_000); // let the pending attempt run (1 s + jitter)
+    fireRecoverableClose(); // the next drop lands while already INITIALIZING — still no emission
+    expect(states).toEqual([EngineStatus.INITIALIZING]);
+  });
+
+  it('a logged-out close still reports DISCONNECTED (terminal behavior unchanged)', async () => {
+    const rmSpy = jest.spyOn(fs.promises, 'rm').mockResolvedValue(undefined);
+    try {
+      const onDisconnected = jest.fn();
+      const adapter = await initReady({ onDisconnected });
+
+      fakeSock.fire('connection.update', {
+        connection: 'close',
+        lastDisconnect: { error: { output: { statusCode: 401 } } },
+      });
+
+      // The status is DISCONNECTED synchronously; onDisconnected fires after the deferred auth removal.
+      expect(adapter.getStatus()).toBe(EngineStatus.DISCONNECTED);
+      await new Promise(r => setImmediate(r));
+      expect(onDisconnected).toHaveBeenCalledWith('logged out');
+      await expect(adapter.probeLiveness()).resolves.toBe(false);
+    } finally {
+      rmSpy.mockRestore();
+    }
+  });
+});
+
 describe('BaileysAdapter capability gating', () => {
   it('throws EngineNotSupportedError for still-gated methods (e.g. getChatHistory)', async () => {
     const adapter = newAdapter();
@@ -909,6 +1303,53 @@ describe('BaileysAdapter inbound fan-out', () => {
     // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access
     const msg = onMessage.mock.calls[0][0] as { id: string; body: string; type: string; fromMe: boolean };
     expect(msg).toMatchObject({ id: 'IN1', body: 'hi there', type: 'text', fromMe: false });
+  });
+
+  it('routes a status broadcast to onMessage with the poster in author (so the status store can ingest it)', async () => {
+    const onMessage = jest.fn();
+    const adapter = newAdapter();
+    await adapter.initialize({ onMessage });
+    fakeSock.fire('messages.upsert', {
+      type: 'notify',
+      messages: [
+        {
+          // A contact's status: remoteJid is the shared channel, the poster is in participant.
+          key: { remoteJid: 'status@broadcast', participant: '628111@s.whatsapp.net', fromMe: false, id: 'ST1' },
+          message: { conversation: 'my status' },
+          messageTimestamp: 1700000002,
+          pushName: 'Alice',
+        },
+      ],
+    });
+    await new Promise(r => setImmediate(r));
+    expect(onMessage).toHaveBeenCalledTimes(1);
+    // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access
+    const msg = onMessage.mock.calls[0][0] as { id: string; author?: string; isStatusBroadcast: boolean };
+    // Regression lock: buildIncomingStatus needs author to resolve the poster — without it the
+    // status resolves to the status@broadcast pseudo-JID and is dropped before ingest.
+    expect(msg).toMatchObject({ id: 'ST1', isStatusBroadcast: true, author: '628111@c.us' });
+  });
+
+  it('extracts text-status styling (backgroundArgb/font) from the extended-text content', async () => {
+    baileys.getContentType.mockReturnValue('extendedTextMessage');
+    const onMessage = jest.fn();
+    const adapter = newAdapter();
+    await adapter.initialize({ onMessage });
+    fakeSock.fire('messages.upsert', {
+      type: 'notify',
+      messages: [
+        {
+          key: { remoteJid: 'status@broadcast', participant: '628111@s.whatsapp.net', fromMe: false, id: 'ST2' },
+          message: { extendedTextMessage: { text: 'styled story', backgroundArgb: 0xff123456, font: 3 } },
+          messageTimestamp: 1700000002,
+        },
+      ],
+    });
+    await new Promise(r => setImmediate(r));
+    // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access
+    const msg = onMessage.mock.calls[0][0] as { backgroundColor?: string; font?: number };
+    expect(msg.backgroundColor).toBe('#123456');
+    expect(msg.font).toBe(3);
   });
 
   it('extracts coordinates from an ephemeral (disappearing) location message', async () => {
@@ -2316,12 +2757,27 @@ describe('BaileysAdapter group management', () => {
     ]);
   });
 
-  it('getGroupInfo maps groupMetadata, and returns null when it rejects', async () => {
+  it('getGroupInfo maps groupMetadata, and returns null only for a server refusal (401/403/404)', async () => {
     fakeSock.groupMetadata.mockResolvedValueOnce(META);
     const adapter = await ready();
     expect((await adapter.getGroupInfo('123-456@g.us'))?.id).toBe('123-456@g.us');
-    fakeSock.groupMetadata.mockRejectedValueOnce(new Error('not a group'));
+    // Baileys carries a server refusal as Boom with the numeric WA code on `data`
+    // (assertNodeErrorFree, WABinary/generic-utils.js:57).
+    fakeSock.groupMetadata.mockRejectedValueOnce(Object.assign(new Error('item-not-found'), { data: 404 }));
     expect(await adapter.getGroupInfo('x@g.us')).toBeNull();
+    fakeSock.groupMetadata.mockRejectedValueOnce(Object.assign(new Error('not-authorized'), { data: 401 }));
+    expect(await adapter.getGroupInfo('y@g.us')).toBeNull();
+  });
+
+  it('getGroupInfo does NOT fold a transport death into null — a dead socket is not "group not found"', async () => {
+    const adapter = await ready();
+    // Local Boom, no server error node: DisconnectReason-shaped 428 Connection Closed.
+    const connectionClosed = Object.assign(new Error('Connection Closed'), { output: { statusCode: 428 } });
+    fakeSock.groupMetadata.mockRejectedValueOnce(connectionClosed);
+    await expect(adapter.getGroupInfo('123-456@g.us')).rejects.toBe(connectionClosed);
+    // A non-boom failure (programming/protocol error) propagates too.
+    fakeSock.groupMetadata.mockRejectedValueOnce(new Error('unexpected'));
+    await expect(adapter.getGroupInfo('123-456@g.us')).rejects.toThrow('unexpected');
   });
 
   it('getGroupInfo canonicalizes participant + owner ids through the session store (lid -> phone)', async () => {
@@ -2430,9 +2886,61 @@ describe('BaileysAdapter group management', () => {
 
   it('joinGroupViaInviteCode maps an IQ error to InvalidInviteCodeError (400)', async () => {
     // A rejected groupAcceptInvite (not-authorized / gone IQ) is the same client-facing cause.
-    fakeSock.groupAcceptInvite.mockRejectedValue(new Error('not-authorized'));
+    // Baileys carries the refusal as Boom with the numeric WA code on `data`.
+    fakeSock.groupAcceptInvite.mockRejectedValue(Object.assign(new Error('not-authorized'), { data: 401 }));
     const adapter = await ready();
     await expect(adapter.joinGroupViaInviteCode('BAD')).rejects.toBeInstanceOf(InvalidInviteCodeError);
+  });
+
+  it('joinGroupViaInviteCode does NOT fold a transport death into a 400 — a dead socket is not a bad invite', async () => {
+    // Local Boom, no server error node: DisconnectReason-shaped 428 Connection Closed.
+    const connectionClosed = Object.assign(new Error('Connection Closed'), { output: { statusCode: 428 } });
+    fakeSock.groupAcceptInvite.mockRejectedValue(connectionClosed);
+    const adapter = await ready();
+    await expect(adapter.joinGroupViaInviteCode('CODE123')).rejects.toBe(connectionClosed);
+  });
+
+  it('addParticipants maps the per-participant [{status, jid}] array — a partial refusal does not throw', async () => {
+    fakeSock.groupParticipantsUpdate.mockResolvedValueOnce([
+      { status: '200', jid: '628111@s.whatsapp.net', content: {} },
+      { status: '403', jid: '628222@s.whatsapp.net', content: {} },
+      { status: '409', jid: '628333@s.whatsapp.net', content: {} },
+    ]);
+    const adapter = await ready();
+    const results = await adapter.addParticipants('123-456@g.us', ['628111@c.us', '628222@c.us', '628333@c.us']);
+    // Jids cross the engine boundary back in the neutral dialect; only the 200 entry is a success.
+    expect(results).toEqual([
+      { id: '628111@c.us', success: true, status: 200 },
+      { id: '628222@c.us', success: false, status: 403 },
+      { id: '628333@c.us', success: false, status: 409 },
+    ]);
+  });
+
+  it.each([
+    ['addParticipants', 'add'],
+    ['removeParticipants', 'remove'],
+    ['promoteParticipants', 'promote'],
+    ['demoteParticipants', 'demote'],
+  ])('%s throws EngineRefusedError (403) when EVERY participant is refused (e.g. not admin)', async method => {
+    fakeSock.groupParticipantsUpdate.mockResolvedValueOnce([
+      { status: '403', jid: '628111@s.whatsapp.net', content: {} },
+      { status: '403', jid: '628222@s.whatsapp.net', content: {} },
+    ]);
+    const adapter = await ready();
+    const err = await (adapter as unknown as Record<string, (g: string, p: string[]) => Promise<unknown>>)
+      [method]('123-456@g.us', ['628111@c.us', '628222@c.us'])
+      .catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(EngineRefusedError);
+    expect((err as Error).message).toMatch(/failed for all 2 participant/);
+  });
+
+  it('removeParticipants throws EngineRefusedError when the server returns no per-participant outcome', async () => {
+    // An empty result is no evidence of success — reporting one would be a false success.
+    fakeSock.groupParticipantsUpdate.mockResolvedValueOnce([]);
+    const adapter = await ready();
+    await expect(adapter.removeParticipants('123-456@g.us', ['628111@c.us'])).rejects.toBeInstanceOf(
+      EngineRefusedError,
+    );
   });
 
   it.each([
@@ -3211,6 +3719,13 @@ describe('BaileysAdapter status posting', () => {
     );
   });
 
+  it('postStatus rejects an absent/empty recipients list with a 400 (Baileys posts to exactly the allow-list)', async () => {
+    const adapter = await ready();
+    await expect(adapter.postTextStatus('hello', {})).rejects.toBeInstanceOf(BadRequestException);
+    await expect(adapter.postTextStatus('hello', { recipients: [] })).rejects.toBeInstanceOf(BadRequestException);
+    expect(fakeSock.sendMessage).not.toHaveBeenCalled();
+  });
+
   it('deleteStatus revokes by constructing the key from statusId (no store lookup)', async () => {
     fakeSock.sendMessage.mockResolvedValue({ key: { id: 'STATUS1' } });
     const adapter = await ready();
@@ -3224,5 +3739,75 @@ describe('BaileysAdapter status posting', () => {
       },
     });
     expect(fakeStore.getMessage).not.toHaveBeenCalled();
+  });
+});
+
+describe('BaileysAdapter proxy support', () => {
+  beforeEach(() => {
+    fakeSock.user = undefined;
+    fakeSock.resetEmitter();
+    jest.clearAllMocks();
+  });
+
+  const proxied = (proxyUrl: string): BaileysAdapter =>
+    new BaileysAdapter({
+      sessionId: 'sess-1',
+      dbSessionId: 'db-uuid-1',
+      authDir: './data/baileys',
+      messageStore: fakeStore,
+      proxyUrl,
+    });
+
+  const makeWASocketMock = (): jest.Mock =>
+    // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access
+    jest.requireMock('@whiskeysockets/baileys').default as jest.Mock;
+
+  const lastSocketConfig = (): Record<string, unknown> => {
+    const calls = makeWASocketMock().mock.calls as Array<[Record<string, unknown>]>;
+    const last = calls.at(-1);
+    if (!last) throw new Error('Expected makeWASocket to have been called');
+    return last[0];
+  };
+
+  it('selects HttpsProxyAgent for http/https proxy URLs', () => {
+    expect(createProxyAgent('http://user:pass@proxy.example:8080')).toBeInstanceOf(HttpsProxyAgent);
+    expect(createProxyAgent('https://proxy.example:443')).toBeInstanceOf(HttpsProxyAgent);
+  });
+
+  it('selects SocksProxyAgent for socks4/socks5 proxy URLs', () => {
+    expect(createProxyAgent('socks5://user:pass@proxy.example:1080')).toBeInstanceOf(SocksProxyAgent);
+    expect(createProxyAgent('socks4://proxy.example:1080')).toBeInstanceOf(SocksProxyAgent);
+  });
+
+  it('throws on an unsupported proxy scheme', () => {
+    expect(() => createProxyAgent('ftp://proxy.example:21')).toThrow(/unsupported proxy/i);
+  });
+
+  it('passes the agent to makeWASocket as both agent (WS) and fetchAgent (media)', async () => {
+    await proxied('http://user:pass@proxy.example:8080').initialize(noopCallbacks());
+    const cfg = lastSocketConfig();
+    expect(cfg.agent).toBeInstanceOf(HttpsProxyAgent);
+    expect(cfg.fetchAgent).toBe(cfg.agent);
+  });
+
+  it('passes a SOCKS agent through for a socks5 URL', async () => {
+    await proxied('socks5://user:pass@proxy.example:1080').initialize(noopCallbacks());
+    expect(lastSocketConfig().agent).toBeInstanceOf(SocksProxyAgent);
+  });
+
+  it('leaves agent/fetchAgent unset without a proxyUrl', async () => {
+    await newAdapter().initialize(noopCallbacks());
+    const cfg = lastSocketConfig();
+    expect(cfg.agent).toBeUndefined();
+    expect(cfg.fetchAgent).toBeUndefined();
+  });
+
+  it('fails closed: an unusable proxy value fails initialize instead of connecting direct', async () => {
+    const onError = jest.fn();
+    const adapter = proxied('ftp://proxy.example:21');
+    await expect(adapter.initialize(noopCallbacks({ onError }))).rejects.toThrow(/unsupported proxy/i);
+    expect(adapter.getStatus()).toBe(EngineStatus.FAILED);
+    expect(onError).toHaveBeenCalled();
+    expect(makeWASocketMock()).not.toHaveBeenCalled();
   });
 });

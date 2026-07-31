@@ -25,6 +25,7 @@ import {
   Group,
   GroupInfo,
   GroupParticipant,
+  ParticipantOperationResult,
   LocationInput,
   PollInput,
   ContactCard,
@@ -62,6 +63,7 @@ import { InvalidInviteCodeError } from '../../common/errors/invalid-invite-code.
 import { GroupNotFoundError } from '../../common/errors/group-not-found.error';
 import { ChannelNotFoundError } from '../../common/errors/channel-not-found.error';
 import { ChannelMediaNotSupportedError } from '../../common/errors/channel-media-not-supported.error';
+import { EngineTransportError } from '../../common/errors/engine-transport.error';
 import { loadRemoteMediaBuffer } from '../../common/media/load-remote-media';
 import {
   GroupChat,
@@ -74,11 +76,14 @@ import {
 } from '../types/whatsapp-web-js.types';
 import { buildEditedMessage, buildIncomingMessageBase, mapContactFields, mapWwebjsMessageType } from './message-mapper';
 import { buildVCard } from './vcard';
+import { BACKPORT_MISSING_MESSAGE, isBackportMissing } from './wwebjs-backport-check';
 import {
   capInboundMedia,
+  chatHistoryMediaBudgetBytes,
   coerceDeclaredSize,
   inboundMediaConcurrency,
   inboundMediaMaxBytes,
+  ingestMediaBudgetBytes,
   inboundMediaTimeoutMs,
   isMediaDownloadEnabled,
   withInboundDownloadTimeout,
@@ -168,6 +173,22 @@ export function extractWwebjsCall(msg: Message): { video: boolean; missed: boole
   if ((msg.type as string) !== 'call_log') return undefined;
   const d = (msg as unknown as { _data?: { isVideoCall?: boolean; callDuration?: number } })._data ?? {};
   return { video: Boolean(d.isVideoCall), missed: !msg.fromMe && !d.callDuration };
+}
+
+/**
+ * The `media` envelope for a message whose blob is not downloaded: keeps the sender-declared metadata
+ * so the `media` field stays present (n8n/dashboard contract) while carrying the `omitted` marker
+ * instead of base64. Used when downloads are disabled, the size pre-gate trips, the aggregate history
+ * budget is spent, or the download fails/times out.
+ */
+function declaredOnlyMedia(msg: Message): IncomingMessage['media'] {
+  const data = (msg as unknown as { _data?: { size?: number; mimetype?: string; filename?: string } })._data;
+  return {
+    mimetype: data?.mimetype ?? '',
+    filename: data?.filename || undefined,
+    omitted: true,
+    sizeBytes: coerceDeclaredSize(data?.size),
+  };
 }
 
 /**
@@ -282,6 +303,99 @@ export interface WhatsAppWebJsConfig {
 const READY_RECONCILE_INTERVAL_MS = 2000;
 const READY_RECONCILE_TIMEOUT_MS = 90_000;
 
+// Onboarding-modal watcher (#982). A freshly-linked account shows a "What's new on WhatsApp Web"
+// modal with a Continue button that must be acknowledged, or WhatsApp unlinks the companion ~5m
+// later (surfacing as disconnected: LOGOUT). whatsapp-web.js exposes no API for this (#3550 open),
+// so the watcher reaches the page directly and clicks it best-effort. The modal is one-shot per
+// account, so the watcher self-terminates after the lifetime cap rather than polling forever.
+const ONBOARDING_MODAL_INTERVAL_MS = 5_000;
+const ONBOARDING_MODAL_MAX_LIFETIME_MS = 5 * 60_000;
+const ONBOARDING_MODAL_PROBE_TIMEOUT_MS = 5_000;
+// Clicking Continue dismisses the modal, so one click is the normal case and the next tick finds
+// nothing. Repeated clicks mean the click is not landing — the only evidence that actually justifies
+// asking a human to intervene. Five, not three: a multi-step "What's new" flow is clicked through
+// one screen per tick, and three screens inside one watcher run must not read as a stuck modal.
+// Five failed clicks still trips in ~25s — far inside the lifetime cap and the ~5m unlink deadline.
+const ONBOARDING_MODAL_MAX_DISMISS_CLICKS = 5;
+
+/** The modal's confirm-button label on an English WhatsApp Web. */
+const ONBOARDING_DEFAULT_CONTINUE_LABEL = 'Continue';
+
+/**
+ * Extra confirm-button labels for a deployment whose WhatsApp Web does not render this modal in
+ * English, comma-separated (`WWEBJS_ONBOARDING_CONTINUE_LABELS=Continuar,Weiter`).
+ *
+ * Needed because the match is on visible text and WhatsApp controls those strings — we are not going
+ * to carry its translation table. Read per probe, not cached, so an operator can correct a running
+ * deployment through the infra config without a restart.
+ *
+ * Supplying labels also drops the heading requirement for THOSE labels: the English heading regex
+ * would reject a localised modal anyway, so requiring both would make the setting useless. That is a
+ * deliberate, operator-opted-in loosening — see {@link probeOnboardingModal}.
+ */
+function resolveOnboardingContinueLabels(): string[] {
+  const extra = (process.env.WWEBJS_ONBOARDING_CONTINUE_LABELS ?? '')
+    .split(',')
+    .map(label => label.trim())
+    .filter(Boolean);
+  return [ONBOARDING_DEFAULT_CONTINUE_LABEL, ...extra];
+}
+
+/**
+ * In-page probe for the onboarding modal: click its confirm button if it is on screen.
+ *
+ * Exported and self-contained on purpose. `page.evaluate` stringifies this into the browser, so it
+ * may not close over anything in this module — every input arrives as an argument — and being a plain
+ * function means the DOM matching can be unit-tested directly, rather than only through a mocked
+ * `evaluate` that proves nothing about the matching itself.
+ *
+ * The BUTTON is the presence signal, never the heading text on its own. `textContent` on a `div`
+ * concatenates every descendant, so a chat-list row previewing the words "what's new" — an ordinary
+ * English message — satisfies a heading-only test. Treating that as a stuck modal would take a
+ * perfectly healthy session out of READY and block every send. A visible control whose exact label is
+ * the confirm label, sitting within a few levels of an element that also carries the heading, is a
+ * shape the chat list does not produce. The ancestor walk is bounded for the same reason: matching
+ * against `<body>` would just be the loose text test again.
+ *
+ * LANGUAGE. The default label and the heading are English, and the modal is rendered in whatever
+ * language WhatsApp Web decides. Two things address that, both defaulting to today's behaviour:
+ * the launch args pin `--lang` so the page has a deterministic locale, and an operator can add
+ * their own labels (see {@link resolveOnboardingContinueLabels}). An operator-supplied label matches
+ * WITHOUT the heading check — the English heading would reject a localised modal regardless, so
+ * requiring both would make the setting inert. The default `Continue` keeps the heading requirement,
+ * so the out-of-the-box false-positive surface is unchanged.
+ */
+export function probeOnboardingModal(options?: { labels?: string[]; headingOptionalFor?: string[] }): {
+  modalPresent: boolean;
+  dismissed: boolean;
+} {
+  const isVisible = (el: Element): boolean => {
+    const rect = (el as HTMLElement).getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0 && (el as HTMLElement).offsetParent !== null;
+  };
+  const labels = options?.labels?.length ? options.labels : ['Continue'];
+  const headingOptional = new Set(options?.headingOptionalFor ?? []);
+  // Both apostrophes: WhatsApp Web renders the typographic U+2019, and an ASCII quote appears in
+  // older builds. Matching only the ASCII form means never recognising the real modal.
+  const heading = /what[’']?s new/i;
+  const candidates = Array.from(document.querySelectorAll('button, [role="button"]'))
+    .map(el => ({ el, label: (el.textContent || '').trim() }))
+    .filter(c => isVisible(c.el) && labels.includes(c.label));
+  for (const { el, label } of candidates.reverse()) {
+    if (headingOptional.has(label)) {
+      (el as HTMLElement).click();
+      return { modalPresent: true, dismissed: true };
+    }
+    let scope: Element | null = el;
+    for (let depth = 0; depth < 8 && scope; depth++, scope = scope.parentElement) {
+      if (!heading.test(scope.textContent || '')) continue;
+      (el as HTMLElement).click();
+      return { modalPresent: true, dismissed: true };
+    }
+  }
+  return { modalPresent: false, dismissed: false };
+}
+
 // WhatsApp Web version resolution (the #488 auto-resolve) lives in a dependency-free module so infra
 // status can import it without loading whatsapp-web.js (engine lazy-loading). The adapter imports
 // resolveWebVersionPin above for use in initialize().
@@ -343,6 +457,14 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
   private readyReconcileTimer: ReturnType<typeof setTimeout> | null = null;
   private readyReconcileStartedAt = 0;
   private readyReconcileProbeInFlight = false;
+  // Onboarding-modal watcher handle (#982). Self-rescheduling setTimeout so a hung probe can't stall
+  // the loop; cleared on teardown exactly like readyReconcileTimer.
+  private onboardingWatcherTimer: ReturnType<typeof setTimeout> | null = null;
+  private onboardingWatcherStartedAt = 0;
+  private onboardingWatcherStarted = false;
+  // How many times we have clicked the modal's Continue button. Not reset by clearOnboardingWatcher:
+  // it counts for the engine's lifetime, which is what makes "the click is not landing" detectable.
+  private onboardingDismissClicks = 0;
   /** How long a received call's handle stays rejectable. Calls ring for roughly a minute, so
    *  two minutes covers the ringing window with margin without pinning dead calls for long. */
   private static readonly LIVE_CALL_TTL_MS = 2 * 60_000;
@@ -355,6 +477,18 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
   // Set once teardown begins so a late 'authenticated' can't resurrect a disconnecting adapter. Not
   // reset — an adapter is single-use after teardown (the session creates a fresh one to reconnect).
   private tearingDown = false;
+  // Set by logout() before it starts the native unlink, which itself registers the real
+  // `client.logout()` promise as the credential teardown. The 'disconnected' LOGOUT handler consults
+  // this to avoid registering a second, redundant stand-in for the same profile rm — while still
+  // registering one for a WhatsApp-initiated logout, including one that lands after another teardown
+  // path has already latched the flags below.
+  private logoutInitiated = false;
+  // Set once the adapter ACTIVELY transitions to DISCONNECTED (engine disconnect, puppeteer death,
+  // stuck-auth recovery, teardown). Same single-use contract as `tearingDown`, but it latches earlier:
+  // on LOGOUT whatsapp-web.js keeps the browser and re-runs inject(), while the lifecycle only replaces
+  // the engine after the reconnect backoff — so for those seconds the old client can still emit a QR or
+  // re-authenticate, and neither belongs to the session any more (#982).
+  private disconnectReported = false;
 
   constructor(private readonly config: WhatsAppWebJsConfig) {
     super();
@@ -379,30 +513,23 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
    * on the sender-declared size and skip the download entirely when it exceeds the cap, and (2) run the
    * download through the concurrency limiter for backpressure. Returns undefined when there's no media.
    */
-  private async capInboundMediaFor(msg: Message): Promise<IncomingMessage['media'] | undefined> {
+  private async capInboundMediaFor(
+    msg: Message,
+    maxBytesOverride?: number,
+  ): Promise<IncomingMessage['media'] | undefined> {
     if (!isMediaDownloadEnabled()) {
-      const data = (msg as unknown as { _data?: { size?: number; mimetype?: string; filename?: string } })._data;
-      return {
-        mimetype: data?.mimetype ?? '',
-        filename: data?.filename || undefined,
-        omitted: true,
-        sizeBytes: coerceDeclaredSize(data?.size),
-      };
+      return declaredOnlyMedia(msg);
     }
-    const maxBytes = inboundMediaMaxBytes();
+    const maxBytes = maxBytesOverride ?? inboundMediaMaxBytes();
     const data = (msg as unknown as { _data?: { size?: number; mimetype?: string; filename?: string } })._data;
     const declared = coerceDeclaredSize(data?.size);
     if (declared > maxBytes) {
-      this.logger.warn('Inbound media declared size exceeds MEDIA_DOWNLOAD_MAX_BYTES; skipped download', {
+      this.logger.warn('Inbound media declared size exceeds the cap; skipped download', {
         msgId: msg.id._serialized,
         sizeBytes: declared,
+        maxBytes,
       });
-      return {
-        mimetype: data?.mimetype ?? '',
-        filename: data?.filename || undefined,
-        omitted: true,
-        sizeBytes: declared,
-      };
+      return declaredOnlyMedia(msg);
     }
     // msg.downloadMedia() can't be aborted, so freeing the slot the moment the wall-clock deadline fires
     // would admit a fresh download while the abandoned one is still materialising in heap — letting the
@@ -445,12 +572,7 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
     });
     const media = await boundedReady;
     if (!media) {
-      return {
-        mimetype: data?.mimetype ?? '',
-        filename: data?.filename || undefined,
-        omitted: true,
-        sizeBytes: declared,
-      };
+      return declaredOnlyMedia(msg);
     }
     const capped = capInboundMedia({
       mimetype: media.mimetype,
@@ -470,6 +592,12 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
   async initialize(callbacks: EngineEventCallbacks): Promise<void> {
     this.callbacks = callbacks;
     this.setStatus(EngineStatus.INITIALIZING);
+
+    // An install that skipped the message-id backport fails later with errors that name no cause
+    // (#889) — say so here instead, while the operator is still looking at the startup logs.
+    if (isBackportMissing()) {
+      this.logger.error(BACKPORT_MISSING_MESSAGE);
+    }
 
     try {
       // Build puppeteer args, including proxy if configured
@@ -512,8 +640,10 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
       // output later (after a hard kill of the OpenWA process orphaned them).
       puppeteerArgs.push(`--openwa-session=${this.config.sessionId}`);
 
-      // Pin the WA-Web version when configured (fixes the 1.34.x "stuck at authenticating"
-      // hang on some setups, #251). Opt-in: unset leaves whatsapp-web.js to auto-select.
+      // Pin the WA-Web version (fixes the 1.34.x "stuck at authenticating" hang on some setups,
+      // #251/#488). DEFAULT: auto-resolve a settled build from the wa-version registry and pin its
+      // remote HTML (no integrity check — resolveWebVersionPin logs a loud warning); only
+      // WWEBJS_WEB_VERSION=off leaves whatsapp-web.js to use the first-party build from WhatsApp.
       const versionPin = await resolveWebVersionPin();
       if (this.tearingDown) {
         this.setStatus(EngineStatus.DISCONNECTED);
@@ -606,15 +736,38 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
 
     // eslint-disable-next-line @typescript-eslint/no-misused-promises
     this.client.on('qr', async (qr: string) => {
-      // A 'qr' buffered by a wedged page can flush during the awaited client.destroy() (teardown sets
-      // tearingDown + DISCONNECTED first) or after recoverFromStuckAuth() nulls this.client. Ignore it so a
-      // late event can't resurrect a disconnecting adapter to QR_READY and re-emit a stale QR. Mirrors the
-      // 'authenticated' guard below; the normal first QR is unaffected (not tearing down, not FAILED, client set).
-      if (this.tearingDown || this.status === EngineStatus.FAILED || !this.client) {
+      // A 'qr' buffered by a wedged page can flush during the awaited client.destroy(), after
+      // recoverFromStuckAuth() nulls this.client, or from a client that whatsapp-web.js re-injected
+      // after a LOGOUT (#982) — in the last case the browser is still alive and will keep serving QRs
+      // until the lifecycle replaces the engine. Ignore all of them so a late event can't resurrect a
+      // finished adapter to QR_READY and publish a QR that links a phantom device. Mirrors the
+      // 'authenticated' guard below; the normal first QR is unaffected (initialize() moves the status to
+      // INITIALIZING before any client exists, so the latch is still clear).
+      if (this.tearingDown || this.disconnectReported || this.status === EngineStatus.FAILED || !this.client) {
         return;
       }
+      // Capture the source client so the post-await fence can prove THIS client is still the live one.
+      // qrcode.toDataURL() is an awaited macrotask: a 'disconnected' (or a teardown nulling this.client)
+      // that lands during the encode leaves the pre-await guard stale. Encode to a LOCAL so the stored
+      // qrCode is only touched once the fence re-proves the source client and the finished flags.
+      const sourceClient = this.client;
       try {
-        this.qrCode = await qrcode.toDataURL(qr);
+        const encodedQr = await qrcode.toDataURL(qr);
+        // Post-await fence: the encode resolved, but the source client may have disconnected or been
+        // replaced while we were waiting. Re-check the live client identity and the finished flags before
+        // assigning state, publishing a QR, or driving any downstream callback/webhook — a late encode for
+        // a dead/finished adapter must be dropped, not resurrected. The status is read through getStatus()
+        // (not `this.status`) so the pre-await guard's narrowing does not elide this comparison:
+        // setStatus(FAILED) can run on another tick during the await.
+        if (
+          this.client !== sourceClient ||
+          this.tearingDown ||
+          this.disconnectReported ||
+          this.getStatus() === EngineStatus.FAILED
+        ) {
+          return;
+        }
+        this.qrCode = encodedQr;
         this.setStatus(EngineStatus.QR_READY);
         this.callbacks.onQRCode?.(this.qrCode);
       } catch (error) {
@@ -625,10 +778,12 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
     this.client.on('authenticated', () => {
       // Only the first authentication starts the reconcile window. Ignore a re-fired 'authenticated'
       // while already AUTHENTICATING (so it can't restart the 90s deadline), once READY/FAILED, or any
-      // time during/after teardown (so a late event can't resurrect a disconnecting adapter). The
-      // initial status is DISCONNECTED, so teardown is distinguished by the flag, not by DISCONNECTED.
+      // time after the adapter is finished — teardown, or a reported disconnect the lifecycle has not
+      // replaced the engine for yet (#982). The initial status is DISCONNECTED too, so "finished" is
+      // carried by the flags, never by the status alone.
       if (
         this.tearingDown ||
+        this.disconnectReported ||
         this.status === EngineStatus.AUTHENTICATING ||
         this.status === EngineStatus.READY ||
         this.status === EngineStatus.FAILED
@@ -897,7 +1052,45 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
     this.client.on('call', call => this.handleIncomingCall(call));
 
     this.client.on('disconnected', reason => {
+      // A LOGOUT means whatsapp-web.js is ABOUT to delete this session's profile: `Client.logout()`
+      // ends in `authStrategy.logout()` → `LocalAuth.logout()` → `fs.rm(userDataDir)`, and the
+      // library emits this event BEFORE that await (Client.js: emit DISCONNECTED 'LOGOUT', then
+      // `pupBrowser.close()`, then `authStrategy.logout()`). That rm happens whatever this listener
+      // does, so it MUST be surfaced to the lifecycle before the latch check below can drop out —
+      // otherwise a stop()/destroy() that latched first hides an in-flight rm, the name fence sees
+      // nothing pending, and a later start() under the same name can have its freshly written
+      // profile deleted by it (the #994 hazard, through a narrower window).
+      //
+      // Skipped only when THIS adapter's logout() started it: that path already registered the real
+      // `client.logout()` promise, which covers the same rm and settles no earlier.
+      if (reason === 'LOGOUT' && !this.logoutInitiated) {
+        // Idempotent stand-in for the library's own rm, which we cannot get a handle on:
+        // `fs.rm(force: true)` races it safely and gives the lifecycle something to await.
+        this.callbacks.onCredentialTeardownStarted?.(this.clearLocalAuth());
+      }
+      // A deliberate teardown (logout/disconnect/destroy/forceDestroy via beginClientTeardown) also
+      // raises this event: client.logout() triggers the in-page Cmd 'logout' → framenavigated →
+      // DISCONNECTED 'LOGOUT' while we are still awaiting it. The unlink is already acknowledged by
+      // the API response and the session service writes DISCONNECTED itself, so report nothing here
+      // (mirrors the puppeteer-death gate). A WhatsApp-initiated unlink arrives with
+      // tearingDown=false and still flows through to the status/callback below.
+      //
+      // setStatus(DISCONNECTED) below latches disconnectReported synchronously on the first event, so a
+      // duplicate native 'disconnected' (whatsapp-web.js can fire it more than once for one drop) must
+      // no-op HERE — before log/status/callback — otherwise clearReadyReconcile(), setStatus, and
+      // onDisconnected re-run and the lifecycle schedules a second reconnect.
+      if (this.tearingDown || this.disconnectReported) return;
       this.clearReadyReconcile();
+      // #982: LOGOUT is not a transient drop. The lifecycle's reconnect cannot restore the link; it
+      // can only come back with a fresh QR. Say that here rather than leaving the operator with an
+      // opaque engine token that reads like any other drop.
+      if (reason === 'LOGOUT') {
+        this.logger.warn(
+          'WhatsApp unlinked this device (LOGOUT). whatsapp-web.js is deleting the stored credentials ' +
+            'for this session, so reconnecting cannot restore the link — the session comes back with a ' +
+            'fresh QR and must be re-scanned. If this was not expected, check Linked devices on the phone.',
+        );
+      }
       this.setStatus(EngineStatus.DISCONNECTED);
       this.callbacks.onDisconnected?.(reason);
     });
@@ -1064,6 +1257,12 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
   private static readonly PAGE_TRANSPORT_ERROR_PATTERN =
     /protocol error|target closed|targetclosederror|detached frame|session closed|connection closed/i;
 
+  /** Whether the error carries a dead page/transport signature (see PAGE_TRANSPORT_ERROR_PATTERN). */
+  private isPageTransportError(error: unknown): boolean {
+    const message = error instanceof Error ? error.message : String(error);
+    return WhatsAppWebJsAdapter.PAGE_TRANSPORT_ERROR_PATTERN.test(message);
+  }
+
   /**
    * Report a failed client/page operation as a session death when the error matches
    * PAGE_TRANSPORT_ERROR_PATTERN. A wedged page can fire NO events while still reporting CONNECTED
@@ -1073,18 +1272,22 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
    * handlePuppeteerDeath's guard makes this safe during teardown and against double-reporting.
    */
   private reportIfPageTransportError(error: unknown, context: string): void {
-    const message = error instanceof Error ? error.message : String(error);
-    if (!WhatsAppWebJsAdapter.PAGE_TRANSPORT_ERROR_PATTERN.test(message)) {
+    if (!this.isPageTransportError(error)) {
       return;
     }
     this.logger.warn(`Page transport error during ${context} — treating the session as dead`, {
-      error: message,
+      error: error instanceof Error ? error.message : String(error),
     });
     this.handlePuppeteerDeath(`Page transport error during ${context}`);
   }
 
   private markReadyFromClientInfo(): void {
-    if ([EngineStatus.READY, EngineStatus.DISCONNECTED, EngineStatus.FAILED].includes(this.status)) return;
+    if (
+      [EngineStatus.READY, EngineStatus.DISCONNECTED, EngineStatus.FAILED, EngineStatus.ACTION_REQUIRED].includes(
+        this.status,
+      )
+    )
+      return;
     this.clearReadyReconcile();
     try {
       const info = this.client?.info;
@@ -1097,6 +1300,10 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
       this.setStatus(EngineStatus.READY);
       this.callbacks.onReady?.('', '');
     }
+    // A freshly-linked account may show a "What's new" onboarding modal that, left unacknowledged,
+    // gets the companion unlinked (~5m later → disconnected: LOGOUT, #982). Dismiss it best-effort
+    // and fall back to ACTION_REQUIRED. Started after READY so a non-ready session never arms it.
+    this.startOnboardingWatcher();
   }
 
   private scheduleReadyReconcile(): void {
@@ -1117,6 +1324,9 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
             'is stuck after the QR scan (usually the auto-selected WhatsApp Web build is incompatible). ' +
             'Clearing it to re-pair; pin a known-good version via WWEBJS_WEB_VERSION (see ' +
             'docs/12-troubleshooting-faq.md) if it keeps recurring.',
+          // Name the session: on a multi-session host this warning is the only way to tell whether one
+          // session timed out or every one of them did, and the two have very different causes.
+          { sessionId: this.config.sessionId, action: 'ready_reconcile_timeout' },
         );
         this.clearReadyReconcile();
         // Self-heal: don't leave the session stuck at "authenticating" forever — clear the broken auth
@@ -1160,20 +1370,160 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
   }
 
   /**
+   * Dismiss a freshly-linked account's "What's new on WhatsApp Web" onboarding modal (#982). The modal
+   * has a Continue button that must be acknowledged or WhatsApp unlinks the companion ~5m later
+   * (surfacing as disconnected: LOGOUT). whatsapp-web.js exposes no API for this (#3550 open), so the
+   * watcher reaches the page directly. Idempotent and one-shot per engine: the modal appears once per
+   * account, so the loop self-terminates at the lifetime cap instead of polling forever.
+   *
+   * The watcher only ever moves the session out of READY when it has clicked Continue repeatedly and
+   * the modal is still there — real evidence a human must acknowledge it. A probe that cannot reach
+   * the page, or a page with no such modal, leaves the session exactly where it was: blocking sends
+   * over a best-effort DOM guess would be a worse outcome than the problem being guarded against.
+   */
+  private startOnboardingWatcher(): void {
+    if (this.onboardingWatcherStarted) return; // idempotent: ready event + reconcile path share one funnel
+    this.onboardingWatcherStarted = true;
+    this.onboardingWatcherStartedAt = Date.now();
+
+    const tick = (): void => {
+      if (!this.client || this.status !== EngineStatus.READY || this.tearingDown || this.disconnectReported) {
+        this.clearOnboardingWatcher();
+        return;
+      }
+      // The modal is one-shot per account: stop after the lifetime cap rather than polling forever.
+      if (Date.now() - this.onboardingWatcherStartedAt >= ONBOARDING_MODAL_MAX_LIFETIME_MS) {
+        this.clearOnboardingWatcher();
+        return;
+      }
+      // Schedule the next tick up front so a hung page.evaluate can't stall the loop.
+      this.onboardingWatcherTimer = setTimeout(tick, ONBOARDING_MODAL_INTERVAL_MS);
+      this.onboardingWatcherTimer.unref?.();
+      // Fire-and-forget: a rejection is the fallback signal, not a crash.
+      void this.dismissOnboardingModalIfNeeded();
+    };
+
+    this.onboardingWatcherTimer = setTimeout(tick, ONBOARDING_MODAL_INTERVAL_MS);
+    this.onboardingWatcherTimer.unref?.();
+  }
+
+  private clearOnboardingWatcher(): void {
+    if (this.onboardingWatcherTimer) {
+      clearTimeout(this.onboardingWatcherTimer);
+      this.onboardingWatcherTimer = null;
+    }
+    this.onboardingWatcherStartedAt = 0;
+  }
+
+  /**
+   * One watcher tick: click the onboarding modal's Continue button if it is on screen. Returns the
+   * probe verdict rather than mutating state so the loop stays the single owner of the
+   * ACTION_REQUIRED transition. A rejected evaluate is NOT an operator signal — see the catch.
+   */
+  private async dismissOnboardingModalIfNeeded(): Promise<void> {
+    if (!this.client) return;
+    const page = (
+      this.client as unknown as {
+        pupPage?: { evaluate: <T, A>(fn: (arg: A) => T, arg: A) => Promise<T> };
+      }
+    ).pupPage;
+
+    // Resolved out here, not inside the probe: the function body is stringified into the page, so it
+    // cannot read process.env. Operator-supplied labels skip the English heading check (see the probe).
+    const labels = resolveOnboardingContinueLabels();
+    const headingOptionalFor = labels.filter(label => label !== ONBOARDING_DEFAULT_CONTINUE_LABEL);
+
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const result = await Promise.race([
+        page?.evaluate(probeOnboardingModal, { labels, headingOptionalFor }),
+        new Promise<never>((_, reject) => {
+          timeout = setTimeout(
+            () => reject(new Error('onboarding modal probe timed out')),
+            ONBOARDING_MODAL_PROBE_TIMEOUT_MS,
+          );
+          timeout.unref?.();
+        }),
+      ]);
+
+      if (!result?.dismissed) return;
+
+      // We clicked. A modal that is really dismissed is gone by the next tick, so a click here is
+      // normally a one-off. Repeated clicks mean the click is not taking effect (an overlay is
+      // swallowing it, or WhatsApp keeps re-showing the modal) — that, and only that, is evidence a
+      // human has to acknowledge it on the phone before the companion is unlinked.
+      this.onboardingDismissClicks += 1;
+      this.logger.log('Dismissed the WhatsApp Web onboarding modal', {
+        sessionId: this.config.sessionId,
+        attempt: this.onboardingDismissClicks,
+        action: 'onboarding_modal_dismissed',
+      });
+      if (this.onboardingDismissClicks >= ONBOARDING_MODAL_MAX_DISMISS_CLICKS) {
+        this.reportActionRequired(
+          `WhatsApp is still showing its onboarding modal after ${this.onboardingDismissClicks} ` +
+            "attempts to dismiss it. Open WhatsApp Web on the account holder's own browser and click " +
+            'through the "What\'s new" screen, or the companion device will be unlinked. Then restart ' +
+            'the session (stop, then start) — acknowledging the modal does not return it to ready on its own.',
+        );
+      }
+    } catch {
+      // The page navigated, closed, or the probe timed out. This is expected around a reload or a
+      // teardown and says nothing about the modal, so it must not move the session: a status change
+      // here would take a HEALTHY session out of READY, which blocks every send (ensureReady) for a
+      // reason the operator cannot act on. A page that is genuinely gone surfaces through the
+      // puppeteer lifecycle listeners as a disconnect, which is where that belongs.
+      this.logger.debug('Onboarding modal probe could not reach the page; ignoring', {
+        sessionId: this.config.sessionId,
+        action: 'onboarding_modal_probe_skipped',
+      });
+    } finally {
+      if (timeout) clearTimeout(timeout);
+    }
+  }
+
+  private reportActionRequired(reason: string): void {
+    this.clearOnboardingWatcher();
+    if (this.status !== EngineStatus.READY) return; // already leaving READY; don't override a teardown/failure
+    this.setStatus(EngineStatus.ACTION_REQUIRED);
+    this.callbacks.onActionRequired?.(reason);
+    this.logger.warn(reason, { sessionId: this.config.sessionId, action: 'onboarding_modal_fallback' });
+  }
+
+  /**
    * Recover a session that authenticated but never reached runtime readiness (stale/incompatible auth
    * or a wedged page). Clear the broken LocalAuth and disconnect so the session lifecycle re-pairs (a
-   * fresh QR) instead of hanging at "authenticating". Runs at most once per engine — a re-paired session
-   * that still can't reach readiness fails terminally rather than looping.
+   * fresh QR) instead of hanging at "authenticating". Runs at most ONCE per reconnect episode: the
+   * one-shot budget lives on the session (via the synchronous `claimStuckAuthRecovery` callback), so
+   * an automatic reconnect that builds a fresh adapter cannot reset it and wipe LocalAuth every
+   * generation. A re-paired session that still can't reach readiness fails terminally rather than looping.
+   *
+   * When the callback is ABSENT (standalone adapter use/test, no session lifecycle) the adapter falls
+   * back to its own instance-local boolean so standalone behavior stays one-shot.
    */
   private async recoverFromStuckAuth(): Promise<void> {
-    if (this.stuckAuthRecoveryAttempted) {
+    // The one-shot budget is decided SYNCHRONOUSLY before any destructive I/O. The session-owned
+    // callback is authoritative when present; the instance-local boolean is the standalone fallback.
+    // Fail-closed: a callback that throws (or already-spent budget) makes this terminal WITHOUT
+    // touching the auth dir, so a wedged claim path can never wipe the only copy of the credentials.
+    const claim = this.callbacks.claimStuckAuthRecovery;
+    let granted: boolean;
+    if (claim) {
+      try {
+        granted = claim();
+      } catch {
+        granted = false;
+      }
+    } else {
+      granted = !this.stuckAuthRecoveryAttempted;
+      this.stuckAuthRecoveryAttempted = true;
+    }
+    if (!granted) {
       this.setStatus(EngineStatus.FAILED);
       this.callbacks.onError?.(
         'WhatsApp Web could not reach readiness after re-pairing. Pin WWEBJS_WEB_VERSION to a known-good build and try again.',
       );
       return;
     }
-    this.stuckAuthRecoveryAttempted = true;
 
     const client = this.client;
     this.client = null;
@@ -1190,9 +1540,26 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
   /** Remove this session's LocalAuth directory so the next start re-pairs from a clean slate. */
   private async clearLocalAuth(): Promise<void> {
     const dir = path.join(path.resolve(this.config.sessionDataPath), `session-${this.config.sessionId}`);
-    await fs.promises.rm(dir, { recursive: true, force: true }).catch((error: unknown) => {
-      this.logger.warn(`Could not clear stale auth at ${dir}`, { error: String(error) });
-    });
+    await fs.promises
+      .rm(dir, { recursive: true, force: true })
+      .then(() => {
+        // #981: this is the only copy of the session's WhatsApp credentials, and removing it is not
+        // recoverable — every later start finds an empty profile and can do nothing but show a QR. Say
+        // so at the moment it happens: otherwise the sole trace is a session that silently stops
+        // reconnecting, indistinguishable from a WhatsApp-side logout or an untouched profile.
+        this.logger.warn(
+          `Deleted this session's stored WhatsApp credentials at ${dir}. That was the only copy, so the ` +
+            'next start cannot restore the link and comes back with a fresh QR to scan.',
+          { sessionId: this.config.sessionId, dir, action: 'auth_cleared' },
+        );
+      })
+      .catch((error: unknown) => {
+        this.logger.warn(`Could not clear stale auth at ${dir}`, {
+          sessionId: this.config.sessionId,
+          dir,
+          error: String(error),
+        });
+      });
   }
 
   /**
@@ -1220,14 +1587,18 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
           else resolve(stdout);
         });
       });
+      // Token-exact marker match: the marker is a single argv token, so it must appear delimited by
+      // whitespace or string boundaries. A plain substring test would let restarting session
+      // `sales` SIGKILL the LIVE browser of sibling `sales2` (their markers share a prefix).
       const marker = `--openwa-session=${this.config.sessionId}`;
+      const markerRe = new RegExp('(?:^|\\s)' + marker.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '(?=\\s|$)');
       const killedPids: number[] = [];
       for (const line of psOutput.split('\n')) {
         const match = /^\s*(\d+)\s+(.*)$/.exec(line);
         if (!match) continue;
         const pid = Number(match[1]);
         const args = match[2];
-        if (pid === process.pid || !args.includes(marker)) continue;
+        if (pid === process.pid || !markerRe.test(args)) continue;
         // Never kill a non-browser process that happens to carry the marker string
         // (e.g. a `grep --openwa-session=…` probing the process table).
         if (!/chrome|chromium|headless/i.test(args)) continue;
@@ -1283,6 +1654,12 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
   }
 
   private setStatus(status: EngineStatus): void {
+    // Latch before anything observes the transition. The constructor's initial DISCONNECTED is a field
+    // initializer and never reaches here, so this only ever fires on a real transition — startup is
+    // unaffected while a finished adapter is marked finished for good.
+    if (status === EngineStatus.DISCONNECTED) {
+      this.disconnectReported = true;
+    }
     this.status = status;
     this.callbacks.onStateChanged?.(status);
     this.emit('stateChanged', status);
@@ -1297,6 +1674,7 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
     if (!client) return null;
 
     this.clearReadyReconcile();
+    this.clearOnboardingWatcher();
     if (this.status !== EngineStatus.DISCONNECTED) {
       this.setStatus(EngineStatus.DISCONNECTED);
     }
@@ -1309,6 +1687,7 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
       this.client = null;
     }
     this.clearReadyReconcile();
+    this.clearOnboardingWatcher();
   }
 
   async disconnect(): Promise<void> {
@@ -1328,20 +1707,41 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
   }
 
   async logout(): Promise<void> {
+    // Mark the credential removal as caller-owned before anything can emit 'disconnected'. The
+    // lifecycle tracks this call's removal from the outside — SessionService passes the session name
+    // to teardownEngineSafely, which registers the whole engine.logout() promise (a superset of the
+    // in-page unlink AND the profile rm that follows it), and that is the single owner for BOTH
+    // engines, since the Baileys adapter reports nothing here either. So this method must NOT
+    // register a second, narrower promise for the same removal, and the 'disconnected' LOGOUT handler
+    // must not add its stand-in on top. Set even with no live client: the throw path sends nothing,
+    // so no event can arrive, and a caller-initiated logout is still what happened.
+    this.logoutInitiated = true;
     const client = this.beginClientTeardown();
-    if (!client) return;
+    // No live client means there is nothing to send the unlink through. Resolving here would report a
+    // confirmed unlink for a request that never reached WhatsApp — the caller writes an audit row on
+    // success, and the device would stay listed under the account holder's Linked Devices. The
+    // session-level "is it started?" check cannot catch this: an engine stays registered while its
+    // client is gone (a stuck-auth recovery nulls it, then waits out the reconnect backoff).
+    if (!client) {
+      throw new Error('No live WhatsApp Web client — the unlink was not sent');
+    }
 
     try {
-      // Logout clears session data - user will need to scan QR again
+      // client.logout() chains authStrategy.logout() (LocalAuth) → fs.rm of this session's profile
+      // dir. The lifecycle already tracks that removal through this method's own promise (see the
+      // note above logoutInitiated), so nothing is registered here.
       await client.logout();
     } catch (error) {
       this.logger.warn('Logout failed:', { error: String(error) });
-      // Fall back to destroy if logout fails
+      // Fall back to destroy so the session still dies locally — but rethrow so the caller
+      // learns the unlink never reached WhatsApp: the device may still be listed under the
+      // account holder's Linked Devices, and reporting success would write a false audit row.
       try {
         await client.destroy();
       } catch (destroyError) {
         this.logger.warn('Client destroy also failed during logout fallback', { error: String(destroyError) });
       }
+      throw error;
     } finally {
       this.finishClientTeardown(client);
     }
@@ -1545,25 +1945,45 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
     return this.sendMediaMessage(chatId, media, media.ptt ? { sendAudioAsVoice: true } : undefined);
   }
 
+  /**
+   * Without `sendMediaAsDocument` whatsapp-web.js lets WA Web classify the attachment from its declared
+   * mimetype (`Injected/Utils.js` `processMediaData` -> `prepRawMedia`), so an `image/*`, `video/*` or
+   * `audio/*` payload posted here reached the recipient as a photo/video/audio bubble — re-encoded and
+   * stripped of its filename — instead of a document (#989). Baileys has always forced it via the
+   * explicit `document:` content key, so the two engines disagreed on the same request.
+   *
+   * The flag is withheld for `status@broadcast` and broadcast lists: whatsapp-web.js refuses every
+   * `@broadcast` recipient outright once it is set (`Client.js` returns `null`, which `toMessageResult`
+   * surfaces as a failed send), so setting it there would turn a working send into an error rather than
+   * improve it. Those recipients keep the classification they have today.
+   */
   async sendDocumentMessage(chatId: string, media: MediaInput): Promise<MessageResult> {
-    return this.sendMediaMessage(chatId, media);
+    const kind = chatKind(chatId);
+    const asDocument = kind !== 'status' && kind !== 'broadcast';
+    return this.sendMediaMessage(chatId, media, asDocument ? { sendMediaAsDocument: true } : undefined);
   }
 
   private async sendMediaMessage(
     chatId: string,
     media: MediaInput,
-    extraOptions?: { sendAudioAsVoice?: boolean },
+    extraOptions?: { sendAudioAsVoice?: boolean; sendMediaAsDocument?: boolean },
   ): Promise<MessageResult> {
     this.ensureReady();
     this.ensureNotChannelRecipient(chatId);
 
     // Build the media once (a remote URL is fetched here); sendResolved may retry the send itself.
     const messageMedia = await this.toMessageMedia(media);
+    // A nameless document reaches WA Web as `new File([blob], undefined)` and is labelled literally
+    // "undefined". Only documents render a filename, so default just this path — as Baileys does.
+    if (extraOptions?.sendMediaAsDocument && !messageMedia.filename) {
+      messageMedia.filename = 'file';
+    }
     const msg = await this.sendResolved(chatId, to =>
       this.client!.sendMessage(to, messageMedia, {
         caption: media.caption,
         ...(media.mentions?.length ? { mentions: media.mentions } : {}),
-        // sendAudioAsVoice only for audio; {...undefined} contributes no keys.
+        // sendAudioAsVoice only for audio, sendMediaAsDocument only for documents;
+        // {...undefined} contributes no keys.
         ...extraOptions,
       }),
     );
@@ -1708,17 +2128,9 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
     // hits the same channel crash: for a channel wwjs drops the sticker form and runs processMediaData
     // with sendToChannel, which still ends at msg.avParams() (Utils.js:518). Guard it too (#673).
     this.ensureNotChannelRecipient(chatId);
-    let messageMedia: MessageMedia;
-
-    if (typeof media.data === 'string') {
-      if (isHttpUrl(media.data)) {
-        messageMedia = await loadRemoteMedia(media.data);
-      } else {
-        messageMedia = new MessageMedia(media.mimetype, media.data, media.filename);
-      }
-    } else {
-      messageMedia = new MessageMedia(media.mimetype, media.data.toString('base64'), media.filename);
-    }
+    // Keep the fetched content-type for a remote URL: here the mimetype selects the conversion, and
+    // whatsapp-web.js returns the media unconverted once it reads as webp (Util.formatImageToWebpSticker).
+    const messageMedia = await this.toMessageMedia(media, { trustDeclaredType: false });
 
     const msg = await this.sendResolved(chatId, to =>
       this.client!.sendMessage(to, messageMedia, {
@@ -1856,6 +2268,13 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
         linkedParentJID: extractLinkedParentJID(groupChat.groupMetadata),
       };
     } catch (error) {
+      // A dead page and a genuinely-missing group both land in this catch; only the second may
+      // become null (→ service 404). A transport death surfaced as "group not found" sends
+      // operators debugging the wrong layer — report it and answer 503 instead.
+      if (this.isPageTransportError(error)) {
+        this.reportIfPageTransportError(error, 'getGroupInfo');
+        throw new EngineTransportError(`Transport died while reading group ${groupId}`);
+      }
       this.logger.warn(`Failed to get group: ${groupId}`, { error: String(error) });
       return null;
     }
@@ -1888,44 +2307,104 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
     };
   }
 
-  async addParticipants(groupId: string, participants: string[]): Promise<void> {
+  async addParticipants(groupId: string, participants: string[]): Promise<ParticipantOperationResult[]> {
     this.ensureReady();
     const chat = await this.client!.getChatById(groupId);
     if (!chat.isGroup) {
       throw new Error('Chat is not a group');
     }
     const participantIds = participants.map(p => (p.includes('@') ? p : `${p}@c.us`));
-    await (chat as unknown as GroupChat).addParticipants(participantIds);
+    const raw = await (chat as unknown as GroupChat).addParticipants(participantIds);
+    // whatsapp-web.js reports a batch-level refusal (no admin rights, empty group) by RESOLVING a
+    // plain reason string (GroupChat.js:106-107,128-130) instead of throwing — surface it as a
+    // refusal, not a success.
+    if (typeof raw === 'string') {
+      throw new EngineRefusedError(raw);
+    }
+    // Per-participant outcome: code 200 = added; 403 invite-only / 404 not registered / 408
+    // recently left / 409 already a member / 419 group full (GroupChat.js:102-116).
+    const results: ParticipantOperationResult[] = Object.entries(raw ?? {}).map(([id, r]) => {
+      // A 403 with isInviteV4Sent is not a failure: wwebjs already delivered the private group
+      // invite (GroupChat.js:203-240). Report it as success-with-invite — otherwise an all-invite
+      // batch throws "failed for all" (HTTP 403) even though every participant was reached.
+      const inviteSent = r.code === 403 && r.isInviteV4Sent === true;
+      return {
+        id,
+        success: r.code === 200 || inviteSent,
+        status: r.code,
+        message: inviteSent
+          ? 'the participant can only be added by private invitation — invite sent'
+          : r.message || undefined,
+      };
+    });
+    return this.assertParticipantResults('addParticipants', groupId, results);
   }
 
-  async removeParticipants(groupId: string, participants: string[]): Promise<void> {
-    this.ensureReady();
-    const chat = await this.client!.getChatById(groupId);
-    if (!chat.isGroup) {
-      throw new Error('Chat is not a group');
-    }
-    const participantIds = participants.map(p => (p.includes('@') ? p : `${p}@c.us`));
-    await (chat as unknown as GroupChat).removeParticipants(participantIds);
+  async removeParticipants(groupId: string, participants: string[]): Promise<ParticipantOperationResult[]> {
+    return this.runStatusOnlyParticipantOp('removeParticipants', groupId, participants);
   }
 
-  async promoteParticipants(groupId: string, participants: string[]): Promise<void> {
-    this.ensureReady();
-    const chat = await this.client!.getChatById(groupId);
-    if (!chat.isGroup) {
-      throw new Error('Chat is not a group');
-    }
-    const participantIds = participants.map(p => (p.includes('@') ? p : `${p}@c.us`));
-    await (chat as unknown as GroupChat).promoteParticipants(participantIds);
+  async promoteParticipants(groupId: string, participants: string[]): Promise<ParticipantOperationResult[]> {
+    return this.runStatusOnlyParticipantOp('promoteParticipants', groupId, participants);
   }
 
-  async demoteParticipants(groupId: string, participants: string[]): Promise<void> {
+  async demoteParticipants(groupId: string, participants: string[]): Promise<ParticipantOperationResult[]> {
+    return this.runStatusOnlyParticipantOp('demoteParticipants', groupId, participants);
+  }
+
+  /**
+   * whatsapp-web.js remove/promote/demote resolve `{status: 200}` for the whole batch and reject on
+   * a page-side failure (GroupChat.js:267-298,305-340,343-374) — there is no per-participant
+   * breakdown to map: the page-side code even drops requested ids it can't find in the group and
+   * still resolves 200, so a 200 confirms the batch, not any individual. A non-200 status is a
+   * batch refusal. Within the per-participant shape the truthful report is one entry per requested
+   * participant carrying the batch status, annotated so a consumer can tell it apart from an
+   * individually-confirmed outcome (addParticipants); nothing per-participant exists to map.
+   */
+  private async runStatusOnlyParticipantOp(
+    op: 'removeParticipants' | 'promoteParticipants' | 'demoteParticipants',
+    groupId: string,
+    participants: string[],
+  ): Promise<ParticipantOperationResult[]> {
     this.ensureReady();
     const chat = await this.client!.getChatById(groupId);
     if (!chat.isGroup) {
       throw new Error('Chat is not a group');
     }
     const participantIds = participants.map(p => (p.includes('@') ? p : `${p}@c.us`));
-    await (chat as unknown as GroupChat).demoteParticipants(participantIds);
+    const res = await (chat as unknown as GroupChat)[op](participantIds);
+    if (res?.status !== 200) {
+      throw new EngineRefusedError(`${op} refused for group ${groupId} (status ${res?.status ?? 'unknown'})`);
+    }
+    return participantIds.map(id => ({
+      id,
+      success: true,
+      status: 200,
+      message: 'confirmed with the batch — wwebjs reports no per-participant outcome',
+    }));
+  }
+
+  /**
+   * Shared gate for the membership writes: a result list with at least one success resolves as-is
+   * (partial refusals stay visible per participant); a batch that failed for EVERY requested
+   * participant is a refusal of the operation itself (HTTP 403), not a per-participant detail; and
+   * an empty result is no evidence of success at all.
+   */
+  private assertParticipantResults(
+    op: string,
+    groupId: string,
+    results: ParticipantOperationResult[],
+  ): ParticipantOperationResult[] {
+    if (results.length === 0) {
+      throw new EngineRefusedError(`${op} returned no per-participant outcome for group ${groupId}`);
+    }
+    if (results.every(r => !r.success)) {
+      const detail = results.map(r => `${r.id} (${r.status ?? '?'})`).join(', ');
+      throw new EngineRefusedError(
+        `${op} failed for all ${results.length} participant(s) in group ${groupId}: ${detail}`,
+      );
+    }
+    return results;
   }
 
   async leaveGroup(groupId: string): Promise<void> {
@@ -1943,7 +2422,12 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
     if (!chat.isGroup) {
       throw new Error('Chat is not a group');
     }
-    await (chat as unknown as GroupChat).setSubject(subject);
+    // GroupChat.setSubject resolves false when WA Web rejects the change (e.g. the account lacks
+    // admin rights; index.d.ts:1982) instead of throwing — surface the refusal, not a false success.
+    const ok = await (chat as unknown as GroupChat).setSubject(subject);
+    if (!ok) {
+      throw new EngineRefusedError(`Failed to set the subject for group ${groupId} — admin rights required`);
+    }
   }
 
   async setGroupDescription(groupId: string, description: string): Promise<void> {
@@ -1952,7 +2436,11 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
     if (!chat.isGroup) {
       throw new Error('Chat is not a group');
     }
-    await (chat as unknown as GroupChat).setDescription(description);
+    // Same discarded-boolean contract as setSubject (index.d.ts:1984).
+    const ok = await (chat as unknown as GroupChat).setDescription(description);
+    if (!ok) {
+      throw new EngineRefusedError(`Failed to set the description for group ${groupId} — admin rights required`);
+    }
   }
 
   // Reactions (Phase 3)
@@ -2123,20 +2611,27 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
     return channels.find(c => c.id === channelId) ?? null;
   }
 
-  async subscribeToChannel(inviteCode: string): Promise<Channel> {
+  // whatsapp-web.js `Client.subscribeToChannel(channelId)` takes a channel ID and resolves a
+  // boolean (index.d.ts:71; Client.js:2533) — the interface contract here is subscribe-by-INVITE-CODE
+  // returning the subscribed Channel. The old wiring passed the invite code straight in and mapped
+  // the returned boolean as if it were a Channel, fabricating `{ id: "undefined" }`: a reported
+  // success that never subscribed anything. A real wiring is the two-step
+  // `getChannelByInviteCode(inviteCode)` (Client.js:1707) → `subscribeToChannel(channel.id)` flow;
+  // until that is verified against a live session, an honest 501 beats a phantom success.
+  // eslint-disable-next-line @typescript-eslint/require-await, @typescript-eslint/no-unused-vars
+  async subscribeToChannel(_inviteCode: string): Promise<Channel> {
     this.ensureReady();
-    const ch = await (this.client as unknown as BusinessClient).subscribeToChannel(inviteCode);
-    this.logger.log(`Subscribed to channel with invite code: ${inviteCode}`);
-    return {
-      id: String(typeof ch.id === 'object' ? ch.id._serialized : ch.id),
-      name: String(ch.name || ''),
-      description: ch.description ? String(ch.description) : undefined,
-    };
+    throw new EngineNotSupportedError('subscribeToChannel');
   }
 
   async unsubscribeFromChannel(channelId: string): Promise<void> {
     this.ensureReady();
-    await (this.client as unknown as BusinessClient).unsubscribeFromChannel(channelId);
+    // Resolves false instead of throwing when the unsubscription did not complete (Client.js:2556)
+    // — surface the refusal rather than reporting a false success.
+    const ok = await (this.client as unknown as BusinessClient).unsubscribeFromChannel(channelId);
+    if (!ok) {
+      throw new EngineRefusedError(`Failed to unsubscribe from channel ${channelId}`);
+    }
     this.logger.log(`Unsubscribed from channel: ${channelId}`);
   }
 
@@ -2152,7 +2647,11 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
     if (!channel) {
       throw new ChannelNotFoundError(channelId);
     }
-    const messages = await channel.fetchMessages({ limit });
+    // wwebjs Channel.fetchMessages only honors a limit > 0: its load-earlier loop AND the final
+    // splice are both gated on `searchOptions.limit > 0` (Channel.js:352), so a 0/negative/NaN
+    // limit fails OPEN and returns every loaded message. Substitute the default instead.
+    const safeLimit = Number.isFinite(limit) && limit >= 1 ? Math.trunc(limit) : 50;
+    const messages = await channel.fetchMessages({ limit: safeLimit });
     return (messages ?? []).map(msg => ({
       // Read `$1` before the sentinel (#747), and don't `String()` the object branch: that turned an
       // unreadable id into the literal "undefined" rather than the empty sentinel every other path
@@ -2475,12 +2974,36 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
 
   // ========== Gap Quick Wins Implementation ==========
 
-  async getChatHistory(chatId: string, limit: number = 50, includeMedia: boolean = false): Promise<IncomingMessage[]> {
+  async getChatHistory(
+    chatId: string,
+    limit: number = 50,
+    includeMedia: boolean = false,
+    mediaMaxBytes?: number,
+    signal?: AbortSignal,
+  ): Promise<IncomingMessage[]> {
     this.ensureReady();
     const chat = await this.client!.getChatById(chatId);
     const messages = await chat.fetchMessages({ limit });
     const results: IncomingMessage[] = [];
+    // Aggregate base64 budget across the whole pass: the per-message cap bounds ONE blob, but without
+    // an aggregate bound a 100-message history could stack ~100 × 50 MiB into one response. Once the
+    // running total crosses the budget, later media messages get the declared-only `omitted` marker —
+    // no download — while everything already inlined stays inline (a small history is byte-identical
+    // to before). `signal` (client disconnect) stops the loop between messages; partials are returned.
+    // The 25 MiB default is sized for ONE HTTP response and is too tight for a caller that ingests
+    // into a store instead (mediaMaxBytes — the status seed): two ~10 MiB videos are ~28 MiB of
+    // base64 and would strip every later status. Such a caller gets a budget derived from its own
+    // per-item cap rather than an exemption — unbounded here would mean a 50-item seed could stack
+    // ~650 MiB of base64 on the heap at connect time.
+    let mediaBudget = !includeMedia
+      ? Number.POSITIVE_INFINITY
+      : mediaMaxBytes === undefined
+        ? chatHistoryMediaBudgetBytes()
+        : ingestMediaBudgetBytes(mediaMaxBytes);
     for (const msg of messages) {
+      if (signal?.aborted) {
+        break;
+      }
       // Reuse the shared mapper so history messages carry the same author/contact
       // enrichment as live incoming messages (#223). The mapper defaults chatId to
       // msg.from, which is wrong here (history includes fromMe messages whose `from`
@@ -2513,12 +3036,23 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
         }
       }
       if (includeMedia && msg.hasMedia) {
-        try {
-          // Same pre-gate + limiter as live media: a large historical blob shouldn't bloat the response/heap.
-          const capped = await this.capInboundMediaFor(msg);
-          if (capped) out.media = capped;
-        } catch (error) {
-          this.logger.warn(`Failed to download media for ${msg.id._serialized}: ${String(error)}`);
+        if (mediaBudget <= 0) {
+          out.media = declaredOnlyMedia(msg);
+        } else {
+          try {
+            // Same pre-gate + limiter as live media: a large historical blob shouldn't bloat the
+            // response/heap. Callers (the status seed) can tighten the cap below the global default.
+            const capped = await this.capInboundMediaFor(msg, mediaMaxBytes);
+            if (capped) {
+              out.media = capped;
+              // Only an inlined payload spends budget; an omitted marker carries no base64.
+              if (capped.data) {
+                mediaBudget -= capped.data.length;
+              }
+            }
+          } catch (error) {
+            this.logger.warn(`Failed to download media for ${msg.id._serialized}: ${String(error)}`);
+          }
         }
       }
       results.push(out);
@@ -2579,7 +3113,13 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
       const url = await this.client!.getProfilePicUrl(contactId);
       return url || null;
     } catch (error) {
-      this.reportIfPageTransportError(error, 'getProfilePicture');
+      // Mirrors getGroupInfo: a dead page and a contact with no picture both land here, and only the
+      // second may become null (→ service: the contact simply has no avatar). A transport death
+      // surfaced as "no picture" sends operators debugging the wrong layer — report it and answer 503.
+      if (this.isPageTransportError(error)) {
+        this.reportIfPageTransportError(error, 'getProfilePicture');
+        throw new EngineTransportError(`Transport died while reading profile picture for ${contactId}`);
+      }
       this.logger.warn(`Failed to get profile picture for ${contactId}: ${String(error)}`);
       return null;
     }
@@ -2666,9 +3206,12 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
       groupId = await this.client!.acceptInvite(inviteCode);
     } catch (error) {
       // A refused invite and a broken page both land here, and only the first is the caller's
-      // fault. Surface the transport case to the liveness path and keep the original error in the
-      // log: without it an upstream rename turns every join into an unexplained 400.
-      this.reportIfPageTransportError(error, 'joinGroupViaInviteCode');
+      // fault. A transport death must not be reported as "invalid invite" (400): report the death
+      // to the liveness path and answer 503 so the caller can tell the layers apart.
+      if (this.isPageTransportError(error)) {
+        this.reportIfPageTransportError(error, 'joinGroupViaInviteCode');
+        throw new EngineTransportError('Transport died while accepting the group invite');
+      }
       this.logger.warn(`Failed to accept group invite: ${String(error)}`);
       groupId = undefined;
     }
@@ -2767,6 +3310,16 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
       };
       for (const msg of broadcast.msgs) {
         const ts = new Date(msg.timestamp * 1000);
+        // Reuse the same capped/limited/timeout-bounded inbound media download the live message path
+        // uses (capInboundMediaFor), so a seeded status renders identically to one that arrived live.
+        let media: IncomingMessage['media'];
+        if (msg.hasMedia) {
+          try {
+            media = await this.capInboundMediaFor(msg);
+          } catch (error) {
+            this.logger.warn(`Failed to download media for status ${msg.id._serialized}: ${String(error)}`);
+          }
+        }
         statuses.push({
           // `deleteStatus` takes this id as its revoke handle, so losing it to the rename makes a
           // listed status unactionable (#747). The contact id above is a Wid and is unaffected.
@@ -2774,6 +3327,7 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
           contact: contactSummary,
           type: msg.type === MessageTypes.IMAGE ? 'image' : msg.type === MessageTypes.VIDEO ? 'video' : 'text',
           ...(msg.body ? { caption: msg.body } : {}),
+          ...(media ? { media } : {}),
           timestamp: ts,
           expiresAt: new Date(ts.getTime() + 24 * 3_600_000),
         });
@@ -2817,13 +3371,53 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
     return this.toStatusResult(msg);
   }
 
-  /** Build a MessageMedia from a MediaInput (URL → fetched, base64/Buffer → wrapped). */
-  private async toMessageMedia(media: MediaInput): Promise<MessageMedia> {
-    if (typeof media.data === 'string') {
-      if (isHttpUrl(media.data)) return loadRemoteMedia(media.data);
-      return new MessageMedia(media.mimetype, media.data, media.filename);
+  /**
+   * Build a MessageMedia from a MediaInput (URL → fetched, base64/Buffer → wrapped).
+   *
+   * `trustDeclaredType: false` keeps the fetched response's content-type for a remote URL. Use it
+   * wherever the mimetype is an INSTRUCTION rather than a label: whatsapp-web.js decides how to
+   * convert a sticker from it, and `Util.formatImageToWebpSticker` returns the media untouched when it
+   * already says webp. A caller that declares `image/webp` over bytes that are not webp would then
+   * have raw bytes shipped as a sticker. The response describes bytes the caller never saw, so for
+   * that one decision it is the better source. The declared filename still wins either way — that is
+   * a label, and nothing branches on it.
+   */
+  private async toMessageMedia(media: MediaInput, opts?: { trustDeclaredType?: boolean }): Promise<MessageMedia> {
+    if (typeof media.data === 'string' && isHttpUrl(media.data)) {
+      const fetched = await loadRemoteMedia(media.data);
+      // `loadRemoteMedia` derives both fields from the response (content-type, URL basename) because
+      // that is all it has. The caller usually knows better, so let an explicit `mimetype`/`filename`
+      // win — matching `resolveMediaBuffer` on the Baileys adapter, which already prefers the caller's.
+      // `application/octet-stream` is the DTO's own placeholder, not a statement about the bytes.
+      if (opts?.trustDeclaredType !== false && media.mimetype && media.mimetype !== 'application/octet-stream') {
+        fetched.mimetype = media.mimetype;
+      }
+      // Sticker path (trustDeclaredType:false): a specific fetched image/video MIME stays authoritative,
+      // but a generic/empty fetched MIME carries no information, and the caller's declared
+      // image/* or video/* would otherwise be discarded — whatsapp-web.js then rejects the format
+      // before running the sticker conversion. Fall back ONLY in that one shape: remote URL +
+      // trustDeclaredType:false + generic fetched type + convertible declared type. Canonicalize the
+      // value handed downstream (lowercased, params stripped) so a mixed-case declared type is
+      // normalized exactly once. A declared image/webp IS accepted here when the fetched response
+      // carries no usable MIME — the caller is asserting what the bytes actually are, so trusting it
+      // only in the generic-fetched shape can't bypass the sticker conversion the way globally
+      // trusting a declared WebP over a specific fetched type would. Arbitrary application/* is
+      // rejected (e.g. the DTO's own octet-stream placeholder, or application/pdf).
+      const normalizeMediaType = (value?: string): string => (value ?? '').split(';', 1)[0].trim().toLowerCase();
+      const fetchedType = normalizeMediaType(fetched.mimetype);
+      const declaredType = normalizeMediaType(media.mimetype);
+      const fetchedTypeIsGeneric = !fetchedType || fetchedType === 'application/octet-stream';
+      const declaredTypeIsConvertible = declaredType.startsWith('image/') || declaredType.startsWith('video/');
+      if (opts?.trustDeclaredType === false && fetchedTypeIsGeneric && declaredTypeIsConvertible) {
+        fetched.mimetype = declaredType;
+      }
+      if (media.filename) {
+        fetched.filename = media.filename;
+      }
+      return fetched;
     }
-    return new MessageMedia(media.mimetype, media.data.toString('base64'), media.filename);
+    const data = typeof media.data === 'string' ? media.data : media.data.toString('base64');
+    return new MessageMedia(media.mimetype, data, media.filename);
   }
 
   /**
@@ -2904,27 +3498,24 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
   }
 
   // ========== Catalog (Phase 3) ==========
+  // whatsapp-web.js has no Catalog API at all (no Client.getCatalog/getProducts/getProduct symbol in
+  // index.d.ts). These used to be phantom stubs — a warn log plus null/empty results — so the API
+  // reported "no catalog" / "no products" for a capability that never ran. Honest 501s instead,
+  // matching sendProduct/sendCatalog below.
 
   async getCatalog(): Promise<Catalog | null> {
     this.ensureReady();
-    // whatsapp-web.js doesn't have native Catalog API support
-    this.logger.warn('getCatalog not implemented in whatsapp-web.js adapter');
-    return null;
+    throw new EngineNotSupportedError('getCatalog');
   }
 
   async getProducts(_options?: ProductQueryOptions): Promise<PaginatedProducts> {
     this.ensureReady();
-    this.logger.warn('getProducts not implemented in whatsapp-web.js adapter');
-    return {
-      products: [],
-      pagination: { page: 1, limit: 20, total: 0, totalPages: 0 },
-    };
+    throw new EngineNotSupportedError('getProducts');
   }
 
   async getProduct(_productId: string): Promise<Product | null> {
     this.ensureReady();
-    this.logger.warn('getProduct not implemented in whatsapp-web.js adapter');
-    return null;
+    throw new EngineNotSupportedError('getProduct');
   }
 
   async sendProduct(_chatId: string, _productId: string, _body?: string): Promise<MessageResult> {

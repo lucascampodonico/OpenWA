@@ -27,20 +27,27 @@ export interface Session {
   name: string;
   status:
     | 'created'
-    | 'idle'
     | 'initializing'
-    | 'connecting'
     | 'authenticating'
     | 'qr_ready'
     | 'ready'
     | 'disconnected'
+    | 'action_required'
     | 'failed';
-  phone?: string;
-  pushName?: string;
-  lastActive?: string;
+  /**
+   * Whether the gateway holds a live engine for this session right now. The precondition the
+   * lifecycle routes enforce, and not derivable from `status`: `disconnected` covers both a session
+   * mid automatic-reconnect (engine present, start 400s) and one stopped through stop() (no engine).
+   * Optional only because a dashboard can be served by a gateway that predates the field.
+   */
+  engineLoaded?: boolean;
+  phone?: string | null;
+  pushName?: string | null;
+  lastActive?: string | null;
   createdAt: string;
   updatedAt: string;
-  /** Human-readable reason for the most recent terminal engine failure (set only when status is 'failed'). */
+  /** Human-readable reason carried while the status is 'failed' (terminal failure) or
+   * 'action_required' (operator must intervene, e.g. acknowledge an onboarding modal). */
   lastError?: string | null;
 }
 
@@ -178,6 +185,18 @@ export interface ChatMessage {
   chatId: string;
   /** Chat kind of the source conversation (present on live engine/WS payloads). */
   kind?: ChatKind;
+  /**
+   * Human-readable name of the message's sender. For a group this is the participant who posted
+   * (their pushName/contact name); the chat view uses it to label who said what, like WhatsApp. Null
+   * on legacy rows or when the engine could not resolve a name.
+   */
+  chatName?: string;
+  /**
+   * Stable sender identity for a group message: the participant JID who actually posted (`from` is
+   * the group JID). Present on live/engine payloads and on rows persisted after the column was
+   * added; absent on 1:1 messages, outgoing echoes, and legacy rows.
+   */
+  author?: string;
   from: string;
   to: string;
   body: string;
@@ -206,6 +225,10 @@ export interface EngineHistoryMessage {
   timestamp: number;
   fromMe?: boolean;
   media?: { mimetype: string; filename?: string; data?: string };
+  /** Sender in a group: `from` is the group JID, so this participant WID is the real poster. */
+  author?: string;
+  /** Best-effort sender contact (sync cache); its name labels the poster in a group thread. */
+  contact?: { id?: string; name?: string; pushName?: string };
 }
 
 // Mirrors the backend engine Channel / ChannelMessage (GET /sessions/:id/channels[/:id/messages]).
@@ -223,6 +246,34 @@ export interface ChannelMessage {
   timestamp: number;
   hasMedia: boolean;
   mediaUrl?: string;
+}
+
+// Mirrors the backend engine Status / IWhatsAppEngine status methods (GET /sessions/:id/status).
+export interface StatusUpdate {
+  id: string;
+  contact: { id: string; name?: string; pushName?: string };
+  type: 'text' | 'image' | 'video';
+  caption?: string;
+  mediaUrl?: string;
+  backgroundColor?: string;
+  font?: number;
+  timestamp: string;
+  expiresAt: string;
+}
+
+export interface ContactStatusGroup {
+  contact: { id: string; name?: string; pushName?: string };
+  items: StatusUpdate[];
+  latest: string;
+}
+
+// Minimal contact type for the recipient picker; the backend GET /sessions/:id/contacts
+// returns a Contact array; fields beyond id are optional.
+export interface Contact {
+  id: string;
+  name?: string;
+  pushName?: string;
+  number?: string;
 }
 
 export interface SendMediaPayload {
@@ -521,8 +572,16 @@ async function request<T>(endpoint: string, options: RequestInit = {}): Promise<
     const error = await response.json().catch(() => ({}));
     // Carry the HTTP status on the Error (message unchanged, so the toast de-dup still matches) so
     // callers can tell apart a permission 403 from a real server 5xx instead of guessing from text.
-    const err = new Error(error.message || `HTTP ${response.status}`) as Error & { status?: number };
+    // Carry the machine `code` too: the gateway's stable codes (SESSION_LOGOUT_INCOMPLETE,
+    // SESSION_NAME_TEARDOWN_PENDING, …) drive specific recovery UI, and a reverse-proxy 502 that
+    // never reached the gateway carries no code at all — that distinction is exactly what the unlink
+    // classifier keys on instead of fragile message heuristics.
+    const err = new Error(error.message || `HTTP ${response.status}`) as Error & {
+      status?: number;
+      code?: string;
+    };
     err.status = response.status;
+    if (typeof error.code === 'string') err.code = error.code;
     throw err;
   }
 
@@ -556,6 +615,39 @@ async function requestText(endpoint: string): Promise<string> {
   return response.text();
 }
 
+/** Like {@link request} but returns a Blob — e.g. for status media downloads. */
+async function requestBlob(endpoint: string): Promise<Blob> {
+  const url = `${API_BASE_URL}${endpoint}`;
+
+  // Get API key from sessionStorage for authentication
+  const apiKey = sessionStorage.getItem('openwa_api_key');
+
+  const headers: HeadersInit = {
+    ...(apiKey ? { 'X-API-Key': apiKey } : {}),
+  };
+
+  const response = await fetch(url, { headers });
+
+  if (response.status === 401) {
+    // The stored API key is invalid/expired/revoked — clear it and return to login
+    sessionStorage.removeItem('openwa_api_key');
+    if (typeof window !== 'undefined') {
+      window.location.assign('/');
+      // Halt this request's promise chain so callers neither throw nor receive an undefined payload.
+      return new Promise<Blob>(() => {});
+    }
+  }
+
+  if (!response.ok) {
+    const error = await response.json().catch(() => ({}));
+    const err = new Error(error.message || `HTTP ${response.status}`) as Error & { status?: number };
+    err.status = response.status;
+    throw err;
+  }
+
+  return response.blob();
+}
+
 // =============================================================================
 // Session API
 // =============================================================================
@@ -571,6 +663,7 @@ export const sessionApi = {
   delete: (id: string) => request<void>(`/sessions/${id}`, { method: 'DELETE' }),
   start: (id: string) => request<Session>(`/sessions/${id}/start`, { method: 'POST' }),
   stop: (id: string) => request<Session>(`/sessions/${id}/stop`, { method: 'POST' }),
+  logout: (id: string) => request<Session>(`/sessions/${id}/logout`, { method: 'POST' }),
   forceKill: (id: string) => request<Session>(`/sessions/${id}/force-kill`, { method: 'POST' }),
   getQR: (id: string) => request<{ qrCode: string; status: string }>(`/sessions/${id}/qr`),
   requestPairingCode: (id: string, phoneNumber: string) =>
@@ -609,6 +702,29 @@ export const sessionApi = {
   getSubscribedChannels: (id: string) => request<Channel[]>(`/sessions/${id}/channels`),
   getChannelMessages: (id: string, channelId: string, limit = 50) =>
     request<ChannelMessage[]>(`/sessions/${id}/channels/${encodeURIComponent(channelId)}/messages?limit=${limit}`),
+  getContactStatuses: (id: string) => request<{ statuses: StatusUpdate[] }>(`/sessions/${id}/status`),
+  getStatusMediaBlob: (id: string, statusId: string) =>
+    requestBlob(`/sessions/${id}/status/${encodeURIComponent(statusId)}/media`),
+  postTextStatus: (
+    id: string,
+    text: string,
+    recipients?: string[],
+    extra?: { backgroundColor?: string; font?: number },
+  ) =>
+    request(`/sessions/${id}/status/send-text`, {
+      method: 'POST',
+      body: JSON.stringify({ text, recipients, ...extra }),
+    }),
+  postImageStatus: (
+    id: string,
+    image: { url?: string; base64?: string; mimetype?: string },
+    recipients?: string[],
+    caption?: string,
+  ) =>
+    request(`/sessions/${id}/status/send-image`, {
+      method: 'POST',
+      body: JSON.stringify({ image, recipients, caption }),
+    }),
 };
 
 // =============================================================================
@@ -675,6 +791,7 @@ export interface ProfilePictureResponse {
 }
 
 export const contactApi = {
+  list: (sessionId: string) => request<Contact[]>(`/sessions/${sessionId}/contacts`),
   checkNumber: (sessionId: string, number: string) =>
     request<CheckNumberResponse>(`/sessions/${sessionId}/contacts/check/${encodeURIComponent(number)}`),
   // Returns the contact/group profile picture URL. Both engines return null when the user hid their
@@ -903,14 +1020,26 @@ export const infraApi = {
       tables: Record<string, unknown[]>;
       counts: Record<string, number>;
     }>('/infra/export-data'),
-  importData: (tables: Record<string, unknown[]>) =>
-    request<{ imported: boolean; counts?: Record<string, number>; message?: string; warnings?: string[] }>(
-      '/infra/import-data',
-      {
-        method: 'POST',
-        body: JSON.stringify({ tables }),
-      },
-    ),
+  // 200 contract includes the orphan-engine reconciliation result (restartRequired / notices /
+  // stopped+failed ids). A 409 (live engines exist for sessions the backup would remove; the error
+  // message lists them) is retried by the caller with stopOrphans=true, which stops those engines
+  // inside the request. force is deliberately NOT exposed: it leaves the engines writing into the
+  // restored tables until a restart — the window stopOrphans exists to close.
+  importData: (tables: Record<string, unknown[]>, options?: { stopOrphans?: boolean }) =>
+    request<{
+      imported: boolean;
+      counts?: Record<string, number>;
+      message?: string;
+      warnings?: string[];
+      notices?: string[];
+      restartRequired?: boolean;
+      orphanedEngines?: string[];
+      stoppedOrphanEngines?: string[];
+      failedOrphanEngines?: string[];
+    }>('/infra/import-data', {
+      method: 'POST',
+      body: JSON.stringify({ tables, ...options }),
+    }),
 };
 
 // =============================================================================

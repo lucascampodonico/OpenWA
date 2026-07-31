@@ -14,7 +14,14 @@ from typing import Any, Literal, Optional, TypedDict
 
 Jid = str
 SessionStatus = Literal[
-    "created", "initializing", "qr_ready", "authenticating", "ready", "disconnected", "failed"
+    "created",
+    "initializing",
+    "qr_ready",
+    "authenticating",
+    "ready",
+    "disconnected",
+    "action_required",
+    "failed",
 ]
 ChatState = Literal["typing", "recording", "paused"]
 MessageDirection = Literal["incoming", "outgoing"]
@@ -24,7 +31,7 @@ WebhookEvent = Literal[
     "message.received", "message.sent", "message.ack", "message.failed", "message.revoked",
     "message.reaction", "message.edited", "session.status", "session.qr", "session.authenticated",
     "session.disconnected", "session.reconnect_loop",
-    "group.join", "group.leave", "group.update", "call.received",
+    "group.join", "group.leave", "group.update", "call.received", "status.received",
     "*",
 ]
 
@@ -48,6 +55,11 @@ class SessionResponse(TypedDict, total=False):
     createdAt: str
     updatedAt: str
     lastError: str | None
+    # Whether the gateway holds a live engine for this session -- the precondition stop/logout/
+    # force-kill require and start refuses. Not derivable from status: 'disconnected' covers both a
+    # session mid automatic-reconnect (engine present) and one stopped with no engine. Absent from a
+    # gateway that predates the field (the TypedDict is total=False).
+    engineLoaded: bool
 
 
 class CreateSessionRequest(TypedDict, total=False):
@@ -94,9 +106,12 @@ class MessageResponse(TypedDict):
     timestamp: int
 
 
-class SendTextRequest(TypedDict):
+class SendTextRequest(TypedDict, total=False):
+    # chatId/text required; mentions optional.
     chatId: Jid
     text: str
+    # WIDs to @mention (e.g. ["62811@c.us"]). The text must also contain the @<number> token.
+    mentions: list[str]
 
 
 class SendMediaRequest(TypedDict, total=False):
@@ -176,6 +191,16 @@ class SendTemplateRequest(TypedDict, total=False):
     templateId: str
     templateName: str
     vars: dict[str, str]
+
+
+class SendPollRequest(TypedDict, total=False):
+    # chatId/name/options required; allowMultipleAnswers optional (default single choice).
+    chatId: Jid
+    # Poll question / title (max 255 chars).
+    name: str
+    # Options to vote on (WhatsApp allows between 2 and 12).
+    options: list[str]
+    allowMultipleAnswers: bool
 
 
 # ``from`` is a Python keyword, so use the functional TypedDict form.
@@ -385,6 +410,11 @@ class ProfilePictureResponse(TypedDict):
     url: str | None
 
 
+class ProfilePicturesResponse(TypedDict):
+    # Map of contact id → picture URL (None when the lookup failed).
+    pictures: dict[str, str | None]
+
+
 class ContactPhoneResponse(TypedDict):
     contactId: Jid
     phone: str | None
@@ -479,10 +509,14 @@ class SetProfilePictureRequest(TypedDict, total=False):
 # ── Webhook ───────────────────────────────────────────────────────
 
 
-class WebhookFilterCondition(TypedDict):
+class WebhookFilterCondition(TypedDict, total=False):
+    # field/operator/value required; caseSensitive optional (text fields only, default false).
     field: str
     operator: str
-    value: list[str]
+    # Polymorphic per field kind: a single string (text fields), a list of
+    # strings (id/idArray/enum fields), or a bool (boolean fields).
+    value: str | list[str] | bool
+    caseSensitive: bool
 
 
 class WebhookFilters(TypedDict):
@@ -565,9 +599,7 @@ class StatusContact(TypedDict, total=False):
 # One status/story from the GET status endpoints (``list``/``from_contact``), which
 # answer a ``{"statuses": [...]}`` envelope. Mirrors the backend ``Status`` — the engine
 # payload is returned as-is, with no DTO in between. ``timestamp``/``expiresAt`` are
-# ISO 8601 strings (``Date`` on the server, serialized). ``mediaUrl``/``backgroundColor``/
-# ``font`` are declared by the backend but no engine populates them on a read yet
-# (whatsapp-web.js maps none of them; Baileys cannot read statuses at all).
+# ISO 8601 strings (``Date`` on the server, serialized).
 class StatusRecord(TypedDict, total=False):
     id: str
     contact: StatusContact
@@ -591,10 +623,17 @@ class StatusResult(TypedDict, total=False):
     expiresAt: str
 
 
+class StatusMedia(TypedDict):
+    """A stored status media file: raw bytes plus the served content type."""
+
+    data: bytes
+    contentType: str | None
+
+
 class SendTextStatusRequest(TypedDict, total=False):
-    # text and recipients required; backgroundColor (hex, e.g. #25D366) and font optional.
+    # text always required; recipients required on the Baileys engine only.
     text: str
-    # Recipient JIDs the status is addressed to (required by the server; empty -> 400).
+    # Recipient JIDs. Required on the Baileys engine (absent/empty -> 400); omit on whatsapp-web.js.
     recipients: list[str]
     backgroundColor: str
     font: int
@@ -612,7 +651,7 @@ class SendImageStatusRequest(TypedDict, total=False):
     """Server expects a nested ``{ image: { url|base64 } }`` body."""
 
     image: StatusMediaInput
-    # Recipient JIDs the status is addressed to (required by the server; empty -> 400).
+    # Recipient JIDs. Required on the Baileys engine (absent/empty -> 400); omit on whatsapp-web.js.
     recipients: list[str]
     caption: str
 
@@ -621,7 +660,7 @@ class SendVideoStatusRequest(TypedDict, total=False):
     """Server expects a nested ``{ video: { url|base64 } }`` body."""
 
     video: StatusMediaInput
-    # Recipient JIDs the status is addressed to (required by the server; empty -> 400).
+    # Recipient JIDs. Required on the Baileys engine (absent/empty -> 400); omit on whatsapp-web.js.
     recipients: list[str]
     caption: str
 
