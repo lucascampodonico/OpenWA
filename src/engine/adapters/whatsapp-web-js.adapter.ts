@@ -52,16 +52,18 @@ import { EngineNotSupportedError } from '../../common/errors/engine-not-supporte
 import { resolveWebVersionPin } from '../wa-web-version';
 import { resolveAuthTimeoutMs, resolveEngineInitTimeoutMs } from '../engine-init-timeout';
 import { killOrphanedChromiumProcesses, removeStaleSingletonFiles } from './chromium-profile-hygiene';
-import { isChannelJid } from '../identity/wa-id';
+import { isChannelJid, chatKind } from '../identity/wa-id';
 import { LidMappingStore } from '../identity/lid-mapping-store.service';
 import { createLogger } from '../../common/services/logger.service';
 import { EngineNotReadyError } from '../../common/errors/engine-not-ready.error';
 import { CallNotFoundError } from '../../common/errors/call-not-found.error';
 import { ChannelMediaNotSupportedError } from '../../common/errors/channel-media-not-supported.error';
+import { MessageNotFoundError } from '../../common/errors/message-not-found.error';
 import { WwebjsGroups } from './wwebjs-groups';
 import { type WwebjsEngineHost } from './wwebjs-host';
 import { registerWwebjsMessageEvents } from './wwebjs-message-events';
 import { WwebjsMessaging, declaredOnlyMedia } from './wwebjs-messaging';
+import { mapWwebjsMessageType } from './message-mapper';
 import { WwebjsContacts } from './wwebjs-contacts';
 import { WwebjsProfile } from './wwebjs-profile';
 import { WwebjsLabels } from './wwebjs-labels';
@@ -1870,22 +1872,8 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
     return this.messaging.sendStickerMessage(chatId, media);
   }
 
-  async sendContactMessage(chatId: string, contact: ContactCard): Promise<MessageResult> {
-    this.ensureReady();
-    // Shared builder sanitizes name/number (strips CR/LF, digits-only waid) so a crafted contact
-    // can't inject extra vCard fields — the previous inline build interpolated raw values.
-    const vcard = buildVCard(contact);
-
-    const msg = await this.sendResolved(chatId, to =>
-      this.client!.sendMessage(to, vcard, {
-        parseVCards: true,
-      }),
-    );
-    return this.toMessageResult(msg);
-  }
-
-  sendStickerMessage(chatId: string, media: MediaInput): Promise<MessageResult> {
-    return this.messaging.sendStickerMessage(chatId, media);
+  sendPollMessage(chatId: string, poll: PollInput): Promise<MessageResult> {
+    return this.messaging.sendPollMessage(chatId, poll);
   }
 
   promoteParticipants(groupId: string, participants: string[]): Promise<ParticipantOperationResult[]> {
@@ -1917,57 +1905,8 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
     return this.messaging.replyToMessage(chatId, quotedMsgId, text);
   }
 
-  async forwardMessage(fromChatId: string, toChatId: string, messageId: string): Promise<MessageResult> {
-    this.ensureReady();
-    try {
-      const chat = await this.client!.getChatById(fromChatId);
-      const messages = await chat.fetchMessages({ limit: 100 });
-      const msgToForward = messages.find(m => m.id._serialized === messageId);
-
-      if (!msgToForward) {
-        throw new MessageNotFoundError(messageId);
-      }
-
-      // The forward's send leg fails with `No LID for user` for a LID-migrated destination, so resolve
-      // it (and self-heal a stale mapping) via sendResolved. Capture the id actually sent to so the
-      // id-recovery below reads back from the SAME (resolved) chat, not the raw @c.us (#583 R1).
-      let resolvedTo = toChatId;
-      await this.sendResolved(toChatId, to => {
-        resolvedTo = to;
-        return msgToForward.forward(to);
-      });
-
-      // whatsapp-web.js's forward() returns void, so BEST-EFFORT recover the REAL id of the sent copy by
-      // reading it back from the destination chat (the most recent outgoing message). The delivery-ack
-      // matcher keys on this id, so a synthetic one would leave the forward stuck at SENT; Baileys already
-      // returns the real id. The forward already succeeded here, so recovery must NEVER fail the operation.
-      // When the copy can't be identified we return an explicit-unknown id (empty): message.service then
-      // leaves the row's waMessageId unset so no ack can mis-match it — unlike a synthetic or source id,
-      // which could cross-drive another row's delivery status. Concurrent forwards to the same chat may
-      // mis-identify the copy — acceptable for delivery-status accuracy.
-      try {
-        const destChat = await this.client!.getChatById(resolvedTo);
-        const sentByMe = (await destChat?.fetchMessages({ limit: 5, fromMe: true })) ?? [];
-        let sent: (typeof sentByMe)[number] | undefined;
-        for (const m of sentByMe) {
-          if (!sent || m.timestamp > sent.timestamp) {
-            sent = m;
-          }
-        }
-        if (sent) {
-          return this.toMessageResult(sent);
-        }
-      } catch (error) {
-        // Still surface a dead page even though the send itself succeeded (detection only; the
-        // forward's best-effort recovery contract is unchanged).
-        this.reportIfPageTransportError(error, 'forwardMessage');
-        this.logger.warn(`Forward succeeded but recovering the sent message id failed: ${String(error)}`);
-      }
-      return { id: '', timestamp: Math.floor(Date.now() / 1000) };
-    } catch (error) {
-      this.reportIfPageTransportError(error, 'forwardMessage');
-      throw error;
-    }
+  forwardMessage(fromChatId: string, toChatId: string, messageId: string): Promise<MessageResult> {
+    return this.messaging.forwardMessage(fromChatId, toChatId, messageId);
   }
 
   // ============= Phase 3: Group Management =============
@@ -2007,6 +1946,10 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
 
   addLabelToChat(chatId: string, labelId: string): Promise<void> {
     return this.labels.addLabelToChat(chatId, labelId);
+  }
+
+  removeLabelFromChat(chatId: string, labelId: string): Promise<void> {
+    return this.labels.removeLabelFromChat(chatId, labelId);
   }
 
   // Channels/Newsletter (Phase 3)
