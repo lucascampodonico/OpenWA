@@ -290,7 +290,9 @@
       "phone": "Numéro de téléphone",
       "phoneNone": "Non connecté",
       "created": "Créé le",
-      "lastActive": "Dernière activité"
+      "lastActive": "Dernière activité",
+      "autoRejectCalls": "Rejeter automatiquement les appels",
+      "autoRejectCallsHint": "Les appels entrants sont refusés dès qu'ils sonnent. Le webhook call.received est tout de même émis avant. S'applique au prochain appel — aucun redémarrage nécessaire."
     },
     "actions": {
       "view": "Voir",
@@ -315,7 +317,8 @@
       "phone": "Téléphone",
       "sessionId": "ID de session",
       "lastActive": "Dernière activité",
-      "error": "Erreur"
+      "error": "Erreur",
+      "restriction": "Restriction"
     },
     "forceKill": {
       "title": "Arrêter la session bloquée",
@@ -360,6 +363,12 @@
     "start": {
       "teardownPendingTitle": "Démarrage de la session",
       "teardownPending": "Un nettoyage d'identifiants pour cette session est encore en cours. Patientez un instant et réessayez."
+    },
+    "restriction": {
+      "reachout_timelock": "Nouvelles discussions bloquées",
+      "tos_block": "Bloqué par WhatsApp",
+      "proxy_block": "Connexion bloquée",
+      "until": "jusqu'au {{date}}"
     }
   },
   "webhooks": {
@@ -760,7 +769,8 @@
     "toasts": {
       "saveFailed": "Échec de l'enregistrement"
     },
-    "envPinNote": "Défini par une variable d'environnement — c'est la valeur en cours d'exécution ; les modifications du tableau de bord ne s'appliqueront pas tant que cette variable ne sera pas supprimée.",
+    "envPinNote": "Défini par la variable d'environnement {{name}} — c'est la valeur en cours d'exécution ; les modifications du tableau de bord ne s'appliqueront pas tant que cette variable n'est pas supprimée.",
+    "pendingRestartNote": "Enregistré, mais pas encore appliqué — redémarrez le serveur pour que cette modification prenne effet.",
     "migration": {
       "title": "Attention — cela change le backend de données",
       "dbWarning": "La nouvelle base de données démarre vide. Téléchargez dès maintenant une sauvegarde de vos données actuelles (tant que vous êtes encore sur l'ancienne base de données), puis restaurez-la après le redémarrage.",
@@ -771,6 +781,8 @@
       "export": "Exporter les données",
       "import": "Importer les données",
       "exportFailed": "Impossible d'exporter les données",
+      "exportPartialTitle": "Backup is missing some media",
+      "exportPartial": "{{count}} attachment payload(s) exceeded the export media budget and were saved as placeholders. The messages restore; their media does not.",
       "importFailed": "Impossible d'importer les données",
       "importOk": "Données importées",
       "importConfirm": "L'importation REMPLACERA toutes les données actuelles par la sauvegarde ({{rows}} lignes). Cette action est irréversible. Continuer ?",

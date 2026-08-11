@@ -1119,6 +1119,44 @@ describe('WebhookService', () => {
       return mockFetch.mock.calls.length;
     }
 
+    // A condition names a field the event's payload does not carry — `sender` resolves from
+    // author/from, and message.ack dispatches { id, messageId, status, ack }. The condition cannot
+    // match, so the delivery is dropped. That is the filter working as specified; what was missing
+    // was any way to find out it had happened.
+    it('logs when a filter suppresses a subscribed webhook', async () => {
+      const logger = (service as unknown as { logger: { debug: jest.Mock } }).logger;
+      const spy = jest.spyOn(logger, 'debug');
+
+      expect(
+        await deliveries(conds({ field: 'sender', operator: 'is', value: ['111@c.us'] }), 'message.ack', {
+          messageId: 'm1',
+          status: 'read',
+        }),
+      ).toBe(0);
+
+      const suppressed = spy.mock.calls.filter(c => String(c[0]).includes('suppressed a delivery'));
+      expect(suppressed).toHaveLength(1);
+      expect(suppressed[0][1]).toMatchObject({ event: 'message.ack', subscribed: 1, suppressed: 1 });
+      // The payload's own fields are recorded, because the usual cause is a condition on a field
+      // this event does not have — that list is the answer to "why did nothing fire?".
+      expect((suppressed[0][1] as { payloadFields: string }).payloadFields).toBe('messageId,status');
+      spy.mockRestore();
+    });
+
+    it('stays quiet when nothing is suppressed', async () => {
+      const logger = (service as unknown as { logger: { debug: jest.Mock } }).logger;
+      const spy = jest.spyOn(logger, 'debug');
+
+      expect(
+        await deliveries(conds({ field: 'sender', operator: 'is', value: ['111@c.us'] }), 'message.received', {
+          from: '111@c.us',
+        }),
+      ).toBe(1);
+
+      expect(spy.mock.calls.filter(c => String(c[0]).includes('suppressed a delivery'))).toHaveLength(0);
+      spy.mockRestore();
+    });
+
     it('fires with no filters (additive: zero-config behaviour is unchanged)', async () => {
       expect(await deliveries(null, 'message.received', { from: '111@c.us' })).toBe(1);
       expect(await deliveries(conds(), 'message.received', { from: '111@c.us' })).toBe(1);
@@ -1417,6 +1455,52 @@ describe('WebhookService', () => {
         sizeBytes: 2048,
       });
       expect(JSON.stringify(jobData).length).toBeLessThan(2048);
+    });
+
+    it('keys the queue job by the delivery id, so a retried enqueue cannot double-deliver', async () => {
+      const queueService = await buildQueueService((key: string, def?: unknown) => {
+        if (key === 'queue.enabled') return true;
+        if (key === 'webhook.retryDelay') return 5000;
+        return def;
+      });
+      (repository.find as jest.Mock).mockResolvedValue([createMockWebhook({ events: ['message.received'] })]);
+      (hookManager.execute as jest.Mock).mockResolvedValue({ continue: true, data: {} });
+
+      await queueService.dispatch('sess-1', 'message.received', {});
+
+      const [, jobData, opts] = (webhookQueue.add as jest.Mock).mock.calls[0] as [
+        string,
+        WebhookJobData,
+        { jobId?: string },
+      ];
+      // BullMQ's dedupe boundary and the receiver's must key off the SAME identifier, or a job
+      // that BullMQ accepts twice still looks like one delivery to the receiver (and vice versa).
+      expect(opts.jobId).toBe(jobData.headers['X-OpenWA-Delivery-Id']);
+      expect(opts.jobId).toBe(jobData.payload.deliveryId);
+    });
+
+    it('gives sibling webhooks distinct job ids, so one event fanning out is not collapsed into one job', async () => {
+      const queueService = await buildQueueService((key: string, def?: unknown) => {
+        if (key === 'queue.enabled') return true;
+        if (key === 'webhook.retryDelay') return 5000;
+        return def;
+      });
+      (repository.find as jest.Mock).mockResolvedValue([
+        createMockWebhook({ id: 'wh-uuid-1', events: ['message.received'] }),
+        createMockWebhook({ id: 'wh-uuid-2', events: ['message.received'], url: 'https://example.com/other' }),
+      ]);
+      (hookManager.execute as jest.Mock).mockResolvedValue({ continue: true, data: {} });
+
+      await queueService.dispatch('sess-1', 'message.received', {});
+
+      // Guards the invariant that makes jobId = deliveryId safe: deliveryId is minted per webhook
+      // per dispatch. Were it ever hoisted to per-event, BullMQ would silently drop every
+      // subscription after the first — a data-loss bug with no error anywhere.
+      expect(webhookQueue.add).toHaveBeenCalledTimes(2);
+      const jobIds = (webhookQueue.add as jest.Mock).mock.calls.map(
+        (call: [string, WebhookJobData, { jobId?: string }]) => call[2].jobId,
+      );
+      expect(new Set(jobIds).size).toBe(2);
     });
 
     it('should add job to queue when queue is enabled', async () => {

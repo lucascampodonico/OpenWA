@@ -22,6 +22,17 @@ if (API_ORIGIN) warnIfInsecureHttpUrl(API_ORIGIN, 'VITE_API_URL');
 // Types
 // =============================================================================
 
+/**
+ * The three tunable keys, as the gateway resolves them — not the raw stored column, which the API
+ * never returns. `maxReconnectAttempts` is null when reconnects are unlimited, which is the default
+ * and which no number in the accepted 0-20 range can express.
+ */
+export interface SessionConfig {
+  autoRejectCalls: boolean;
+  maxReconnectAttempts: number | null;
+  reconnectBaseDelay: number;
+}
+
 export interface Session {
   id: string;
   name: string;
@@ -49,6 +60,45 @@ export interface Session {
   /** Human-readable reason carried while the status is 'failed' (terminal failure) or
    * 'action_required' (operator must intervene, e.g. acknowledge an onboarding modal). */
   lastError?: string | null;
+  /**
+   * A limit WhatsApp itself has placed on the account, or null when there is none. Distinct from
+   * `lastError`, which describes a fault on the gateway's side of the link. Optional only because a
+   * dashboard can be served by a gateway that predates the field.
+   */
+  restriction?: AccountRestriction | null;
+}
+
+/** One participant's presence within a chat. */
+export interface ParticipantPresence {
+  id: string;
+  /** `composing`/`recording` mean actively typing or recording; `paused` means they stopped. */
+  state: 'available' | 'unavailable' | 'composing' | 'recording' | 'paused';
+  /** Unix SECONDS. Absent whenever the contact's privacy settings hide last-seen. */
+  lastSeen?: number;
+}
+
+/** The last presence reported for a chat since it was subscribed. */
+export interface ChatPresence {
+  chatId: string;
+  participants: ParticipantPresence[];
+  groupOnlineCount?: number;
+  /** When the gateway received the report — NOT a WhatsApp timestamp. */
+  observedAt: string;
+}
+
+/**
+ * A restriction WhatsApp has in force on a session's account.
+ *
+ * `reachout_timelock` leaves the session connected and existing chats working — only starting new
+ * conversations is blocked — which is why it can appear on a perfectly `ready` session. `tos_block`
+ * and `proxy_block` refuse the connection itself and so cannot.
+ */
+export interface AccountRestriction {
+  kind: 'reachout_timelock' | 'tos_block' | 'proxy_block';
+  /** The engine's own token for the cause, verbatim (`TOS_BLOCK`, `BIZ_QUALITY`, …). */
+  code: string;
+  /** ISO timestamp when enforcement ends, when WhatsApp states one. */
+  expiresAt?: string | null;
 }
 
 export interface SessionStats {
@@ -252,7 +302,7 @@ export interface ChannelMessage {
 export interface StatusUpdate {
   id: string;
   contact: { id: string; name?: string; pushName?: string };
-  type: 'text' | 'image' | 'video';
+  type: 'text' | 'image' | 'video' | 'voice';
   caption?: string;
   mediaUrl?: string;
   backgroundColor?: string;
@@ -412,6 +462,15 @@ export interface InfraStatus {
     webVersion?: string | null;
     webVersionSource?: 'pinned' | 'auto' | 'native';
   };
+  /**
+   * Editable settings supplied by a layer above `data/.env.generated` (the container environment or a
+   * project `.env`), which therefore cannot be changed from this page until that layer is. Reported by
+   * the gateway rather than inferred from a running-vs-saved mismatch, because that mismatch is also
+   * what an unrestarted save looks like and the two need opposite advice (#1082).
+   *
+   * Optional only because a dashboard can be served by a gateway that predates the field.
+   */
+  envPinned?: string[];
 }
 
 // Saved infrastructure config (from data/.env.generated) used to hydrate the form.
@@ -661,6 +720,13 @@ export const sessionApi = {
       body: JSON.stringify({ name }),
     }),
   delete: (id: string) => request<void>(`/sessions/${id}`, { method: 'DELETE' }),
+  getConfig: (id: string) => request<SessionConfig>(`/sessions/${id}/config`),
+  // PATCH merges: only the keys sent are touched. Send null to clear one back to its default.
+  updateConfig: (id: string, patch: Partial<Record<keyof SessionConfig, boolean | number | null>>) =>
+    request<SessionConfig>(`/sessions/${id}/config`, {
+      method: 'PATCH',
+      body: JSON.stringify(patch),
+    }),
   start: (id: string) => request<Session>(`/sessions/${id}/start`, { method: 'POST' }),
   stop: (id: string) => request<Session>(`/sessions/${id}/stop`, { method: 'POST' }),
   logout: (id: string) => request<Session>(`/sessions/${id}/logout`, { method: 'POST' }),
@@ -1010,7 +1076,11 @@ export const infraApi = {
       method: 'POST',
       body: JSON.stringify({ profiles: profiles || [], profilesToRemove: profilesToRemove || [] }),
     }),
-  healthCheck: () => request<{ status: string; timestamp: string }>('/infra/health'),
+  // Readiness, not the plain /infra/health ping. The restart poll must not be able to latch onto the
+  // process it just asked to shut down: /infra/health answers 200 for the whole drain and teardown,
+  // while /health/ready reports 503 as soon as draining starts and stays 503 until both databases
+  // answer. Public (no API key), like /infra/health.
+  healthCheck: () => request<{ status: 'ok' | 'error'; details: Record<string, { status: string }> }>('/health/ready'),
   // Data migration: export all Data-DB tables (call while still on the OLD database, before switching),
   // then import after the switch + restart. Used by the DB-switch migration guard so data isn't lost.
   exportData: () =>
@@ -1019,12 +1089,22 @@ export const infraApi = {
       dataDbType: string;
       tables: Record<string, unknown[]>;
       counts: Record<string, number>;
+      // Optional tables absent from an older schema. Always present in the response; a non-empty
+      // list means the backup is partial, not that those tables were empty.
+      skippedTables: string[];
+      // Inline media payloads the export budget refused. Always present; non-zero means the rows are
+      // all there but some of their media is not — a state a restored archive cannot express, since
+      // the omitted marker is the same one media skipped on the way in gets.
+      omittedInlineMedia: { messages: number; messageBatches: number };
     }>('/infra/export-data'),
   // 200 contract includes the orphan-engine reconciliation result (restartRequired / notices /
-  // stopped+failed ids). A 409 (live engines exist for sessions the backup would remove; the error
-  // message lists them) is retried by the caller with stopOrphans=true, which stops those engines
-  // inside the request. force is deliberately NOT exposed: it leaves the engines writing into the
-  // restored tables until a restart — the window stopOrphans exists to close.
+  // stopped+failed ids). 409 has several causes and the error's `code` distinguishes them:
+  // IMPORT_WOULD_ORPHAN_ENGINES (live engines exist for sessions the backup would remove; the
+  // message lists them) is the only one the caller retries with stopOrphans=true to stop those
+  // engines inside the request. IMPORT_ALREADY_RUNNING (another restore is in flight) and
+  // IMPORT_NESTED_TRANSACTION (another transaction holds the connection) leave nothing to retry.
+  // force is deliberately NOT exposed: it leaves the engines writing into the restored tables until
+  // a restart — the window stopOrphans exists to close.
   importData: (tables: Record<string, unknown[]>, options?: { stopOrphans?: boolean }) =>
     request<{
       imported: boolean;

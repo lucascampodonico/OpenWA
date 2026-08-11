@@ -37,7 +37,13 @@ interface MessageReactionEvent {
   chatId: string;
   reaction: string;
   senderId: string;
-  reactions: Record<string, string>;
+  /**
+   * The post-apply snapshot of every reaction on the message. ABSENT when the gateway holds no
+   * stored copy of the message to compute it from, which it says by omitting the key rather than
+   * sending an empty object — absent means "unknown", `{}` means "there are none left". Keep it
+   * optional: normalising the absence away here is what makes a consumer's own fallback dead code.
+   */
+  reactions?: Record<string, string>;
   timestamp: string;
 }
 
@@ -71,6 +77,12 @@ interface StatusReceivedEvent {
   timestamp: string;
 }
 
+/** A restriction imposed or lifted — the dashboard uses it purely as a refetch signal for the badge. */
+interface SessionRestrictionEvent {
+  sessionId: string;
+  timestamp: string;
+}
+
 /** Ack frame answering a client `subscribe` request (`{type: 'subscribed'}`). */
 interface SubscribedEvent {
   sessionId: string;
@@ -92,6 +104,7 @@ interface WebSocketEvents {
   onMessageRevoked?: (event: MessageRevokedEvent) => void;
   onMessageEdited?: (event: MessageEditedEvent) => void;
   onStatusReceived?: (event: StatusReceivedEvent) => void;
+  onSessionRestriction?: (event: SessionRestrictionEvent) => void;
   onSubscribed?: (event: SubscribedEvent) => void;
   onServerError?: (event: ServerErrorEvent) => void;
 }
@@ -272,6 +285,9 @@ export function useWebSocket(events: WebSocketEvents = {}) {
         case 'status.received':
           events.onStatusReceived?.({ sessionId, timestamp: msg.timestamp });
           break;
+        case 'session.restriction':
+          events.onSessionRestriction?.({ sessionId, timestamp: msg.timestamp });
+          break;
         case 'message.ack':
           events.onMessageAck?.({
             sessionId,
@@ -289,7 +305,9 @@ export function useWebSocket(events: WebSocketEvents = {}) {
             chatId: String(data.chatId),
             reaction: String(data.reaction),
             senderId: String(data.senderId),
-            reactions: (data.reactions as Record<string, string>) || {},
+            // Carried through as-is, including absent: `|| {}` here would tell every consumer that
+            // the message has no reactions left, which is a different claim from "we do not know".
+            reactions: data.reactions as Record<string, string> | undefined,
             timestamp: msg.timestamp,
           });
           break;

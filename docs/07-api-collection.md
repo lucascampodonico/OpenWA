@@ -69,7 +69,7 @@ curl -X GET "$BASE/api/sessions/8f3c2b1a-9d4e-4c7a-8b2f-1e6d5a4c3b2a/qr" \
   -H "X-API-Key: $API_KEY"
 ```
 
-#### GET /api/sessions/:id/groups
+#### GET /api/sessions/:sessionId/groups
 
 List groups the session belongs to (paginated).
 
@@ -193,6 +193,45 @@ curl -X POST "$BASE/api/sessions/8f3c2b1a-9d4e-4c7a-8b2f-1e6d5a4c3b2a/chats/unre
   -d '{ "chatId": "1234567890@c.us" }'
 ```
 
+#### DELETE /api/sessions/:id/chats/:chatId/messages
+
+Delete every message in a chat, keeping the chat.
+
+```bash
+curl -X DELETE "$BASE/api/sessions/8f3c2b1a-9d4e-4c7a-8b2f-1e6d5a4c3b2a/chats/1234567890-123@g.us/messages" \
+  -H "X-API-Key: $API_KEY"
+```
+
+#### POST /api/sessions/:id/chats/archive
+
+Archive or unarchive a chat.
+
+```bash
+curl -X POST "$BASE/api/sessions/8f3c2b1a-9d4e-4c7a-8b2f-1e6d5a4c3b2a/chats/archive" \
+  -H "X-API-Key: $API_KEY" -H "Content-Type: application/json" \
+  -d '{"chatId":"1234567890-123@g.us","archive":true}'
+```
+
+#### POST /api/sessions/:id/chats/mute
+
+Mute a chat until an epoch-**milliseconds** timestamp, or send `"muteUntil":null` to unmute (OPERATOR).
+
+```bash
+curl -X POST "$BASE/api/sessions/8f3c2b1a-9d4e-4c7a-8b2f-1e6d5a4c3b2a/chats/mute" \
+  -H "X-API-Key: $API_KEY" -H "Content-Type: application/json" \
+  -d '{"chatId":"1234567890-123@g.us","muteUntil":1800000000000}'
+```
+
+#### POST /api/sessions/:id/chats/pin
+
+Pin a chat to the top of the list, or unpin it (OPERATOR). WhatsApp allows at most three pinned chats.
+
+```bash
+curl -X POST "$BASE/api/sessions/8f3c2b1a-9d4e-4c7a-8b2f-1e6d5a4c3b2a/chats/pin" \
+  -H "X-API-Key: $API_KEY" -H "Content-Type: application/json" \
+  -d '{"chatId":"1234567890-123@g.us","pin":true}'
+```
+
 #### POST /api/sessions/:id/chats/delete
 
 Delete a chat from the chat list (OPERATOR).
@@ -253,6 +292,55 @@ Get reactions for a message, grouped by emoji.
 ```bash
 curl "$BASE/api/sessions/$SESSION_ID/messages/628123456789@c.us/true_628123456789@c.us_3EB0ABCD/reactions" \
   -H "X-API-Key: $API_KEY"
+```
+
+#### POST /api/sessions/:sessionId/messages/vote-poll
+
+Vote on a poll (whatsapp-web.js only).
+
+```bash
+curl -X POST "$BASE/api/sessions/$SESSION_ID/messages/vote-poll" \
+  -H "X-API-Key: $API_KEY" -H "Content-Type: application/json" \
+  -d '{"chatId":"628123456789@c.us","pollMessageId":"true_628123456789@c.us_3EB0ABCD","options":["Pizza"]}'
+```
+
+#### POST /api/sessions/:sessionId/messages/pin
+
+Pin a message for 24h (default), 7d or 30d.
+
+```bash
+curl -X POST "$BASE/api/sessions/$SESSION_ID/messages/pin" \
+  -H "X-API-Key: $API_KEY" -H "Content-Type: application/json" \
+  -d '{"chatId":"628123456789@c.us","messageId":"true_628123456789@c.us_3EB0ABCD","durationSeconds":604800}'
+```
+
+#### POST /api/sessions/:sessionId/messages/star
+
+Star or unstar a message.
+
+```bash
+curl -X POST "$BASE/api/sessions/$SESSION_ID/messages/star" \
+  -H "X-API-Key: $API_KEY" -H "Content-Type: application/json" \
+  -d '{"chatId":"628123456789@c.us","messageId":"true_628123456789@c.us_3EB0ABCD","star":true}'
+```
+
+#### POST /api/sessions/:sessionId/messages/unpin
+
+```bash
+curl -X POST "$BASE/api/sessions/$SESSION_ID/messages/unpin" \
+  -H "X-API-Key: $API_KEY" -H "Content-Type: application/json" \
+  -d '{"chatId":"628123456789@c.us","messageId":"true_628123456789@c.us_3EB0ABCD"}'
+```
+
+#### GET /api/sessions/:sessionId/messages/:chatId/:messageId/media
+
+Download a message's stored media: the archived file when one exists (`CHAT_MEDIA_ARCHIVE_ENABLED`,
+plus `CHAT_MEDIA_ARCHIVE_OUTBOUND` for media this account sent), else the inline copy on the message
+row — which covers media sent by this account either way; `404` when neither holds bytes.
+
+```bash
+curl "$BASE/api/sessions/$SESSION_ID/messages/628123456789@c.us/true_628123456789@c.us_3EB0ABCD/media" \
+  -H "X-API-Key: $API_KEY" -o media.bin
 ```
 
 #### GET /api/sessions/:sessionId/messages/batch/:batchId
@@ -491,6 +579,25 @@ curl -X GET "$BASE/api/sessions/$SESSION_ID/contacts/12345678901234@lid/phone" \
   -H "X-API-Key: $API_KEY"
 ```
 
+#### PUT /api/sessions/:sessionId/contacts/:contactId
+
+Save or edit an addressbook contact.
+
+```bash
+curl -X PUT "$BASE/api/sessions/$SESSION_ID/contacts/628123456789@c.us" \
+  -H "X-API-Key: $API_KEY" -H "Content-Type: application/json" \
+  -d '{"firstName":"Ada","lastName":"Lovelace"}'
+```
+
+#### DELETE /api/sessions/:sessionId/contacts/:contactId
+
+Remove an addressbook contact.
+
+```bash
+curl -X DELETE "$BASE/api/sessions/$SESSION_ID/contacts/628123456789@c.us" \
+  -H "X-API-Key: $API_KEY"
+```
+
 #### POST /api/sessions/:sessionId/contacts/:contactId/block
 
 Block a contact (requires an OPERATOR key). Send an empty body.
@@ -698,11 +805,11 @@ curl -X DELETE "$BASE/api/sessions/$SESSION_ID/templates/$TEMPLATE_ID" \
 
 ### 07.8 Catalog & Channels
 
-The five catalog routes are registered but **no engine implements them**: both whatsapp-web.js and Baileys raise `EngineNotSupportedError`, so each of them returns `501 Not Implemented` once the session is READY. On whatsapp-web.js the readiness check runs first, so a session that exists but is not yet READY returns `409` instead; Baileys raises the unsupported error unconditionally. They are listed for route completeness only. The channel routes that follow are a separate group with real engine support — the per-engine gaps are listed in `docs/29-engine-capability-matrix.md`.
+The catalog routes work on the **Baileys** engine (WhatsApp Business accounts) — `getCatalog`/`getProducts`/`getProduct` read the session's own catalog and `sendProduct` sends a native product card. On **whatsapp-web.js** they raise `EngineNotSupportedError` (`501 Not Implemented`) — the library has no catalog API at all; on that engine the readiness check runs first, so a session that exists but is not yet READY returns `409` instead. The exception is `send-catalog`, which returns `501` on **both** engines (no catalog-share message type exists in either library). The per-engine gaps are listed in `docs/29-engine-capability-matrix.md`. The channel routes that follow are a separate group with real engine support.
 
 #### GET /api/sessions/:sessionId/catalog
 
-Get business catalog info for the session. Returns `501` on both engines.
+Get business catalog info for the session. On Baileys returns the first catalog collection's metadata (`200`, or `null` when the business has no collections); on whatsapp-web.js returns `501`.
 
 ```bash
 curl -X GET "$BASE/api/sessions/$SESSION_ID/catalog" \
@@ -711,7 +818,7 @@ curl -X GET "$BASE/api/sessions/$SESSION_ID/catalog" \
 
 #### GET /api/sessions/:sessionId/catalog/products
 
-List catalog products with pagination. Returns `501` on both engines.
+List catalog products with pagination. Works on Baileys (page/limit over the full catalog walk); returns `501` on whatsapp-web.js.
 
 ```bash
 curl -X GET "$BASE/api/sessions/$SESSION_ID/catalog/products?page=1&limit=20" \
@@ -720,7 +827,7 @@ curl -X GET "$BASE/api/sessions/$SESSION_ID/catalog/products?page=1&limit=20" \
 
 #### GET /api/sessions/:sessionId/catalog/products/:productId
 
-Get a specific catalog product by id. Returns `501` on both engines, whatever the id.
+Get a specific catalog product by id. On Baileys returns the product (`200`) or `null` for an unknown id; on whatsapp-web.js returns `501`.
 
 ```bash
 curl -X GET "$BASE/api/sessions/$SESSION_ID/catalog/products/PROD_12345" \
@@ -729,7 +836,7 @@ curl -X GET "$BASE/api/sessions/$SESSION_ID/catalog/products/PROD_12345" \
 
 #### POST /api/sessions/:sessionId/messages/send-product
 
-Send a product card to a chat (OPERATOR key required). Returns `501` on both engines.
+Send a product card to a chat (OPERATOR key required). On Baileys returns `404` for an unknown product id and `400` when the product has no image; on whatsapp-web.js returns `501`.
 
 ```bash
 curl -X POST "$BASE/api/sessions/$SESSION_ID/messages/send-product" \
@@ -1209,7 +1316,7 @@ curl "$BASE/api/infra/export-data" \
 
 #### POST /api/infra/import-data
 
-Replace all Data DB rows with a prior export (destructive, all-or-nothing).
+Replace all Data DB rows with a prior export (destructive, all-or-nothing). Every one of the 14 migration tables is emptied first, so a key you omit restores **empty** rather than untouched — send a body produced by `GET /api/infra/export-data`, not a hand-built subset. All 14 keys are shown below for that reason.
 
 ```bash
 curl -X POST "$BASE/api/infra/import-data" \
@@ -1217,8 +1324,10 @@ curl -X POST "$BASE/api/infra/import-data" \
   -H "Content-Type: application/json" \
   -d '{
     "tables": {
-      "sessions": [ { "id": "s1", "name": "main", "status": "READY", "phone": "15551234567", "pushName": "Me", "config": {}, "proxyUrl": null, "proxyType": null, "connectedAt": "2026-06-25T00:00:00.000Z", "lastActiveAt": "2026-06-25T00:00:00.000Z", "createdAt": "2026-06-25T00:00:00.000Z", "updatedAt": "2026-06-25T00:00:00.000Z" } ],
-      "webhooks": [], "messages": [], "messageBatches": [], "templates": [], "baileysStoredMessages": []
+      "sessions": [ { "id": "s1", "name": "main", "status": "ready", "phone": "15551234567", "pushName": "Me", "config": {}, "proxyUrl": null, "proxyType": null, "connectedAt": "2026-06-25T00:00:00.000Z", "lastActiveAt": "2026-06-25T00:00:00.000Z", "createdAt": "2026-06-25T00:00:00.000Z", "updatedAt": "2026-06-25T00:00:00.000Z" } ],
+      "webhooks": [], "messages": [], "messageBatches": [], "templates": [], "baileysStoredMessages": [],
+      "lidMappings": [], "pluginInstances": [], "conversationMappings": [], "ingressEvents": [],
+      "webhookDeliveryFailures": [], "integrationDeliveryFailures": [], "statusUpdates": [], "automationRules": []
     }
   }'
 ```
@@ -1444,7 +1553,7 @@ socket.on('connect', () => {
   });
 });
 
-socket.on('message', (msg) => {
+socket.on('message', msg => {
   if (msg.type === 'event') {
     console.log(`[${msg.payload.event}] ${msg.payload.sessionId}`, msg.payload.data);
   } else {
@@ -1452,6 +1561,6 @@ socket.on('message', (msg) => {
   }
 });
 
-socket.on('connect_error', (err) => console.error('connect_error:', err.message));
-socket.on('disconnect', (reason) => console.log('disconnected:', reason));
+socket.on('connect_error', err => console.error('connect_error:', err.message));
+socket.on('disconnect', reason => console.log('disconnected:', reason));
 ```

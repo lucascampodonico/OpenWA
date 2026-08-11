@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, TypedDict
 
 from .._http import quote_segment
 from ..types import (
+    UpsertContactRequest,
     CheckNumberResponse,
     ContactPhoneResponse,
     ContactRecord,
@@ -57,5 +58,25 @@ class ContactsResource:
     def block(self, session_id: str, contact_id: str) -> SuccessResult:
         return self._http.request("POST", f"/api/sessions/{quote_segment(session_id)}/contacts/{quote_segment(contact_id)}/block")
 
+    def upsert(self, session_id: str, contact_id: str, body: UpsertContactRequest) -> SuccessResult:
+        """Save a contact to the addressbook, or edit an existing entry (OPERATOR)."""
+        return self._http.request(
+            "PUT", f"/api/sessions/{quote_segment(session_id)}/contacts/{quote_segment(contact_id)}", body=body
+        )
+
+    def delete(self, session_id: str, contact_id: str) -> SuccessResult:
+        """Remove a contact from the addressbook (OPERATOR)."""
+        return self._http.request(
+            "DELETE", f"/api/sessions/{quote_segment(session_id)}/contacts/{quote_segment(contact_id)}"
+        )
+
     def unblock(self, session_id: str, contact_id: str) -> SuccessResult:
         return self._http.request("DELETE", f"/api/sessions/{quote_segment(session_id)}/contacts/{quote_segment(contact_id)}/block")
+
+    def list_blocked(self, session_id: str) -> list[str]:
+        """List the JIDs this account has blocked.
+
+        Session-wide, so it takes no contact id — unlike ``block`` and ``unblock``, which act on one
+        contact. Returns a bare list of ids, not contact records.
+        """
+        return self._http.request("GET", f"/api/sessions/{quote_segment(session_id)}/contacts/blocked")

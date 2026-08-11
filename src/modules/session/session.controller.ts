@@ -1,12 +1,33 @@
-import { Controller, Get, Post, Delete, Param, Query, Body, HttpCode, HttpStatus, ParseUUIDPipe } from '@nestjs/common';
+import {
+  Controller,
+  Get,
+  Post,
+  Patch,
+  Put,
+  Delete,
+  Param,
+  Query,
+  Body,
+  HttpCode,
+  HttpStatus,
+  ParseUUIDPipe,
+} from '@nestjs/common';
 import { ApiTags, ApiOperation, ApiResponse, ApiParam, ApiQuery } from '@nestjs/swagger';
 import { SyncSessionDto } from './dto/sync-session.dto';
 import { SessionService } from './session.service';
 import {
   CreateSessionDto,
+  SessionConfigResponseDto,
+  UpdateSessionConfigDto,
   SessionResponseDto,
   QRCodeResponseDto,
   MarkChatReadDto,
+  SubscribePresenceDto,
+  SetOwnPresenceDto,
+  ChatPresenceResponseDto,
+  ArchiveChatDto,
+  MuteChatDto,
+  PinChatDto,
   DeleteChatDto,
   SendChatStateDto,
   RequestPairingCodeDto,
@@ -19,6 +40,7 @@ import { AuditService } from '../audit/audit.service';
 import { AuditAction } from '../audit/entities/audit-log.entity';
 import { RequireRole, CurrentApiKey, SessionScoped, RequireUnscopedKey } from '../auth/decorators/auth.decorators';
 import { ApiKey, ApiKeyRole } from '../auth/entities/api-key.entity';
+import { ENGINE_NOT_READY_409 } from '../../common/openapi/engine-status-responses';
 
 @ApiTags('sessions')
 @Controller('sessions')
@@ -96,6 +118,51 @@ export class SessionController {
     return this.transformSession(session);
   }
 
+  @Get(':id/config')
+  @ApiOperation({ summary: 'Get the tunable configuration for a session' })
+  @ApiParam({ name: 'id', description: 'Session ID' })
+  @ApiResponse({
+    status: 200,
+    description: 'Effective session configuration',
+    type: SessionConfigResponseDto,
+  })
+  @ApiResponse({ status: 404, description: 'Session not found' })
+  async getConfig(@Param('id', ParseUUIDPipe) id: string): Promise<SessionConfigResponseDto> {
+    return this.sessionService.getConfig(id);
+  }
+
+  @Patch(':id/config')
+  @RequireRole(ApiKeyRole.OPERATOR)
+  @ApiOperation({
+    summary: 'Update the tunable configuration for a session',
+    description:
+      'Merges the supplied keys into the session config; omitted keys are left unchanged and an ' +
+      'explicit null clears a key back to its default. No restart is required or performed. ' +
+      '`autoRejectCalls` is re-read on every incoming call, so it applies immediately; the two ' +
+      'reconnect settings are read once per start and therefore apply on the next start.',
+  })
+  @ApiParam({ name: 'id', description: 'Session ID' })
+  @ApiResponse({
+    status: 200,
+    description: 'Updated session configuration',
+    type: SessionConfigResponseDto,
+  })
+  @ApiResponse({ status: 400, description: 'A supplied value is outside its accepted range' })
+  @ApiResponse({ status: 404, description: 'Session not found' })
+  async updateConfig(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Body() dto: UpdateSessionConfigDto,
+  ): Promise<SessionConfigResponseDto> {
+    const config = await this.sessionService.updateConfig(id, dto);
+    await this.auditService.logInfo(AuditAction.SESSION_CONFIG_UPDATED, {
+      sessionId: id,
+      // The resulting state, not the request: a merge patch is meaningless in an audit trail without
+      // knowing what it merged into. Only the three recognised keys, never the raw column.
+      metadata: { ...config },
+    });
+    return config;
+  }
+
   @Delete(':id')
   @RequireRole(ApiKeyRole.OPERATOR)
   @HttpCode(HttpStatus.NO_CONTENT)
@@ -106,9 +173,10 @@ export class SessionController {
   @ApiResponse({
     status: 409,
     description:
-      'A credential teardown for the same session name is still in flight. Retryable — the body ' +
-      "carries `code: 'SESSION_NAME_TEARDOWN_PENDING'`; wait for it to settle and retry. No " +
-      'destructive side effect runs before this refusal.',
+      'A credential teardown for the same session name is still in flight (retryable — the body ' +
+      "carries `code: 'SESSION_NAME_TEARDOWN_PENDING'`; wait for it to settle and retry), OR " +
+      "another node currently holds this session's live engine and deleting it here would strip a " +
+      'session the owner is running. No destructive side effect runs before either refusal.',
   })
   async delete(@Param('id', ParseUUIDPipe) id: string): Promise<void> {
     const session = await this.sessionService.findOne(id);
@@ -139,7 +207,9 @@ export class SessionController {
       'A credential teardown for the same session name is still in flight (e.g. a prior logout ' +
       'that owns destructive cleanup). Retryable — the body carries `code: ' +
       'SESSION_NAME_TEARDOWN_PENDING`; wait for it to settle and retry. No destructive side ' +
-      'effect runs before this refusal.',
+      'effect runs before this refusal. Also returned when another node currently holds this ' +
+      "session's engine: only the owner may start it, and the claim is refused before any engine " +
+      'is launched, so no second connection to the account is opened.',
   })
   async start(@Param('id', ParseUUIDPipe) id: string): Promise<SessionResponseDto> {
     const session = await this.sessionService.start(id);
@@ -161,6 +231,13 @@ export class SessionController {
     type: SessionResponseDto,
   })
   @ApiResponse({ status: 404, description: 'Session not found' })
+  @ApiResponse({
+    status: 409,
+    description:
+      "Another node currently holds this session's live engine (multi-node deployments): stopping " +
+      'it here would report the session down while the owner keeps running it, so the request is ' +
+      'refused. Retry against the owning node, or once its lease has lapsed.',
+  })
   async stop(@Param('id', ParseUUIDPipe) id: string): Promise<SessionResponseDto> {
     const session = await this.sessionService.stop(id);
     await this.auditService.logInfo(AuditAction.SESSION_STOPPED, {
@@ -199,12 +276,17 @@ export class SessionController {
           name: 'my-bot',
           status: 'disconnected',
           phone: null,
-          pushName: null,
-          connectedAt: null,
+          // logout clears `phone` only, so a session that had connected keeps the name and the
+          // connection timestamp it was last linked with.
+          pushName: 'John Doe',
+          connectedAt: '2026-06-24T08:15:00.000Z',
           lastActive: '2026-06-25T09:01:55.000Z',
           createdAt: '2026-06-20T11:30:00.000Z',
           updatedAt: '2026-06-25T09:11:00.000Z',
           lastError: null,
+          restriction: null,
+          // The engine is torn out of the map before the status write, so a logout always reports false.
+          engineLoaded: false,
         },
       },
     },
@@ -266,6 +348,7 @@ export class SessionController {
     description: 'QR code not ready or session already authenticated',
   })
   @ApiResponse({ status: 404, description: 'Session not found' })
+  @ApiResponse({ status: 409, description: ENGINE_NOT_READY_409 })
   async getQRCode(@Param('id', ParseUUIDPipe) id: string): Promise<QRCodeResponseDto> {
     const qrCode = await this.sessionService.getQRCode(id);
     await this.auditService.logInfo(AuditAction.SESSION_QR_GENERATED, {
@@ -281,6 +364,7 @@ export class SessionController {
   @ApiResponse({ status: 201, description: 'Pairing code generated', type: PairingCodeResponseDto })
   @ApiResponse({ status: 400, description: 'Session not started or already authenticated' })
   @ApiResponse({ status: 404, description: 'Session not found' })
+  @ApiResponse({ status: 409, description: ENGINE_NOT_READY_409 })
   async requestPairingCode(
     @Param('id', ParseUUIDPipe) id: string,
     @Body() dto: RequestPairingCodeDto,
@@ -288,19 +372,29 @@ export class SessionController {
     return this.sessionService.requestPairingCode(id, dto.phoneNumber);
   }
 
-  @Get(':id/groups')
+  // `:sessionId`, not `:id`, so this shares a Path Item with GroupController's POST on the same
+  // route. Two names for one positional segment split it into two contract entries.
+  @Get(':sessionId/groups')
   @ApiOperation({ summary: 'Get all groups for a session' })
-  @ApiParam({ name: 'id', description: 'Session ID' })
+  @ApiParam({ name: 'sessionId', description: 'Session ID' })
   @ApiResponse({
     status: 200,
     description: 'List of groups the session is a member of',
   })
   @ApiResponse({ status: 400, description: 'Session not ready' })
   @ApiResponse({ status: 404, description: 'Session not found' })
+  @ApiResponse({
+    status: 503,
+    description:
+      'WhatsApp did not answer the group-list query. Deliberately not reported as an empty list — ' +
+      'the engine returns the same empty value for "you are in no groups", and a caller cannot tell ' +
+      'those apart from the body.',
+  })
+  @ApiResponse({ status: 409, description: ENGINE_NOT_READY_409 })
   @ApiQuery({ name: 'limit', required: false, description: 'Max groups to return (1–1000, default 1000)' })
   @ApiQuery({ name: 'offset', required: false, description: 'Number of groups to skip (for paging)' })
   async getGroups(
-    @Param('id', ParseUUIDPipe) id: string,
+    @Param('sessionId', ParseUUIDPipe) id: string,
     @Query('limit') limit?: string,
     @Query('offset') offset?: string,
   ): Promise<{ id: string; name: string; linkedParentJID?: string | null }[]> {
@@ -347,6 +441,13 @@ export class SessionController {
   @ApiResponse({ status: 200, description: 'List of active chats (most recent first)', type: [ChatSummaryDto] })
   @ApiResponse({ status: 400, description: 'Session not ready' })
   @ApiResponse({ status: 404, description: 'Session not found' })
+  @ApiResponse({ status: 409, description: ENGINE_NOT_READY_409 })
+  @ApiResponse({
+    status: 503,
+    description:
+      'The whatsapp-web.js page connection died mid-read, so nothing could be read. Deliberately not ' +
+      'reported as an empty list — a page that went away says nothing about the chats.',
+  })
   @ApiQuery({ name: 'limit', required: false, description: 'Max chats to return (1–1000, default 1000)' })
   @ApiQuery({ name: 'offset', required: false, description: 'Number of chats to skip (for paging)' })
   async getChats(
@@ -368,12 +469,97 @@ export class SessionController {
   @ApiResponse({ status: 200, description: 'Chat marked as read successfully' })
   @ApiResponse({ status: 400, description: 'Session not ready' })
   @ApiResponse({ status: 404, description: 'Session not found' })
+  @ApiResponse({
+    status: 503,
+    description:
+      'WhatsApp did not answer within the request budget. The change may or may not have been applied — ' +
+      'the gateway stopped waiting for a confirmation that never came.',
+  })
+  @ApiResponse({ status: 409, description: ENGINE_NOT_READY_409 })
   async markChatRead(
     @Param('id', ParseUUIDPipe) id: string,
     @Body() dto: MarkChatReadDto,
   ): Promise<{ success: boolean }> {
     const success = await this.sessionService.sendSeen(id, dto.chatId);
     return { success };
+  }
+
+  @Post(':id/presence/subscribe')
+  @RequireRole(ApiKeyRole.OPERATOR)
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({
+    summary: "Subscribe to a chat's presence",
+    description:
+      'Asks WhatsApp to start reporting who is online or typing in this chat. Updates arrive as the ' +
+      '`presence.update` webhook and socket event — there is no synchronous answer, because presence ' +
+      'cannot be queried from either engine, only received.\n\n' +
+      'The subscription belongs to the connection: it does **not** survive a restart or an automatic ' +
+      'reconnect, and must be re-issued. Subscribe per chat rather than to everything — WhatsApp emits ' +
+      'an update on every transition, so a broad subscription is a firehose.\n\n' +
+      'whatsapp-web.js cannot do this at all (it exposes no presence subscribe and emits no presence ' +
+      'event) and answers `501`.',
+  })
+  @ApiParam({ name: 'id', description: 'Session ID' })
+  @ApiResponse({ status: 200, description: 'Subscribed; updates now arrive as presence.update events' })
+  @ApiResponse({ status: 400, description: 'Session not started' })
+  @ApiResponse({ status: 404, description: 'Session not found' })
+  @ApiResponse({ status: 501, description: 'The active engine cannot observe presence (whatsapp-web.js)' })
+  @ApiResponse({ status: 409, description: ENGINE_NOT_READY_409 })
+  async subscribeToPresence(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Body() dto: SubscribePresenceDto,
+  ): Promise<{ success: boolean }> {
+    await this.sessionService.subscribeToPresence(id, dto.chatId);
+    return { success: true };
+  }
+
+  @Put(':id/presence')
+  @RequireRole(ApiKeyRole.OPERATOR)
+  @ApiOperation({
+    summary: "Set the account's own global presence (appear online or offline)",
+    description:
+      'Publishes whether this account appears online. WhatsApp routes notifications away from the ' +
+      'phone while a linked device announces itself online, so a headless bot that never goes ' +
+      "offline suppresses the phone's own alerts — set `available: false` to hand them back.\n\n" +
+      'The setting belongs to the connection: it does not survive a restart or reconnect and must ' +
+      'be re-issued after `session.status` reports one (on Baileys the socket re-announces itself ' +
+      'per its connect-time behaviour). Supported on both engines.',
+  })
+  @ApiParam({ name: 'id', description: 'Session ID' })
+  @ApiResponse({ status: 200, description: 'Presence published' })
+  @ApiResponse({ status: 400, description: 'Session not started, or validation failed' })
+  @ApiResponse({ status: 404, description: 'Session not found' })
+  @ApiResponse({ status: 409, description: ENGINE_NOT_READY_409 })
+  async setOnlinePresence(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Body() dto: SetOwnPresenceDto,
+  ): Promise<{ success: boolean }> {
+    await this.sessionService.setOnlinePresence(id, dto.available);
+    return { success: true };
+  }
+
+  @Get(':id/presence/:chatId')
+  @RequireRole(ApiKeyRole.VIEWER)
+  @ApiOperation({
+    summary: "Read a chat's last reported presence",
+    description:
+      'Serves the most recent report received since the chat was subscribed. Returns `null` when ' +
+      'nothing has been reported — either the chat was never subscribed, or nothing has changed ' +
+      'since. That is a normal state, not a missing resource, so it is `200` with a null body rather ' +
+      'than a `404`.\n\n' +
+      'Held in memory and never persisted: presence is short-lived, and answering "typing" from ' +
+      'before a restart would be worse than answering nothing.',
+  })
+  @ApiParam({ name: 'id', description: 'Session ID' })
+  @ApiParam({ name: 'chatId', description: 'Chat ID as subscribed' })
+  @ApiResponse({ status: 200, description: 'Last reported presence, or null', type: ChatPresenceResponseDto })
+  @ApiResponse({ status: 404, description: 'Session not found' })
+  async getPresence(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Param('chatId') chatId: string,
+  ): Promise<ChatPresenceResponseDto | null> {
+    const presence = await this.sessionService.getPresence(id, chatId);
+    return presence ? { ...presence, observedAt: new Date(presence.observedAt) } : null;
   }
 
   @Post(':id/chats/unread')
@@ -384,11 +570,134 @@ export class SessionController {
   @ApiResponse({ status: 200, description: 'Chat marked as unread successfully' })
   @ApiResponse({ status: 400, description: 'Session not ready' })
   @ApiResponse({ status: 404, description: 'Session not found' })
+  @ApiResponse({
+    status: 503,
+    description:
+      'WhatsApp did not answer within the request budget. The change may or may not have been applied — ' +
+      'the gateway stopped waiting for a confirmation that never came.',
+  })
+  @ApiResponse({ status: 409, description: ENGINE_NOT_READY_409 })
   async markChatUnread(
     @Param('id', ParseUUIDPipe) id: string,
     @Body() dto: MarkChatReadDto,
   ): Promise<{ success: boolean }> {
     const success = await this.sessionService.markUnread(id, dto.chatId);
+    return { success };
+  }
+
+  @Delete(':id/chats/:chatId/messages')
+  @RequireRole(ApiKeyRole.OPERATOR)
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({ summary: 'Delete every message in a chat, keeping the chat itself' })
+  @ApiParam({ name: 'id', description: 'Session ID' })
+  @ApiParam({ name: 'chatId', description: "Chat JID, e.g. 1234567890-123@g.us (URL-encode the '@')" })
+  @ApiResponse({
+    status: 200,
+    description:
+      'Returns `{ success }`. `false` means the engine declined to act — an unknown chat, or on the ' +
+      'Baileys engine a chat with no known history, since the change is keyed to its last message.',
+  })
+  @ApiResponse({ status: 400, description: 'Session not ready' })
+  @ApiResponse({ status: 404, description: 'Session not found' })
+  @ApiResponse({
+    status: 503,
+    description:
+      'WhatsApp did not answer within the request budget. The change may or may not have been applied — ' +
+      'the gateway stopped waiting for a confirmation that never came.',
+  })
+  @ApiResponse({ status: 409, description: ENGINE_NOT_READY_409 })
+  async clearChatMessages(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Param('chatId') chatId: string,
+  ): Promise<{ success: boolean }> {
+    const success = await this.sessionService.clearChatMessages(id, chatId);
+    return { success };
+  }
+
+  @Post(':id/chats/archive')
+  @RequireRole(ApiKeyRole.OPERATOR)
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({ summary: 'Archive or unarchive a chat' })
+  @ApiParam({ name: 'id', description: 'Session ID' })
+  @ApiResponse({
+    status: 200,
+    description:
+      'Returns `{ success }`. `false` means the engine declined to act — on the Baileys engine a ' +
+      'chat with no known history cannot be archived, since the change is keyed to its last message.',
+  })
+  @ApiResponse({ status: 400, description: 'Session not ready' })
+  @ApiResponse({ status: 404, description: 'Session not found' })
+  @ApiResponse({
+    status: 503,
+    description:
+      'WhatsApp did not answer within the request budget. The change may or may not have been applied — ' +
+      'the gateway stopped waiting for a confirmation that never came.',
+  })
+  @ApiResponse({ status: 409, description: ENGINE_NOT_READY_409 })
+  async archiveChat(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Body() dto: ArchiveChatDto,
+  ): Promise<{ success: boolean }> {
+    const success = await this.sessionService.archiveChat(id, dto.chatId, dto.archive);
+    return { success };
+  }
+
+  @Post(':id/chats/mute')
+  @RequireRole(ApiKeyRole.OPERATOR)
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({ summary: 'Mute or unmute a chat' })
+  @ApiParam({ name: 'id', description: 'Session ID' })
+  @ApiResponse({
+    status: 200,
+    description:
+      'Returns `{ success: true }`. Unlike the archive route there is no declined outcome: the mute ' +
+      "change is not keyed to the chat's last message on either engine, so a chat with no known " +
+      'history mutes like any other.',
+  })
+  @ApiResponse({ status: 400, description: 'Session not ready, or an invalid chatId / muteUntil' })
+  @ApiResponse({ status: 404, description: 'Session not found' })
+  @ApiResponse({
+    status: 503,
+    description:
+      'WhatsApp did not answer within the request budget. The change may or may not have been applied — ' +
+      'the gateway stopped waiting for a confirmation that never came.',
+  })
+  @ApiResponse({ status: 409, description: ENGINE_NOT_READY_409 })
+  async muteChat(@Param('id', ParseUUIDPipe) id: string, @Body() dto: MuteChatDto): Promise<{ success: boolean }> {
+    await this.sessionService.muteChat(id, dto.chatId, dto.muteUntil);
+    return { success: true };
+  }
+
+  @Post(':id/chats/pin')
+  @RequireRole(ApiKeyRole.OPERATOR)
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({ summary: 'Pin or unpin a chat at the top of the chat list' })
+  @ApiParam({ name: 'id', description: 'Session ID' })
+  @ApiResponse({
+    status: 200,
+    description:
+      'Returns `{ success }`. `false` means the engine declined, and only a pin can: WhatsApp allows ' +
+      'at most three pinned chats and the whatsapp-web.js engine reports the refusal. Unpinning always ' +
+      'succeeds, and the Baileys engine always reports success because it cannot observe the cap.',
+  })
+  @ApiResponse({
+    status: 400,
+    description:
+      'Session not ready, or a chatId the session cannot resolve. An unknown chat is reported here ' +
+      'rather than as `success: false`, which on this route means only that the three-pin cap ' +
+      'refused a real chat. The Baileys engine cannot resolve chats ahead of the write and answers ' +
+      '`success: true` for an unknown chat.',
+  })
+  @ApiResponse({ status: 404, description: 'Session not found' })
+  @ApiResponse({
+    status: 503,
+    description:
+      'WhatsApp did not answer within the request budget. The change may or may not have been applied — ' +
+      'the gateway stopped waiting for a confirmation that never came.',
+  })
+  @ApiResponse({ status: 409, description: ENGINE_NOT_READY_409 })
+  async pinChat(@Param('id', ParseUUIDPipe) id: string, @Body() dto: PinChatDto): Promise<{ success: boolean }> {
+    const success = await this.sessionService.pinChat(id, dto.chatId, dto.pin);
     return { success };
   }
 
@@ -400,6 +709,13 @@ export class SessionController {
   @ApiResponse({ status: 200, description: 'Chat deleted successfully' })
   @ApiResponse({ status: 400, description: 'Session not ready' })
   @ApiResponse({ status: 404, description: 'Session not found' })
+  @ApiResponse({
+    status: 503,
+    description:
+      'WhatsApp did not answer within the request budget. The change may or may not have been applied — ' +
+      'the gateway stopped waiting for a confirmation that never came.',
+  })
+  @ApiResponse({ status: 409, description: ENGINE_NOT_READY_409 })
   async deleteChat(@Param('id', ParseUUIDPipe) id: string, @Body() dto: DeleteChatDto): Promise<{ success: boolean }> {
     const success = await this.sessionService.deleteChat(id, dto.chatId);
     return { success };
@@ -412,6 +728,7 @@ export class SessionController {
   @ApiParam({ name: 'id', description: 'Session ID' })
   @ApiResponse({ status: 200, description: 'Presence sent' })
   @ApiResponse({ status: 404, description: 'Session not found' })
+  @ApiResponse({ status: 409, description: ENGINE_NOT_READY_409 })
   async sendChatState(
     @Param('id', ParseUUIDPipe) id: string,
     @Body() dto: SendChatStateDto,

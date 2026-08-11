@@ -4,9 +4,17 @@ import { Repository, DataSource } from 'typeorm';
 import { BadGatewayException, ConflictException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { SessionService } from './session.service';
+import { SessionEngineLifecycle } from './session-engine-lifecycle.service';
+import { SessionErrorStore } from './session-error-store.service';
+import { SessionRestrictionStore } from './session-restriction-store.service';
+import { PresenceStore } from './presence-store.service';
 import { Session, SessionStatus } from './entities/session.entity';
 import { Message } from '../message/entities/message.entity';
 import { EngineFactory } from '../../engine/engine.factory';
+import { EngineRegistry } from '../../engine/engine-registry.service';
+import { SessionLidResolver } from './session-lid-resolver.service';
+import { SessionLivenessWatchdog } from './session-liveness-watchdog.service';
+import { MessageProjector } from './message-projector.service';
 import { LidMappingStoreService } from '../../engine/identity/lid-mapping-store.service';
 import { EventsGateway } from '../events/events.gateway';
 import { WebhookService } from '../webhook/webhook.service';
@@ -28,6 +36,10 @@ function createMockSession(overrides: Partial<Session> = {}): Session {
     proxyType: null,
     connectedAt: null,
     lastActiveAt: null,
+    nodeId: null,
+    claimedAt: null,
+    leaseExpiresAt: null,
+    nodeUrl: null,
     createdAt: new Date(),
     updatedAt: new Date(),
     ...overrides,
@@ -55,6 +67,9 @@ async function expectNameTeardownPending(p: Promise<unknown>): Promise<void> {
 
 describe('SessionService logout() name-scoped teardown fence', () => {
   let service: SessionService;
+  // The teardown fence + lifecycle state live on the engine-lifecycle owner after the god-object
+  // split; the white-box pokes below target it directly, the public-API calls stay on `service`.
+  let lifecycle: SessionEngineLifecycle;
   let repository: jest.Mocked<Partial<Repository<Session>>>;
   let engineFactory: jest.Mocked<Partial<EngineFactory>>;
 
@@ -85,10 +100,19 @@ describe('SessionService logout() name-scoped teardown fence', () => {
     const module: TestingModule = await Test.createTestingModule({
       providers: [
         SessionService,
+        SessionEngineLifecycle,
+        SessionErrorStore,
+        SessionRestrictionStore,
+        PresenceStore,
         { provide: getRepositoryToken(Session, 'data'), useValue: repository },
         { provide: getRepositoryToken(Message, 'data'), useValue: messageRepository },
         { provide: getDataSourceToken('data'), useValue: dataSource },
         { provide: EngineFactory, useValue: engineFactory },
+        // Real registry: this suite asserts on engine map state across the teardown fence.
+        EngineRegistry,
+        SessionLidResolver,
+        SessionLivenessWatchdog,
+        MessageProjector,
         {
           provide: EventsGateway,
           useValue: { emitSessionStatus: jest.fn(), emitSessionDisconnected: jest.fn(), emitQRCode: jest.fn() },
@@ -105,15 +129,16 @@ describe('SessionService logout() name-scoped teardown fence', () => {
     }).compile();
 
     service = module.get<SessionService>(SessionService);
+    lifecycle = module.get<SessionEngineLifecycle>(SessionEngineLifecycle);
   });
 
   const enginesOf = () => (service as unknown as { engines: Map<string, unknown> }).engines;
-  const pendingOf = () => (service as unknown as { pendingTeardowns: Map<string, Promise<void>> }).pendingTeardowns;
-  const stoppingOf = () => (service as unknown as { stoppingSessions: Set<string> }).stoppingSessions;
-  const reconnectStatesOf = () => (service as unknown as { reconnectStates: Map<string, unknown> }).reconnectStates;
+  const pendingOf = () => (lifecycle as unknown as { pendingTeardowns: Map<string, Promise<void>> }).pendingTeardowns;
+  const stoppingOf = () => (lifecycle as unknown as { stoppingSessions: Set<string> }).stoppingSessions;
+  const reconnectStatesOf = () => (lifecycle as unknown as { reconnectStates: Map<string, unknown> }).reconnectStates;
   const errorsOf = () => (service as unknown as { sessionErrors: Map<string, string> }).sessionErrors;
   const lastStatusOf = () =>
-    (service as unknown as { lastDispatchedStatus: Map<string, unknown> }).lastDispatchedStatus;
+    (lifecycle as unknown as { lastDispatchedStatus: Map<string, unknown> }).lastDispatchedStatus;
 
   it('quick-settling teardown: start waits for it, then proceeds', async () => {
     let releaseLogout!: () => void;
@@ -208,8 +233,9 @@ describe('SessionService logout() name-scoped teardown fence', () => {
         cb(manager),
       ) as unknown as DataSource['transaction'],
     };
-    // Swap in a dataSource whose transaction we can assert was NOT run.
-    (service as unknown as { dataSource: unknown }).dataSource = dataSource;
+    // Swap in a dataSource whose transaction we can assert was NOT run. delete() runs on the
+    // lifecycle owner now, so the swap must land there to intercept the path under test.
+    (lifecycle as unknown as { dataSource: unknown }).dataSource = dataSource;
     (repository.findOne as jest.Mock).mockResolvedValue(createMockSession({ id: SESSION_UUID, name: SESSION_NAME }));
 
     const neverSettles = new Promise<void>(() => undefined);
@@ -314,10 +340,10 @@ describe('SessionService logout() name-scoped teardown fence', () => {
     // engine fires its credential-teardown callback synchronously inside that teardown window — between
     // fence #1 and fence #2. Drive the service's own tracking the same way the adapter would.
     const trackPending = (
-      service as unknown as {
+      lifecycle as unknown as {
         trackPendingCredentialTeardown: (name: string, raw: Promise<void>) => void;
       }
-    ).trackPendingCredentialTeardown.bind(service);
+    ).trackPendingCredentialTeardown.bind(lifecycle);
     enginesOf().set(SESSION_UUID, {
       forceDestroy: jest.fn().mockImplementation(() => {
         // Simulate the adapter firing onCredentialTeardownStarted for a logout that captured this

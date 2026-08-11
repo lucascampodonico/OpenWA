@@ -290,7 +290,9 @@
       "phone": "Número de telefone",
       "phoneNone": "Não conectado",
       "created": "Criado em",
-      "lastActive": "Última atividade"
+      "lastActive": "Última atividade",
+      "autoRejectCalls": "Rejeitar chamadas automaticamente",
+      "autoRejectCallsHint": "As chamadas recebidas são recusadas assim que tocam. O webhook call.received continua sendo enviado antes. Vale a partir da próxima chamada — sem reiniciar."
     },
     "actions": {
       "view": "Ver",
@@ -315,7 +317,8 @@
       "phone": "Telefone",
       "sessionId": "ID da sessão",
       "lastActive": "Última atividade",
-      "error": "Erro"
+      "error": "Erro",
+      "restriction": "Restrição"
     },
     "forceKill": {
       "title": "Forçar encerramento da sessão travada",
@@ -360,6 +363,12 @@
     "start": {
       "teardownPendingTitle": "Iniciando sessão",
       "teardownPending": "A remoção de credenciais desta sessão ainda está em andamento. Aguarde um momento e tente novamente."
+    },
+    "restriction": {
+      "reachout_timelock": "Novas conversas bloqueadas",
+      "tos_block": "Bloqueado pelo WhatsApp",
+      "proxy_block": "Conexão bloqueada",
+      "until": "até {{date}}"
     }
   },
   "webhooks": {
@@ -760,7 +769,8 @@
     "toasts": {
       "saveFailed": "Erro ao salvar"
     },
-    "envPinNote": "Fixado por uma variável de ambiente: este é o valor em execução; as alterações do painel não serão aplicadas até que essa variável seja removida.",
+    "envPinNote": "Fixado pela variável de ambiente {{name}}: este é o valor em execução; as alterações do painel não serão aplicadas até que essa variável seja removida.",
+    "pendingRestartNote": "Salvo, mas ainda não aplicado: reinicie o servidor para que esta alteração tenha efeito.",
     "migration": {
       "title": "Atenção: isso altera o backend de dados",
       "dbWarning": "O novo banco de dados começa vazio. Baixe agora um backup dos seus dados atuais (enquanto ainda estiver no banco de dados anterior) e restaure-o após reiniciar.",
@@ -771,6 +781,8 @@
       "export": "Exportar dados",
       "import": "Importar dados",
       "exportFailed": "Não foi possível exportar os dados",
+      "exportPartialTitle": "Backup is missing some media",
+      "exportPartial": "{{count}} attachment payload(s) exceeded the export media budget and were saved as placeholders. The messages restore; their media does not.",
       "importFailed": "Não foi possível importar os dados",
       "importOk": "Dados importados",
       "importConfirm": "A importação IRÁ SUBSTITUIR todos os dados atuais pelo backup ({{rows}} linhas). Isso não pode ser desfeito. Continuar?",
